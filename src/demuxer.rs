@@ -26,7 +26,7 @@ use oxideav_core::{
     TimeBase,
 };
 
-use crate::codec_map::{audio_codec_id, video_codec_id};
+use crate::codec_map::{audio_codec_id_full, video_codec_id};
 use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_FORM, LIST, RIFF};
 use crate::stream_format::{parse_bitmap_info_header, parse_waveformatex};
 
@@ -365,18 +365,14 @@ fn build_stream(index: u32, strh: &[u8], strf: &[u8]) -> Result<(StreamInfo, [u8
                 None
             };
             let format_tag = wfx.as_ref().map(|w| w.format_tag).unwrap_or(0);
-            let codec_id = audio_codec_id(format_tag);
+            let bits = wfx.as_ref().map(|w| w.bits_per_sample).unwrap_or(0);
+            let codec_id = audio_codec_id_full(format_tag, bits);
             let mut p = CodecParameters::audio(codec_id.clone());
             if let Some(w) = &wfx {
                 p.channels = Some(w.channels);
                 p.sample_rate = Some(w.samples_per_sec);
                 p.extradata = w.extradata.clone();
-                p.sample_format = match (codec_id.as_str(), w.bits_per_sample) {
-                    ("pcm_s16le", _) => Some(SampleFormat::S16),
-                    (_, 16) => Some(SampleFormat::S16),
-                    (_, 8) => Some(SampleFormat::U8),
-                    _ => None,
-                };
+                p.sample_format = sample_format_for(codec_id.as_str(), w.bits_per_sample);
                 p.bit_rate = if w.avg_bytes_per_sec > 0 {
                     Some(w.avg_bytes_per_sec as u64 * 8)
                 } else {
@@ -425,6 +421,29 @@ fn build_stream(index: u32, strh: &[u8], strf: &[u8]) -> Result<(StreamInfo, [u8
     };
     let _ = sample_size;
     Ok((stream, suffix))
+}
+
+/// Map a decoded audio codec + WAVEFORMATEX `bits_per_sample` to the
+/// corresponding `SampleFormat`. Used only to hint downstream consumers;
+/// packet bytes are passed through verbatim regardless of this result.
+fn sample_format_for(codec: &str, bits: u16) -> Option<SampleFormat> {
+    match codec {
+        "pcm_u8" => Some(SampleFormat::U8),
+        "pcm_s16le" | "pcm_s16be" => Some(SampleFormat::S16),
+        "pcm_s24le" => Some(SampleFormat::S24),
+        "pcm_s32le" => Some(SampleFormat::S32),
+        "pcm_f32le" => Some(SampleFormat::F32),
+        "pcm_f64le" => Some(SampleFormat::F64),
+        // μ-law / A-law expand to S16 once decoded.
+        "pcm_mulaw" | "pcm_alaw" => Some(SampleFormat::S16),
+        _ => match bits {
+            8 => Some(SampleFormat::U8),
+            16 => Some(SampleFormat::S16),
+            24 => Some(SampleFormat::S24),
+            32 => Some(SampleFormat::S32),
+            _ => None,
+        },
+    }
 }
 
 fn read_body_bounded<R: std::io::Read + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {

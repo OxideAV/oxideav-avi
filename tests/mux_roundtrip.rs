@@ -185,6 +185,101 @@ fn unsupported_codec_errors_at_open() {
     }
 }
 
+/// Build a minimal audio stream with the given codec id + sample format.
+fn audio_stream(codec: &str, bits_per_sample: u16, sfmt: SampleFormat) -> StreamInfo {
+    let mut params = CodecParameters::audio(CodecId::new(codec));
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(sfmt);
+    // bit_rate is advisory; set it so avg_bytes_per_sec in WAVEFORMATEX
+    // is populated and the demuxer can surface it again.
+    params.bit_rate = Some((bits_per_sample as u64) * 2 * 48_000);
+    StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }
+}
+
+#[test]
+fn pcm_variants_roundtrip_codec_ids() {
+    // For each PCM flavour, mux a tiny one-packet file and check the demuxer
+    // surfaces the exact same codec id + sample format.
+    let variants: &[(&str, u16, SampleFormat)] = &[
+        ("pcm_u8", 8, SampleFormat::U8),
+        ("pcm_s16le", 16, SampleFormat::S16),
+        ("pcm_s24le", 24, SampleFormat::S24),
+        ("pcm_s32le", 32, SampleFormat::S32),
+        ("pcm_f32le", 32, SampleFormat::F32),
+        ("pcm_f64le", 64, SampleFormat::F64),
+    ];
+    for (id, bps, sfmt) in variants {
+        let stream = audio_stream(id, *bps, *sfmt);
+        let block_align = ((*bps as usize) / 8) * 2;
+        let payload = vec![0u8; block_align * 100];
+        let tmp = std::env::temp_dir().join(format!("oxideav-avi-{id}.avi"));
+        {
+            let f = std::fs::File::create(&tmp).unwrap();
+            let ws: Box<dyn WriteSeek> = Box::new(f);
+            let mut mux =
+                oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+            mux.write_header().unwrap();
+            let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+            pkt.pts = Some(0);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+            mux.write_trailer().unwrap();
+        }
+        let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+        let dmx = oxideav_avi::demuxer::open(rs).unwrap();
+        let got = dmx.streams()[0].params.codec_id.as_str().to_string();
+        assert_eq!(got, *id, "codec id mismatch for {id}");
+        assert_eq!(
+            dmx.streams()[0].params.sample_format,
+            Some(*sfmt),
+            "sample format mismatch for {id}"
+        );
+    }
+}
+
+#[test]
+fn alaw_mulaw_roundtrip() {
+    // G.711 A-law / μ-law: 1 byte per sample, 2 channels, 8 kHz.
+    for codec in &["pcm_alaw", "pcm_mulaw"] {
+        let mut params = CodecParameters::audio(CodecId::new(*codec));
+        params.channels = Some(2);
+        params.sample_rate = Some(8_000);
+        let stream = StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, 8_000),
+            duration: None,
+            start_time: Some(0),
+            params,
+        };
+        let payload: Vec<u8> = (0..1600u32).map(|i| (i & 0xFF) as u8).collect();
+        let tmp = std::env::temp_dir().join(format!("oxideav-avi-{codec}.avi"));
+        {
+            let f = std::fs::File::create(&tmp).unwrap();
+            let ws: Box<dyn WriteSeek> = Box::new(f);
+            let mut mux =
+                oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+            mux.write_header().unwrap();
+            let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+            pkt.pts = Some(0);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+            mux.write_trailer().unwrap();
+        }
+        let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+        let mut dmx = oxideav_avi::demuxer::open(rs).unwrap();
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), *codec);
+        let pkt = dmx.next_packet().unwrap();
+        assert_eq!(pkt.data, payload);
+    }
+}
+
 #[test]
 fn muxer_writes_idx1_chunk() {
     let stream = pcm_stream();
