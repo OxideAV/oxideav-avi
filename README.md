@@ -11,7 +11,7 @@ framework but usable standalone.
 
 ```toml
 [dependencies]
-oxideav-core = "0.0"
+oxideav-core = "0.1"
 oxideav-container = "0.0"
 oxideav-avi = "0.0"
 ```
