@@ -48,7 +48,8 @@ fn demux_ffmpeg_mjpeg_avi() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(path).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
+    let mut dmx =
+        oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
     assert_eq!(dmx.format_name(), "avi");
     let streams = dmx.streams().to_vec();
     assert_eq!(streams.len(), 1, "expected one stream");
@@ -93,7 +94,8 @@ fn demux_ffmpeg_ffv1_avi() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(path).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
+    let mut dmx =
+        oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
     let streams = dmx.streams().to_vec();
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].params.codec_id.as_str(), "ffv1");
@@ -129,7 +131,8 @@ fn demux_ffmpeg_av_avi() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(path).unwrap());
-    let dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
+    let dmx =
+        oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
     let streams = dmx.streams();
     assert_eq!(streams.len(), 2, "expected video + audio stream");
     // Declaration order: ffmpeg writes video first, then audio.

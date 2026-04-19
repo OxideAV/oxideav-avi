@@ -223,8 +223,7 @@ fn pcm_variants_roundtrip_codec_ids() {
         {
             let f = std::fs::File::create(&tmp).unwrap();
             let ws: Box<dyn WriteSeek> = Box::new(f);
-            let mut mux =
-                oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+            let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
             mux.write_header().unwrap();
             let mut pkt = Packet::new(0, stream.time_base, payload.clone());
             pkt.pts = Some(0);
@@ -263,8 +262,7 @@ fn alaw_mulaw_roundtrip() {
         {
             let f = std::fs::File::create(&tmp).unwrap();
             let ws: Box<dyn WriteSeek> = Box::new(f);
-            let mut mux =
-                oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+            let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
             mux.write_header().unwrap();
             let mut pkt = Packet::new(0, stream.time_base, payload.clone());
             pkt.pts = Some(0);

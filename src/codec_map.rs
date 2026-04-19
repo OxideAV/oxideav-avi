@@ -45,20 +45,20 @@ pub fn video_codec_id(fourcc: &[u8; 4]) -> CodecId {
         // H.264 / AVC — `H264`, `AVC1`, plus Sony/JVC variants and a few
         // widely-seen DVR FourCCs. We accept both in-stream (annex-B) and
         // `avcC`-prefixed bitstreams; downstream decoders adapt.
-        b"H264" | b"AVC1" | b"X264" | b"VSSH" | b"DAVC" | b"PAVC" | b"AVC2" | b"AVC3"
-        | b"AI5Q" | b"AI55" | b"AI15" | b"AI13" | b"AI12" | b"AI1Q" | b"AI5P" | b"AI53" => "h264",
+        b"H264" | b"AVC1" | b"X264" | b"VSSH" | b"DAVC" | b"PAVC" | b"AVC2" | b"AVC3" | b"AI5Q"
+        | b"AI55" | b"AI15" | b"AI13" | b"AI12" | b"AI1Q" | b"AI5P" | b"AI53" => "h264",
         // HEVC / H.265.
         b"HEVC" | b"H265" | b"HVC1" | b"HEV1" | b"X265" | b"DXHE" => "h265",
         // ITU-T H.263 baseline / H.263+. `U263` (UB Video), `M263`, `ILVR`,
         // `VX1K` and `viv1` (VivoActive) all pack an H.263 bitstream.
-        b"H263" | b"U263" | b"M263" | b"ILVR" | b"VX1K" | b"VIV1" | b"X263" | b"T263"
-        | b"S263" | b"L263" => "h263",
+        b"H263" | b"U263" | b"M263" | b"ILVR" | b"VX1K" | b"VIV1" | b"X263" | b"T263" | b"S263"
+        | b"L263" => "h263",
         // MPEG-1 video. `MPG1` is the most common AVI tag; `MPEG` appears in a
         // few legacy files. `mpg1`/`mpeg` fall through via uppercase4.
         b"MPG1" | b"MPEG" => "mpeg1video",
         // MPEG-2 video.
-        b"MPG2" | b"MP2V" | b"EM2V" | b"HDV1" | b"HDV2" | b"HDV3" | b"HDV4" | b"HDV5"
-        | b"HDV6" | b"HDV7" | b"HDV8" | b"HDV9" => "mpeg2video",
+        b"MPG2" | b"MP2V" | b"EM2V" | b"HDV1" | b"HDV2" | b"HDV3" | b"HDV4" | b"HDV5" | b"HDV6"
+        | b"HDV7" | b"HDV8" | b"HDV9" => "mpeg2video",
         // VP8 / VP9 / AV1.
         b"VP80" | b"VP8 " => "vp8",
         b"VP90" | b"VP9 " => "vp9",
@@ -67,8 +67,9 @@ pub fn video_codec_id(fourcc: &[u8; 4]) -> CodecId {
         // Huffyuv / FFV1-adjacent lossless intermediates.
         b"HFYU" => "huffyuv",
         b"FFVH" => "ffvhuff",
-        b"UTVS" | b"ULRG" | b"ULRA" | b"ULY0" | b"ULY2" | b"ULY4" | b"ULH0" | b"ULH2"
-        | b"ULH4" => "utvideo",
+        b"UTVS" | b"ULRG" | b"ULRA" | b"ULY0" | b"ULY2" | b"ULY4" | b"ULH0" | b"ULH2" | b"ULH4" => {
+            "utvideo"
+        }
         // ProRes (rare in AVI but seen in post-production workflows).
         b"APCH" | b"APCN" | b"APCS" | b"APCO" | b"AP4H" | b"AP4X" => "prores",
         // DV video.
@@ -278,11 +279,7 @@ fn ffv1_entry(params: &CodecParameters) -> Result<StrfEntry> {
 
 /// Generic video `strf` builder: writes a BITMAPINFOHEADER with the given
 /// FourCC and bit depth. Extradata from `params` is appended.
-fn video_entry(
-    params: &CodecParameters,
-    fourcc: [u8; 4],
-    bit_count: u16,
-) -> Result<StrfEntry> {
+fn video_entry(params: &CodecParameters, fourcc: [u8; 4], bit_count: u16) -> Result<StrfEntry> {
     if params.media_type != MediaType::Video {
         return Err(Error::invalid("avi muxer: video codec on non-video stream"));
     }

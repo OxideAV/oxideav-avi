@@ -22,17 +22,8 @@ use std::io::{Seek, SeekFrom};
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecId,
-    CodecParameters,
-    CodecResolver,
-    Error,
-    MediaType,
-    Packet,
-    Rational,
-    Result,
-    SampleFormat,
-    StreamInfo,
-    TimeBase,
+    CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, Rational, Result,
+    SampleFormat, StreamInfo, TimeBase,
 };
 
 use crate::codec_map::{audio_codec_id_full, video_codec_id};
@@ -40,7 +31,7 @@ use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_F
 use crate::stream_format::{parse_bitmap_info_header, parse_waveformatex};
 
 /// Factory registered with the container registry.
-pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Top-level RIFF chunk.
     let top = match read_chunk_header(&mut *input)? {
         Some(h) => h,
@@ -71,7 +62,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
             let body_end = body_start + body_len as u64;
             match &list_type {
                 b"hdrl" => {
-                    let (main, stream_infos, suffixes) = parse_hdrl(&mut *input, body_end)?;
+                    let (main, stream_infos, suffixes) = parse_hdrl(&mut *input, body_end, codecs)?;
                     avih = Some(main);
                     streams = stream_infos;
                     packet_chunk_suffix = suffixes;
@@ -238,6 +229,7 @@ fn parse_avih(buf: &[u8]) -> Result<AviMainHeader> {
 fn parse_hdrl<R: ReadSeek + ?Sized>(
     r: &mut R,
     end_pos: u64,
+    codecs: &dyn CodecResolver,
 ) -> Result<(AviMainHeader, Vec<StreamInfo>, Vec<[u8; 2]>)> {
     let mut main = AviMainHeader::default();
     let mut streams: Vec<StreamInfo> = Vec::new();
@@ -260,7 +252,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf) = parse_strl(r, body_end, streams.len() as u32)?;
+                    let (si, suf) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
                         suffixes.push(suf.unwrap_or(*b"xx"));
@@ -282,6 +274,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     r: &mut R,
     end_pos: u64,
     index: u32,
+    codecs: &dyn CodecResolver,
 ) -> Result<(Option<StreamInfo>, Option<[u8; 2]>)> {
     let mut strh_buf: Option<Vec<u8>> = None;
     let mut strf_buf: Option<Vec<u8>> = None;
@@ -309,12 +302,26 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         None => return Ok((None, None)),
     };
     let strf = strf_buf.unwrap_or_default();
-    let parsed = build_stream(index, &strh, &strf)?;
+    let parsed = build_stream(index, &strh, &strf, codecs)?;
     Ok((Some(parsed.0), Some(parsed.1)))
 }
 
 /// Build a StreamInfo from strh + strf payloads.
-fn build_stream(index: u32, strh: &[u8], strf: &[u8]) -> Result<(StreamInfo, [u8; 2])> {
+///
+/// Codec identification flows through `codecs.resolve_tag()` first: a codec
+/// crate may have claimed the AVI FourCC (for video streams) or the
+/// WAVEFORMATEX `wFormatTag` (for audio) via the shared registry, which
+/// gives the codec's own crate ownership of the mapping and lets it attach
+/// a probe function for tag-collision cases (e.g. `DIV3` that's actually
+/// MPEG-4 Part 2). When the registry returns nothing — most of the legacy
+/// codecs (Cinepak, Indeo, WMA, DV, raw PCM flavours) aren't registered —
+/// we fall back to the static table in `codec_map`.
+fn build_stream(
+    index: u32,
+    strh: &[u8],
+    strf: &[u8],
+    codecs: &dyn CodecResolver,
+) -> Result<(StreamInfo, [u8; 2])> {
     // AVISTREAMHEADER layout (56 bytes):
     //   0  fccType       [4]
     //   4  fccHandler    [4]
@@ -350,7 +357,9 @@ fn build_stream(index: u32, strh: &[u8], strf: &[u8]) -> Result<(StreamInfo, [u8
                 None
             };
             let compression = bmih.as_ref().map(|b| b.compression).unwrap_or(fcc_handler);
-            let codec_id = video_codec_id(&compression);
+            let codec_id = codecs
+                .resolve_tag(&CodecTag::fourcc(&compression), None)
+                .unwrap_or_else(|| video_codec_id(&compression));
             let mut p = CodecParameters::video(codec_id.clone());
             if let Some(b) = &bmih {
                 p.width = Some(b.width);
@@ -375,7 +384,9 @@ fn build_stream(index: u32, strh: &[u8], strf: &[u8]) -> Result<(StreamInfo, [u8
             };
             let format_tag = wfx.as_ref().map(|w| w.format_tag).unwrap_or(0);
             let bits = wfx.as_ref().map(|w| w.bits_per_sample).unwrap_or(0);
-            let codec_id = audio_codec_id_full(format_tag, bits);
+            let codec_id = codecs
+                .resolve_tag(&CodecTag::wave_format(format_tag), None)
+                .unwrap_or_else(|| audio_codec_id_full(format_tag, bits));
             let mut p = CodecParameters::audio(codec_id.clone());
             if let Some(w) = &wfx {
                 p.channels = Some(w.channels);
