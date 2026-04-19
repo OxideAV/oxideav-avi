@@ -22,7 +22,16 @@ use std::io::{Seek, SeekFrom};
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, Rational, Result, SampleFormat, StreamInfo,
+    CodecId,
+    CodecParameters,
+    CodecResolver,
+    Error,
+    MediaType,
+    Packet,
+    Rational,
+    Result,
+    SampleFormat,
+    StreamInfo,
     TimeBase,
 };
 
@@ -31,7 +40,7 @@ use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_F
 use crate::stream_format::{parse_bitmap_info_header, parse_waveformatex};
 
 /// Factory registered with the container registry.
-pub fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Top-level RIFF chunk.
     let top = match read_chunk_header(&mut *input)? {
         Some(h) => h,

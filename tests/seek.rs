@@ -99,7 +99,7 @@ fn seek_to_video_midway_lands_on_keyframe() {
 
     // Demux and seek.
     let reader: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(reader).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(reader, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams().len(), 2);
 
     // Seek video stream to pts 5. The muxer flagged every video chunk as a
@@ -173,7 +173,7 @@ fn seek_to_without_idx1_is_unsupported() {
     backing[pos..pos + 4].copy_from_slice(b"JUNK");
 
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(backing));
-    let mut dmx = oxideav_avi::demuxer::open(reader).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(reader, &oxideav_core::NullCodecResolver).unwrap();
     match dmx.seek_to(0, 0) {
         Err(Error::Unsupported(_)) => {}
         other => panic!("expected Unsupported without idx1, got {other:?}"),

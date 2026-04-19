@@ -60,7 +60,7 @@ fn pcm_roundtrip_byte_exact() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(rs).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.format_name(), "avi");
     assert_eq!(dmx.streams().len(), 1);
     assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
@@ -153,7 +153,7 @@ fn mjpeg_roundtrip_via_avi() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(rs).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mjpeg");
     assert_eq!(dmx.streams()[0].params.width, Some(w));
     assert_eq!(dmx.streams()[0].params.height, Some(h));
@@ -233,7 +233,7 @@ fn pcm_variants_roundtrip_codec_ids() {
             mux.write_trailer().unwrap();
         }
         let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-        let dmx = oxideav_avi::demuxer::open(rs).unwrap();
+        let dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
         let got = dmx.streams()[0].params.codec_id.as_str().to_string();
         assert_eq!(got, *id, "codec id mismatch for {id}");
         assert_eq!(
@@ -273,7 +273,7 @@ fn alaw_mulaw_roundtrip() {
             mux.write_trailer().unwrap();
         }
         let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-        let mut dmx = oxideav_avi::demuxer::open(rs).unwrap();
+        let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
         assert_eq!(dmx.streams()[0].params.codec_id.as_str(), *codec);
         let pkt = dmx.next_packet().unwrap();
         assert_eq!(pkt.data, payload);

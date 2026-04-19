@@ -22,11 +22,26 @@ pub fn video_codec_id(fourcc: &[u8; 4]) -> CodecId {
     let name = match &upper {
         b"MJPG" | b"AVRN" | b"LJPG" | b"JPGL" => "mjpeg",
         b"FFV1" => "ffv1",
-        // MPEG-4 Part 2 / ASP — every non-trivial MP4/AVI encoder emits one
-        // of these FourCCs for the same underlying codec (ISO/IEC 14496-2).
-        b"XVID" | b"DIVX" | b"DX50" | b"MP4V" | b"FMP4" | b"DIV3" | b"DIV4" | b"DIV5" | b"DIV6"
-        | b"3IV2" | b"M4S2" | b"MP4S" | b"DIVF" | b"BLZ0" | b"DX40" | b"MP43" | b"RMP4"
-        | b"SMP4" | b"UMP4" | b"WV1F" | b"XVIX" | b"DXGM" => "mpeg4video",
+        // MPEG-4 Part 2 / ASP (ISO/IEC 14496-2) — every non-trivial MP4/AVI
+        // encoder that targets the real ISO spec emits one of these FourCCs.
+        // Handled by oxideav-mpeg4video.
+        b"XVID" | b"DIVX" | b"DX50" | b"MP4V" | b"FMP4" | b"3IV2" | b"M4S2" | b"MP4S" | b"DIVF"
+        | b"BLZ0" | b"DX40" | b"RMP4" | b"SMP4" | b"UMP4" | b"WV1F" | b"XVIX" | b"DXGM" => {
+            "mpeg4video"
+        }
+        // Microsoft MPEG-4 family — the pre-standard Windows Media / DivX ;-)
+        // codecs. **Not** the same bitstream as MPEG-4 Part 2 despite the
+        // similar FourCCs — different VLC tables, no VOS/VOL headers, different
+        // slice layout. Handled by oxideav-msmpeg4.
+        //
+        // Note: `DIV3` / `DIV4` / `MP43` and friends are the most-mislabelled
+        // FourCCs in the wild — files often claim DIV3 but carry an actual
+        // MPEG-4 Part 2 (XVID/DX50) stream. The oxideav-msmpeg4 decoder probes
+        // the bitstream in send_packet and returns Unsupported with a
+        // "dispatch to oxideav-mpeg4video" hint when it sees an ISO start code.
+        b"DIV3" | b"DIV4" | b"DIV5" | b"DIV6" | b"MP43" | b"MPG3" | b"AP41" => "msmpeg4v3",
+        b"MP42" => "msmpeg4v2",
+        b"MP41" | b"MPG4" => "msmpeg4v1",
         // H.264 / AVC — `H264`, `AVC1`, plus Sony/JVC variants and a few
         // widely-seen DVR FourCCs. We accept both in-stream (annex-B) and
         // `avcC`-prefixed bitstreams; downstream decoders adapt.
