@@ -22,8 +22,8 @@ use std::io::{Seek, SeekFrom};
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, Rational, Result,
-    SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext,
+    Rational, Result, SampleFormat, StreamInfo, TimeBase,
 };
 
 use crate::codec_map::{audio_codec_id_full, video_codec_id};
@@ -357,8 +357,13 @@ fn build_stream(
                 None
             };
             let compression = bmih.as_ref().map(|b| b.compression).unwrap_or(fcc_handler);
+            let tag = CodecTag::fourcc(&compression);
+            let mut ctx = ProbeContext::new(&tag).header(strf);
+            if let Some(b) = &bmih {
+                ctx = ctx.width(b.width).height(b.height);
+            }
             let codec_id = codecs
-                .resolve_tag(&CodecTag::fourcc(&compression), None)
+                .resolve_tag(&ctx)
                 .unwrap_or_else(|| video_codec_id(&compression));
             let mut p = CodecParameters::video(codec_id.clone());
             if let Some(b) = &bmih {
@@ -384,8 +389,16 @@ fn build_stream(
             };
             let format_tag = wfx.as_ref().map(|w| w.format_tag).unwrap_or(0);
             let bits = wfx.as_ref().map(|w| w.bits_per_sample).unwrap_or(0);
+            let tag = CodecTag::wave_format(format_tag);
+            let mut ctx = ProbeContext::new(&tag).header(strf);
+            if let Some(w) = &wfx {
+                ctx = ctx
+                    .bits(w.bits_per_sample)
+                    .channels(w.channels)
+                    .sample_rate(w.samples_per_sec);
+            }
             let codec_id = codecs
-                .resolve_tag(&CodecTag::wave_format(format_tag), None)
+                .resolve_tag(&ctx)
                 .unwrap_or_else(|| audio_codec_id_full(format_tag, bits));
             let mut p = CodecParameters::audio(codec_id.clone());
             if let Some(w) = &wfx {
