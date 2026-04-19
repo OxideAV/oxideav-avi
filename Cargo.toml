@@ -14,7 +14,7 @@ keywords = ["multimedia", "avi", "riff", "container", "pure-rust"]
 categories = ["multimedia::video", "parser-implementations"]
 
 [dependencies]
-oxideav-core = "0.0"
+oxideav-core = "0.1"
 oxideav-container = "0.0"
 
 [dev-dependencies]
