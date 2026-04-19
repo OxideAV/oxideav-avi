@@ -44,58 +44,66 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     if form != AVI_FORM {
         return Err(Error::invalid("AVI: RIFF form type is not AVI"));
     }
+    // End of the primary RIFF (exclusive). `top.size` does not include the
+    // 8-byte RIFF header itself; its body starts right after the 4-byte
+    // form-type and ends at this offset.
+    let riff_end = 8u64 + top.size as u64;
 
     // Walk top-level nested chunks until we've processed both hdrl and movi.
     let mut streams: Vec<StreamInfo> = Vec::new();
     let mut packet_chunk_suffix: Vec<[u8; 2]> = Vec::new();
-    let mut movi_start: Option<u64> = None;
-    let mut movi_end: Option<u64> = None;
+    // Multiple (start, end) movi segments: one inside the primary RIFF, plus
+    // one per OpenDML `RIFF AVIX` extension RIFF that follows.
+    let mut movi_segments: Vec<(u64, u64)> = Vec::new();
     let mut avih: Option<AviMainHeader> = None;
     let mut metadata: Vec<(String, String)> = Vec::new();
     let mut idx1_raw: Option<Vec<u8>> = None;
 
+    walk_riff_body(
+        &mut *input,
+        riff_end,
+        &mut streams,
+        &mut packet_chunk_suffix,
+        &mut movi_segments,
+        &mut avih,
+        &mut metadata,
+        &mut idx1_raw,
+        codecs,
+        /* is_primary */ true,
+    )?;
+
+    // OpenDML: additional `RIFF AVIX` extension segments may follow the
+    // primary RIFF. Each holds more movi data.
+    input.seek(SeekFrom::Start(riff_end))?;
     while let Some(hdr) = read_chunk_header(&mut *input)? {
-        if hdr.id == LIST {
-            let list_type = read_form_type(&mut *input)?;
-            let body_len = hdr.size.saturating_sub(4);
-            let body_start = input.stream_position()?;
-            let body_end = body_start + body_len as u64;
-            match &list_type {
-                b"hdrl" => {
-                    let (main, stream_infos, suffixes) = parse_hdrl(&mut *input, body_end, codecs)?;
-                    avih = Some(main);
-                    streams = stream_infos;
-                    packet_chunk_suffix = suffixes;
-                }
-                b"movi" => {
-                    movi_start = Some(body_start);
-                    movi_end = Some(body_end);
-                }
-                b"INFO" => {
-                    let mut buf = vec![0u8; body_len as usize];
-                    input.read_exact(&mut buf)?;
-                    parse_info_list(&buf, &mut metadata);
-                }
-                _ => {}
+        if hdr.id == RIFF {
+            let form = read_form_type(&mut *input)?;
+            let ext_end = input.stream_position()? + hdr.size.saturating_sub(4) as u64;
+            if &form == b"AVIX" {
+                walk_riff_body(
+                    &mut *input,
+                    ext_end,
+                    &mut streams,
+                    &mut packet_chunk_suffix,
+                    &mut movi_segments,
+                    &mut avih,
+                    &mut metadata,
+                    &mut idx1_raw,
+                    codecs,
+                    /* is_primary */ false,
+                )?;
             }
-            // Jump to end of list (skips contents we didn't consume) + pad.
-            input.seek(SeekFrom::Start(body_end))?;
+            input.seek(SeekFrom::Start(ext_end))?;
             skip_pad(&mut *input, hdr.size)?;
-        } else if &hdr.id == b"idx1" {
-            // Legacy AVI 1.0 index. Read the body now so we can build a
-            // keyframe seek table; fall back silently if it's malformed.
-            let mut buf = vec![0u8; hdr.size as usize];
-            input.read_exact(&mut buf)?;
-            skip_pad(&mut *input, hdr.size)?;
-            idx1_raw = Some(buf);
         } else {
-            // Non-list top-level chunks (JUNK, etc.).
             skip_chunk(&mut *input, &hdr)?;
         }
     }
 
-    let movi_start = movi_start.ok_or_else(|| Error::invalid("AVI: missing movi list"))?;
-    let movi_end = movi_end.ok_or_else(|| Error::invalid("AVI: missing movi list"))?;
+    if movi_segments.is_empty() {
+        return Err(Error::invalid("AVI: missing movi list"));
+    }
+    let movi_start = movi_segments[0].0;
     if streams.is_empty() {
         return Err(Error::invalid("AVI: no streams"));
     }
@@ -118,7 +126,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         Vec::new()
     };
 
-    // Seek to start of movi body for next_packet.
+    // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
     Ok(Box::new(AviDemuxer {
@@ -126,12 +134,71 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         streams,
         packet_chunk_suffix,
         movi_start,
-        movi_end,
+        movi_segments,
+        current_segment: 0,
         per_stream_counter: Vec::new(),
         metadata,
         duration_micros,
         idx_table,
     }))
+}
+
+/// Walk the body of one RIFF (`AVI ` or `AVIX`). Collects `hdrl` metadata
+/// (only the primary RIFF carries it), records every `LIST movi` as a
+/// segment, and reads `idx1` if present. `end` is the exclusive end offset
+/// of this RIFF's body.
+#[allow(clippy::too_many_arguments)]
+fn walk_riff_body(
+    input: &mut dyn ReadSeek,
+    end: u64,
+    streams: &mut Vec<StreamInfo>,
+    packet_chunk_suffix: &mut Vec<[u8; 2]>,
+    movi_segments: &mut Vec<(u64, u64)>,
+    avih: &mut Option<AviMainHeader>,
+    metadata: &mut Vec<(String, String)>,
+    idx1_raw: &mut Option<Vec<u8>>,
+    codecs: &dyn CodecResolver,
+    is_primary: bool,
+) -> Result<()> {
+    while input.stream_position()? < end {
+        let hdr = match read_chunk_header(input)? {
+            Some(h) => h,
+            None => break,
+        };
+        if hdr.id == LIST {
+            let list_type = read_form_type(input)?;
+            let body_len = hdr.size.saturating_sub(4);
+            let body_start = input.stream_position()?;
+            let body_end = body_start + body_len as u64;
+            match &list_type {
+                b"hdrl" if is_primary => {
+                    let (main, stream_infos, suffixes) = parse_hdrl(input, body_end, codecs)?;
+                    *avih = Some(main);
+                    *streams = stream_infos;
+                    *packet_chunk_suffix = suffixes;
+                }
+                b"movi" => {
+                    movi_segments.push((body_start, body_end));
+                }
+                b"INFO" if is_primary => {
+                    let mut buf = vec![0u8; body_len as usize];
+                    input.read_exact(&mut buf)?;
+                    parse_info_list(&buf, metadata);
+                }
+                _ => {}
+            }
+            input.seek(SeekFrom::Start(body_end))?;
+            skip_pad(input, hdr.size)?;
+        } else if &hdr.id == b"idx1" && is_primary {
+            let mut buf = vec![0u8; hdr.size as usize];
+            input.read_exact(&mut buf)?;
+            skip_pad(input, hdr.size)?;
+            *idx1_raw = Some(buf);
+        } else {
+            skip_chunk(input, &hdr)?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse a `LIST INFO` body (the 4-byte "INFO" form-type has already been
@@ -626,12 +693,17 @@ struct AviDemuxer {
     streams: Vec<StreamInfo>,
     /// For each stream, the expected 2-byte chunk-name suffix in `movi`.
     packet_chunk_suffix: Vec<[u8; 2]>,
-    /// Absolute start-of-movi offset (first chunk header after the `movi`
-    /// form-type FourCC). Retained so `seek_to` can bound against the
-    /// beginning of packet data.
+    /// Absolute start-of-first-movi offset. Retained so `seek_to` can bound
+    /// against the beginning of packet data and build_idx_table has an
+    /// offset base.
     movi_start: u64,
-    /// Absolute end-of-movi offset.
-    movi_end: u64,
+    /// All movi segments: `(start, end)` pairs. There is always at least
+    /// one; OpenDML `RIFF AVIX` extension RIFFs contribute additional
+    /// segments.
+    movi_segments: Vec<(u64, u64)>,
+    /// Index into `movi_segments` of the segment `next_packet` is
+    /// currently walking.
+    current_segment: usize,
     /// Running packet counter per stream — used to synthesise PTS.
     per_stream_counter: Vec<u64>,
     metadata: Vec<(String, String)>,
@@ -677,8 +749,19 @@ impl Demuxer for AviDemuxer {
             self.per_stream_counter = vec![0u64; self.streams.len()];
         }
         loop {
-            let pos = self.input.stream_position()?;
-            if pos >= self.movi_end {
+            let current_end = self
+                .movi_segments
+                .get(self.current_segment)
+                .map(|s| s.1)
+                .ok_or(Error::Eof)?;
+            if self.input.stream_position()? >= current_end {
+                // Advance to the next movi segment if there is one; its
+                // start is a separate region of the file.
+                self.current_segment += 1;
+                if let Some(&(next_start, _)) = self.movi_segments.get(self.current_segment) {
+                    self.input.seek(SeekFrom::Start(next_start))?;
+                    continue;
+                }
                 return Err(Error::Eof);
             }
             let hdr = match read_chunk_header(&mut *self.input)? {
@@ -694,7 +777,7 @@ impl Demuxer for AviDemuxer {
             }
             // End of movi guard in case sizes disagree.
             let body_end = self.input.stream_position()? + hdr.size as u64;
-            if body_end > self.movi_end {
+            if body_end > current_end {
                 // Truncated or bad size — stop.
                 return Err(Error::Eof);
             }
@@ -786,17 +869,22 @@ impl Demuxer for AviDemuxer {
             ))
         })?;
 
-        // Seek the input to the landed chunk header. Clamp to movi bounds
-        // so a corrupt idx1 can't send us outside the payload region.
+        // Seek the input to the landed chunk header. Clamp against the
+        // segment the offset lives in (idx1 only covers the primary
+        // segment, but we re-locate the matching segment anyway so a
+        // future indx/ix##-backed seek can point into later segments).
         let mut target_off = landed.offset;
         if target_off < self.movi_start {
             target_off = self.movi_start;
         }
-        if target_off >= self.movi_end {
-            return Err(Error::invalid(
-                "AVI: idx1 entry points past end of movi list",
-            ));
-        }
+        let seg = self
+            .movi_segments
+            .iter()
+            .position(|&(s, e)| target_off >= s && target_off < e)
+            .ok_or_else(|| {
+                Error::invalid("AVI: idx1 entry points past end of movi segments")
+            })?;
+        self.current_segment = seg;
         self.input.seek(SeekFrom::Start(target_off))?;
 
         // Reset per-stream pts counters. For streams we have idx entries
