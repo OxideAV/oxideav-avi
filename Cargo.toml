@@ -17,4 +17,4 @@ categories = ["multimedia::video", "parser-implementations"]
 oxideav-core = "0.1"
 oxideav-container = "0.1"
 [dev-dependencies]
-oxideav-mjpeg = "0.0"
+oxideav-mjpeg = "0.1"
