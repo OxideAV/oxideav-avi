@@ -20,11 +20,11 @@
 
 use std::io::{Seek, SeekFrom};
 
-use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext,
     Rational, Result, SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_map::{audio_codec_id_full, video_codec_id};
 use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_FORM, LIST, RIFF};
@@ -881,9 +881,7 @@ impl Demuxer for AviDemuxer {
             .movi_segments
             .iter()
             .position(|&(s, e)| target_off >= s && target_off < e)
-            .ok_or_else(|| {
-                Error::invalid("AVI: idx1 entry points past end of movi segments")
-            })?;
+            .ok_or_else(|| Error::invalid("AVI: idx1 entry points past end of movi segments"))?;
         self.current_segment = seg;
         self.input.seek(SeekFrom::Start(target_off))?;
 

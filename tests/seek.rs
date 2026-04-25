@@ -6,11 +6,11 @@
 
 use std::io::Cursor;
 
-use oxideav_container::{ReadSeek, WriteSeek};
 use oxideav_core::{
     CodecId, CodecParameters, Error, MediaType, Packet, PixelFormat, Rational, SampleFormat,
     StreamInfo, TimeBase,
 };
+use oxideav_core::{ReadSeek, WriteSeek};
 
 /// Build a deterministic JPEG-ish payload. The demuxer round-trips the bytes
 /// verbatim so we don't actually need a valid JPEG — just something unique

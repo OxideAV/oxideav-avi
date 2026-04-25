@@ -13,7 +13,7 @@ pub mod muxer;
 pub mod riff;
 pub mod stream_format;
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 
 pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("avi", demuxer::open);
@@ -23,7 +23,7 @@ pub fn register(reg: &mut ContainerRegistry) {
 }
 
 /// `RIFF....AVI ` — RIFF chunk with form type AVI (note the trailing space).
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() >= 12 && &p.buf[0..4] == b"RIFF" && &p.buf[8..12] == b"AVI " {
         100
     } else {

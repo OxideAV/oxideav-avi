@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use oxideav_container::ReadSeek;
+use oxideav_core::ReadSeek;
 
 const FFMPEG: &str = "/usr/bin/ffmpeg";
 

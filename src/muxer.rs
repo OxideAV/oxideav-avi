@@ -20,8 +20,8 @@
 
 use std::io::{Seek, SeekFrom, Write};
 
-use oxideav_container::{Muxer, WriteSeek};
 use oxideav_core::{Error, Packet, Result, StreamInfo};
+use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_map::{build_strf, StrfEntry};
 use crate::riff::{begin_list, finish_chunk, write_chunk, AVI_FORM, LIST, RIFF};
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn unsupported_codec_errors_at_open() {
-        use oxideav_container::WriteSeek;
+        use oxideav_core::WriteSeek;
         use std::io::Cursor;
         let mut params = CodecParameters::audio(CodecId::new("opus"));
         params.channels = Some(2);

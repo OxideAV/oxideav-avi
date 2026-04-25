@@ -3,11 +3,11 @@
 
 use std::io::Read;
 
-use oxideav_container::{ReadSeek, WriteSeek};
 use oxideav_core::{
     CodecId, CodecParameters, MediaType, Packet, PixelFormat, Rational, SampleFormat, StreamInfo,
     TimeBase,
 };
+use oxideav_core::{ReadSeek, WriteSeek};
 
 fn pcm_stream() -> StreamInfo {
     let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
