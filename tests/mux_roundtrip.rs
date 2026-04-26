@@ -95,12 +95,9 @@ fn mjpeg_roundtrip_via_avi() {
     let cr_plane: Vec<u8> = vec![128u8; chroma_w * chroma_h];
 
     let time_base = TimeBase::new(1, 25);
+    let _ = (time_base, PixelFormat::Yuv420P, h);
     let frame = Frame::Video(VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base,
         planes: vec![
             VideoPlane {
                 stride: w as usize,
