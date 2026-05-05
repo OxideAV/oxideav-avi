@@ -15,11 +15,20 @@ pub mod stream_format;
 
 use oxideav_core::ContainerRegistry;
 
-pub fn register(reg: &mut ContainerRegistry) {
+pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer("avi", demuxer::open);
     reg.register_muxer("avi", muxer::open);
     reg.register_extension("avi", "avi");
     reg.register_probe("avi", probe);
+}
+
+/// Install the AVI container into a [`oxideav_core::RuntimeContext`].
+///
+/// Convenience wrapper around [`register_containers`] that matches the
+/// uniform `register(&mut RuntimeContext)` entry point every sibling
+/// crate exposes.
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_containers(&mut ctx.containers);
 }
 
 /// `RIFF....AVI ` — RIFF chunk with form type AVI (note the trailing space).
@@ -28,5 +37,17 @@ fn probe(p: &oxideav_core::ProbeData) -> u8 {
         100
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_container() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        assert_eq!(ctx.containers.container_for_extension("avi"), Some("avi"));
     }
 }
