@@ -27,9 +27,16 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// Convenience wrapper around [`register_containers`] that matches the
 /// uniform `register(&mut RuntimeContext)` entry point every sibling
 /// crate exposes.
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick AVI up
+/// without any explicit umbrella plumbing.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
+
+oxideav_core::register!("avi", register);
 
 /// `RIFF....AVI ` — RIFF chunk with form type AVI (note the trailing space).
 fn probe(p: &oxideav_core::ProbeData) -> u8 {
