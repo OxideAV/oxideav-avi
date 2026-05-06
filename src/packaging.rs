@@ -2,24 +2,22 @@
 //!
 //! Builds the per-stream `strf` chunk (a `BITMAPINFOHEADER` for video or a
 //! `WAVEFORMATEX` for audio) plus the metadata the muxer needs to write the
-//! `strh` chunk and tag movi packets. Codec ↔ on-wire-tag resolution flows
-//! through `oxideav_core::CodecResolver::tag_for_codec`: each codec crate
-//! declares its FourCC / `WAVE_FORMAT_*` claims via
-//! `CodecInfo::tags(...)`, the registry indexes them, and this module asks
-//! the registry the inverse question — "which tag should I write for this
-//! codec_id?". `NullCodecResolver` is supported as a default; the muxer
-//! returns `Error::Unsupported` for codecs the registry can't resolve.
+//! `strh` chunk and tag movi packets. Codec ↔ on-wire-tag resolution reads
+//! `CodecParameters::tag` directly — set by the demuxer at read-time
+//! (round-trip preservation) or by the encoder via `output_params()` at
+//! configure-time (multi-FourCC codecs like MagicYUV's 17 native v7
+//! variants). The muxer no longer consults the codec registry for the
+//! inverse direction; the registry's "first-declared tag for this codec_id"
+//! answer is arbitrary on multi-tag codecs and was breaking round-trip.
 //!
 //! The PCM family is the one place where bit-depth-aware tag synthesis is
-//! still needed: integer PCM (`WaveFormat(0x0001)`) and IEEE float
-//! (`WaveFormat(0x0003)`) are claimed by multiple `pcm_*` codecs sharing the
-//! same wFormatTag — the muxer reads `params.sample_format` to pick the
-//! depth that goes into the WAVEFORMATEX `wBitsPerSample` field.
+//! still done: integer PCM (`WaveFormat(0x0001)`) and IEEE float
+//! (`WaveFormat(0x0003)`) are shared across every `pcm_*` codec, so when
+//! `params.tag` is `None` and the codec id is in the PCM family the muxer
+//! synthesises the right `wFormatTag` from the codec id; `params.sample_format`
+//! still drives the WAVEFORMATEX `wBitsPerSample` field.
 
-use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, CodecTag, CodecTagKind, Error, MediaType, Result,
-    SampleFormat,
-};
+use oxideav_core::{CodecId, CodecParameters, CodecTag, Error, MediaType, Result, SampleFormat};
 
 use crate::stream_format::{write_bitmap_info_header, write_waveformatex};
 
@@ -45,17 +43,14 @@ pub(crate) struct StrfEntry {
 
 /// Build the `strf` chunk + `strh` metadata for the given stream.
 ///
-/// Returns `Error::Unsupported` when the resolver doesn't know which
-/// FourCC / wFormatTag this `codec_id` writes to (i.e. the codec crate
-/// hasn't registered its tags) AND the codec isn't an uncompressed
-/// PCM family for which we synthesise the tag from `sample_format`.
-pub(crate) fn build_strf(
-    params: &CodecParameters,
-    codecs: &dyn CodecResolver,
-) -> Result<StrfEntry> {
+/// Returns `Error::Unsupported` when no wire tag can be derived: no
+/// `params.tag`, no printable `extradata[0..4]` hint, and the codec
+/// id isn't an uncompressed `rgb24` / PCM family for which the tag
+/// is synthesised.
+pub(crate) fn build_strf(params: &CodecParameters) -> Result<StrfEntry> {
     match params.media_type {
-        MediaType::Video => build_video_strf(params, codecs),
-        MediaType::Audio => build_audio_strf(params, codecs),
+        MediaType::Video => build_video_strf(params),
+        MediaType::Audio => build_audio_strf(params),
         _ => Err(Error::unsupported(format!(
             "avi muxer: media type {:?} not supported",
             params.media_type
@@ -66,52 +61,52 @@ pub(crate) fn build_strf(
 /// Pick the wire FourCC for a video stream.
 ///
 /// Resolution order:
-/// 1. The first 4 bytes of `extradata` if they spell a printable FourCC
-///    (used by codecs with multiple equivalent wire FourCCs that want
-///    the caller to pick — e.g. mpeg4video can be `XVID` / `DIVX` /
-///    `DX50` etc.).
-/// 2. `CodecResolver::tag_for_codec(codec_id, Fourcc)` — the codec crate's
-///    canonical FourCC declared via `CodecInfo::tags`.
-/// 3. The `[0,0,0,0]` `BI_RGB` sentinel for `rgb24` (the one codec id we
-///    can't ever round-trip through the registry because the
-///    "FourCC" is all-zero bytes — a valid `CodecTag::Fourcc` value
-///    but conventionally not registered).
-fn video_fourcc(params: &CodecParameters, codecs: &dyn CodecResolver) -> Result<[u8; 4]> {
+/// 1. **`params.tag` if `Some(CodecTag::Fourcc(...))`** — the
+///    canonical primary path. Set by the demuxer at read-time (so
+///    round-trip preserves the original FourCC byte-for-byte) or by
+///    the encoder's `output_params()` at configure-time.
+/// 2. The first 4 bytes of `extradata` if they spell a printable
+///    FourCC — legacy fallback for callers that haven't migrated to
+///    `params.tag` yet.
+/// 3. The `[0,0,0,0]` `BI_RGB` sentinel for `rgb24` (the one codec
+///    id whose "FourCC" is all-zero bytes).
+fn video_fourcc(params: &CodecParameters) -> Result<[u8; 4]> {
+    if let Some(CodecTag::Fourcc(bytes)) = &params.tag {
+        return Ok(*bytes);
+    }
     if let Some(hint) = extradata_fourcc_hint(&params.extradata) {
         return Ok(hint);
-    }
-    if let Some(CodecTag::Fourcc(bytes)) =
-        codecs.tag_for_codec(&params.codec_id, CodecTagKind::Fourcc)
-    {
-        return Ok(bytes);
     }
     if params.codec_id.as_str() == "rgb24" {
         return Ok([0, 0, 0, 0]);
     }
     Err(Error::unsupported(format!(
-        "avi muxer: codec `{}` has no registered FourCC; \
-         pre-fill `extradata`'s first 4 bytes with the desired FourCC \
-         or register the codec via `CodecInfo::tags(...)`",
+        "avi muxer: codec `{}` has no FourCC; \
+         set `params.tag = Some(CodecTag::fourcc(...))` (preferred), \
+         or pre-fill `extradata`'s first 4 bytes with the desired FourCC",
         params.codec_id
     )))
 }
 
-/// Pick the wFormatTag for an audio stream. Synthesises the tag for the
-/// PCM families directly from `sample_format` because the same
-/// `wFormatTag` value is shared by every depth in the integer-PCM and
-/// IEEE-float-PCM groups; otherwise consults the registry's inverse
-/// lookup.
-fn audio_format_tag(params: &CodecParameters, codecs: &dyn CodecResolver) -> Result<u16> {
+/// Pick the wFormatTag for an audio stream.
+///
+/// Resolution order:
+/// 1. **`params.tag` if `Some(CodecTag::WaveFormat(...))`** — the
+///    canonical primary path.
+/// 2. PCM-family synthesis: integer PCM and IEEE-float-PCM share
+///    one wFormatTag value across every depth, so the muxer derives
+///    `0x0001` / `0x0003` from the codec id directly. This applies
+///    regardless of whether `params.tag` is set.
+fn audio_format_tag(params: &CodecParameters) -> Result<u16> {
+    if let Some(CodecTag::WaveFormat(t)) = &params.tag {
+        return Ok(*t);
+    }
     if let Some(synth) = pcm_synth_format_tag(&params.codec_id) {
         return Ok(synth);
     }
-    if let Some(CodecTag::WaveFormat(t)) =
-        codecs.tag_for_codec(&params.codec_id, CodecTagKind::WaveFormat)
-    {
-        return Ok(t);
-    }
     Err(Error::unsupported(format!(
-        "avi muxer: codec `{}` has no registered WAVEFORMATEX wFormatTag",
+        "avi muxer: codec `{}` has no WAVEFORMATEX wFormatTag; \
+         set `params.tag = Some(CodecTag::wave_format(...))`",
         params.codec_id
     )))
 }
@@ -150,14 +145,14 @@ fn extradata_fourcc_hint(extradata: &[u8]) -> Option<[u8; 4]> {
     Some(hint)
 }
 
-fn build_video_strf(params: &CodecParameters, codecs: &dyn CodecResolver) -> Result<StrfEntry> {
+fn build_video_strf(params: &CodecParameters) -> Result<StrfEntry> {
     let width = params
         .width
         .ok_or_else(|| Error::invalid("avi muxer: video stream missing width"))?;
     let height = params
         .height
         .ok_or_else(|| Error::invalid("avi muxer: video stream missing height"))?;
-    let fourcc = video_fourcc(params, codecs)?;
+    let fourcc = video_fourcc(params)?;
     // bit_count: 24 for compressed bitstreams (the conventional advisory
     // value); for BI_RGB we use 24 too (24-bit packed RGB is the
     // canonical uncompressed AVI pixel format we package).
@@ -181,14 +176,14 @@ fn build_video_strf(params: &CodecParameters, codecs: &dyn CodecResolver) -> Res
     })
 }
 
-fn build_audio_strf(params: &CodecParameters, codecs: &dyn CodecResolver) -> Result<StrfEntry> {
+fn build_audio_strf(params: &CodecParameters) -> Result<StrfEntry> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("avi muxer: audio stream missing channels"))?;
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("avi muxer: audio stream missing sample_rate"))?;
-    let format_tag = audio_format_tag(params, codecs)?;
+    let format_tag = audio_format_tag(params)?;
     let id = params.codec_id.as_str();
 
     // PCM family: choose bit_depth from sample_format (or codec_id), and
@@ -291,17 +286,6 @@ fn video_scale_rate(params: &CodecParameters) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::{CodecCapabilities, CodecInfo, CodecRegistry};
-
-    fn registry_with(id: &str, tags: &[CodecTag]) -> CodecRegistry {
-        let mut reg = CodecRegistry::new();
-        let mut info = CodecInfo::new(CodecId::new(id)).capabilities(CodecCapabilities::audio(id));
-        for t in tags {
-            info = info.tag(t.clone());
-        }
-        reg.register(info);
-        reg
-    }
 
     #[test]
     fn extradata_hint_picks_uppercase_printable() {
@@ -314,34 +298,47 @@ mod tests {
     }
 
     #[test]
-    fn video_fourcc_reads_extradata_hint() {
-        // Codec is unregistered, but extradata hint wins.
-        let reg = CodecRegistry::new();
-        let mut p = CodecParameters::video(CodecId::new("magicyuv"));
+    fn video_fourcc_reads_params_tag() {
+        // Canonical primary path: `params.tag` carries the wire FourCC.
+        let mut p =
+            CodecParameters::video(CodecId::new("magicyuv")).with_tag(CodecTag::fourcc(b"M8RG"));
         p.width = Some(64);
         p.height = Some(64);
-        p.extradata = b"M8YA-extra".to_vec();
-        let fc = video_fourcc(&p, &reg).unwrap();
-        assert_eq!(&fc, b"M8YA");
-    }
-
-    #[test]
-    fn video_fourcc_falls_through_to_registry() {
-        let reg = registry_with("magicyuv", &[CodecTag::fourcc(b"M8RG")]);
-        let mut p = CodecParameters::video(CodecId::new("magicyuv"));
-        p.width = Some(64);
-        p.height = Some(64);
-        let fc = video_fourcc(&p, &reg).unwrap();
+        let fc = video_fourcc(&p).unwrap();
         assert_eq!(&fc, b"M8RG");
     }
 
     #[test]
+    fn video_fourcc_params_tag_wins_over_extradata_hint() {
+        // When both are set, `params.tag` is authoritative — the
+        // demuxer / encoder is the canonical source of truth.
+        let mut p =
+            CodecParameters::video(CodecId::new("magicyuv")).with_tag(CodecTag::fourcc(b"M8RG"));
+        p.width = Some(64);
+        p.height = Some(64);
+        p.extradata = b"M8YAtail".to_vec();
+        let fc = video_fourcc(&p).unwrap();
+        assert_eq!(&fc, b"M8RG");
+    }
+
+    #[test]
+    fn video_fourcc_falls_back_to_extradata_hint() {
+        // Legacy fallback: no `params.tag` set, extradata's first 4
+        // bytes spell a printable FourCC.
+        let mut p = CodecParameters::video(CodecId::new("magicyuv"));
+        p.width = Some(64);
+        p.height = Some(64);
+        p.extradata = b"M8YA-extra".to_vec();
+        let fc = video_fourcc(&p).unwrap();
+        assert_eq!(&fc, b"M8YA");
+    }
+
+    #[test]
     fn video_fourcc_unknown_codec_errors() {
-        let reg = CodecRegistry::new();
         let mut p = CodecParameters::video(CodecId::new("noexist"));
         p.width = Some(64);
         p.height = Some(64);
-        match video_fourcc(&p, &reg) {
+        match video_fourcc(&p) {
             Err(Error::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -349,36 +346,34 @@ mod tests {
 
     #[test]
     fn rgb24_uses_bi_rgb_sentinel() {
-        // No registry claim, no extradata hint → the codec_id-side
+        // No params.tag, no extradata hint → the codec_id-side
         // synthetic for BI_RGB is a special case.
-        let reg = CodecRegistry::new();
         let mut p = CodecParameters::video(CodecId::new("rgb24"));
         p.width = Some(64);
         p.height = Some(64);
-        let fc = video_fourcc(&p, &reg).unwrap();
+        let fc = video_fourcc(&p).unwrap();
         assert_eq!(&fc, &[0, 0, 0, 0]);
     }
 
     #[test]
     fn pcm_format_tag_is_synthesised() {
-        // PCM codecs share wFormatTag values, so the muxer doesn't
-        // need a registered claim for the inverse direction.
-        let reg = CodecRegistry::new();
+        // PCM codecs share wFormatTag values, so the muxer derives
+        // them from the codec id without needing `params.tag`.
         let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, &reg).unwrap();
+        let entry = build_strf(&p).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         assert_eq!(entry.sample_size, 4); // 2ch × 2B
     }
 
     #[test]
-    fn compressed_audio_uses_registry_tag() {
-        let reg = registry_with("mp3", &[CodecTag::wave_format(0x0055)]);
-        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+    fn compressed_audio_uses_params_tag() {
+        let mut p =
+            CodecParameters::audio(CodecId::new("mp3")).with_tag(CodecTag::wave_format(0x0055));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, &reg).unwrap();
+        let entry = build_strf(&p).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         // First 2 bytes of the WAVEFORMATEX are the wFormatTag in LE.
         assert_eq!(&entry.strf[0..2], &0x0055u16.to_le_bytes());
@@ -386,29 +381,12 @@ mod tests {
 
     #[test]
     fn unknown_audio_codec_errors() {
-        let reg = CodecRegistry::new();
         let mut p = CodecParameters::audio(CodecId::new("noexist"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        match build_strf(&p, &reg) {
+        match build_strf(&p) {
             Err(Error::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn magicyuv_extradata_hint_overrides_registry() {
-        // Registry says M8RG but extradata says M8YA.
-        let reg = registry_with(
-            "magicyuv",
-            &[CodecTag::fourcc(b"M8RG"), CodecTag::fourcc(b"M8YA")],
-        );
-        let mut p = CodecParameters::video(CodecId::new("magicyuv"));
-        p.width = Some(64);
-        p.height = Some(64);
-        p.extradata = b"M8YAtail".to_vec();
-        let entry = build_strf(&p, &reg).unwrap();
-        assert_eq!(&entry.handler_fourcc, b"M8YA");
-        assert!(entry.strf.ends_with(b"M8YAtail"));
     }
 }

@@ -114,7 +114,8 @@ fn mjpeg_roundtrip_via_avi() {
         ],
     });
 
-    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"));
+    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"))
+        .with_tag(oxideav_core::CodecTag::fourcc(b"MJPG"));
     enc_params.media_type = MediaType::Video;
     enc_params.width = Some(w);
     enc_params.height = Some(h);
@@ -137,9 +138,8 @@ fn mjpeg_roundtrip_via_avi() {
         params: enc_params.clone(),
     };
 
-    // Codec resolver populated with mjpeg's tag claims so the muxer
-    // can pick the wire FourCC (`MJPG`) without a hand-maintained
-    // codec_map table.
+    // Forward registry for the demuxer's `resolve_tag(MJPG → mjpeg)`
+    // direction. The muxer reads `stream.params.tag` directly.
     let mut reg = oxideav_core::CodecRegistry::new();
     oxideav_mjpeg::register_codecs(&mut reg);
 
@@ -147,8 +147,7 @@ fn mjpeg_roundtrip_via_avi() {
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux =
-            oxideav_avi::muxer::open_with_codecs(ws, std::slice::from_ref(&stream), &reg).unwrap();
+        let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
         mux.write_header().unwrap();
         let mut pkt = Packet::new(0, time_base, jpeg_bytes.clone());
         pkt.pts = Some(0);
@@ -251,14 +250,17 @@ fn pcm_variants_roundtrip_codec_ids() {
 #[test]
 fn alaw_mulaw_roundtrip() {
     // G.711 A-law / μ-law: 1 byte per sample, 2 channels, 8 kHz.
-    // The wire wFormatTag claims (0x0006 / 0x0007) come from
-    // oxideav-g711's `register_codecs`, so the muxer resolves them
-    // through the registry rather than a hand-maintained codec_map.
+    // The wire wFormatTag (0x0006 / 0x0007) is set on `params.tag`
+    // by the caller (would be the encoder's `output_params()` in
+    // production); the demuxer's forward `resolve_tag` direction is
+    // populated from oxideav-g711's `register_codecs` for the
+    // codec_id round-trip.
     let mut reg = oxideav_core::CodecRegistry::new();
     oxideav_g711::register_codecs(&mut reg);
 
-    for codec in &["pcm_alaw", "pcm_mulaw"] {
-        let mut params = CodecParameters::audio(CodecId::new(*codec));
+    for (codec, wave_tag) in &[("pcm_alaw", 0x0006u16), ("pcm_mulaw", 0x0007u16)] {
+        let mut params = CodecParameters::audio(CodecId::new(*codec))
+            .with_tag(oxideav_core::CodecTag::wave_format(*wave_tag));
         params.channels = Some(2);
         params.sample_rate = Some(8_000);
         let stream = StreamInfo {
@@ -273,9 +275,7 @@ fn alaw_mulaw_roundtrip() {
         {
             let f = std::fs::File::create(&tmp).unwrap();
             let ws: Box<dyn WriteSeek> = Box::new(f);
-            let mut mux =
-                oxideav_avi::muxer::open_with_codecs(ws, std::slice::from_ref(&stream), &reg)
-                    .unwrap();
+            let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
             mux.write_header().unwrap();
             let mut pkt = Packet::new(0, stream.time_base, payload.clone());
             pkt.pts = Some(0);

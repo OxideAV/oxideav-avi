@@ -7,8 +7,8 @@
 use std::io::Cursor;
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecRegistry, Error, MediaType, Packet, PixelFormat, Rational,
-    SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecRegistry, CodecTag, Error, MediaType, Packet, PixelFormat,
+    Rational, SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{ReadSeek, WriteSeek};
 
@@ -49,7 +49,8 @@ fn pcm_payload(frames: usize, phase: u16) -> Vec<u8> {
 fn seek_to_video_midway_lands_on_keyframe() {
     // Two streams: video (MJPEG, 25 fps) + audio (PCM s16 stereo, 48 kHz).
     let time_base_v = TimeBase::new(1, 25);
-    let mut vparams = CodecParameters::video(CodecId::new("mjpeg"));
+    let mut vparams =
+        CodecParameters::video(CodecId::new("mjpeg")).with_tag(CodecTag::fourcc(b"MJPG"));
     vparams.media_type = MediaType::Video;
     vparams.width = Some(64);
     vparams.height = Some(64);
@@ -81,12 +82,14 @@ fn seek_to_video_midway_lands_on_keyframe() {
     // Mux into an in-memory buffer. All video frames flagged as keyframes
     // (every MJPEG frame is a keyframe). Use a temp file so we can hand
     // the demuxer a fresh `Box<dyn ReadSeek>` independent of the writer.
+    // The muxer reads `params.tag` directly; the registry is only
+    // needed for the demuxer's forward `resolve_tag` path.
     let reg = registry_with_mjpeg();
     let tmp = std::env::temp_dir().join("oxideav-avi-seek-video.avi");
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let writer: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux = oxideav_avi::muxer::open_with_codecs(writer, &streams, &reg).unwrap();
+        let mut mux = oxideav_avi::muxer::open(writer, &streams).unwrap();
         mux.write_header().unwrap();
 
         // 10 video frames + matching audio packets per frame (1920 samples
@@ -141,7 +144,8 @@ fn seek_to_video_midway_lands_on_keyframe() {
 fn seek_to_without_idx1_is_unsupported() {
     // Build a minimal AVI, then strip the idx1 chunk to simulate a file
     // written by a muxer that didn't emit a legacy index.
-    let mut vparams = CodecParameters::video(CodecId::new("mjpeg"));
+    let mut vparams =
+        CodecParameters::video(CodecId::new("mjpeg")).with_tag(CodecTag::fourcc(b"MJPG"));
     vparams.media_type = MediaType::Video;
     vparams.width = Some(32);
     vparams.height = Some(32);
@@ -160,9 +164,7 @@ fn seek_to_without_idx1_is_unsupported() {
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let writer: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux =
-            oxideav_avi::muxer::open_with_codecs(writer, std::slice::from_ref(&stream), &reg)
-                .unwrap();
+        let mut mux = oxideav_avi::muxer::open(writer, std::slice::from_ref(&stream)).unwrap();
         mux.write_header().unwrap();
         let mut pkt = Packet::new(0, stream.time_base, fake_video_packet(0));
         pkt.pts = Some(0);

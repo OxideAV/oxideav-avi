@@ -16,26 +16,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-maintained table with the shared registry surface and
   removes a class of "container forgot to update its codec_map"
   bugs entirely.
-  - **Demuxer**: `biCompression` (video) and `wFormatTag` (audio)
-    flow through `CodecResolver::resolve_tag` first; on a miss the
-    demuxer surfaces synthetic placeholder ids
-    (`avi:<fourcc>` for video, `avi:tag_<hex>` for audio, plus the
-    depth-aware `pcm_*` fallback for `WAVE_FORMAT_PCM` /
-    `WAVE_FORMAT_IEEE_FLOAT`) so downstream `make_decoder` lookup
-    fails with a clean "codec not registered" error.
-  - **Muxer**: `CodecParameters::codec_id` flows through
-    `CodecResolver::tag_for_codec(codec_id, CodecTagKind::Fourcc)`
-    (video) / `CodecTagKind::WaveFormat` (audio) for the inverse
-    direction. The first 4 bytes of `extradata` are still honoured
-    as a wire-FourCC hint (multi-FourCC codecs like `mpeg4video` or
-    `magicyuv`'s 17 native v7 variants — the caller picks).
-- New `muxer::open_with_codecs` and `muxer::open_with_codecs_and_kind`
-  ctors accept an `&dyn CodecResolver`. The legacy
-  `muxer::open` / `muxer::open_with_kind` overloads default to
-  `&NullCodecResolver` and only succeed for codecs the muxer can
-  derive without registry data (PCM families + extradata-hint
-  codecs + uncompressed `rgb24`); compressed codecs require the
-  registry-aware constructor.
+- **Switch wire-tag resolution to `CodecParameters::tag`**.
+  - **Demuxer**: stamps `params.tag = Some(CodecTag::fourcc(...))`
+    (video, from `bmih.bi_compression`) /
+    `Some(CodecTag::wave_format(...))` (audio, from `wfx.format_tag`)
+    so a muxer re-emitting the stream round-trips the demuxed
+    FourCC / wFormatTag byte-for-byte. Forward
+    `CodecResolver::resolve_tag` direction is unchanged.
+  - **Muxer**: new resolution priority — (1) `params.tag` if set,
+    (2) printable `extradata[0..4]` as a legacy fallback,
+    (3) `[0,0,0,0]` BI_RGB sentinel for `rgb24` (video) / PCM-family
+    synthesis from codec_id (audio). The previous
+    `CodecResolver::tag_for_codec` path is gone (removed in
+    `oxideav-core` 0.1.26 — registering a codec_id's "first
+    declared FourCC" was arbitrary on multi-tag codecs and broke
+    round-trip). Multi-FourCC codecs (`mpeg4video` /
+    `magicyuv`'s 17 native v7 variants) get the right FourCC by
+    setting `params.tag` on the encoder side or letting the demuxer
+    propagate it from the source file.
+- **API surface**: dropped `muxer::open_with_codecs` and
+  `muxer::open_with_codecs_and_kind` — the muxer no longer needs an
+  `&dyn CodecResolver`. Use `muxer::open` / `muxer::open_with_kind`
+  with `params.tag` set on each stream.
 
 ### Added
 

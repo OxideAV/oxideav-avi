@@ -486,6 +486,10 @@ fn build_stream(
                 .resolve_tag(&ctx)
                 .unwrap_or_else(|| video_codec_id_fallback(&compression));
             let mut p = CodecParameters::video(codec_id.clone());
+            // Stamp the on-wire FourCC straight onto the params so a
+            // muxer re-emitting this stream round-trips byte-for-byte
+            // (no walking the registry's first-declared tag).
+            p.tag = Some(CodecTag::fourcc(&compression));
             if let Some(b) = &bmih {
                 p.width = Some(b.width);
                 p.height = Some(b.height);
@@ -521,6 +525,9 @@ fn build_stream(
                 .resolve_tag(&ctx)
                 .unwrap_or_else(|| audio_codec_id_fallback(format_tag, bits));
             let mut p = CodecParameters::audio(codec_id.clone());
+            // Stamp the on-wire wFormatTag onto the params for
+            // round-trip preservation.
+            p.tag = Some(CodecTag::wave_format(format_tag));
             if let Some(w) = &wfx {
                 p.channels = Some(w.channels);
                 p.sample_rate = Some(w.samples_per_sec);

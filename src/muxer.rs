@@ -30,7 +30,7 @@
 
 use std::io::{Seek, SeekFrom, Write};
 
-use oxideav_core::{CodecResolver, Error, NullCodecResolver, Packet, Result, StreamInfo};
+use oxideav_core::{Error, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::packaging::{build_strf, StrfEntry};
@@ -113,53 +113,27 @@ struct TrackState {
     total_bytes: u64,
 }
 
-/// Factory registered with the container registry. Defaults to
-/// [`AviKind::Avi10`]; use [`open_with_kind`] / [`open_with_codecs`]
-/// to opt into OpenDML or pass a populated codec registry for
-/// `codec_id → wire FourCC` resolution.
+/// Open an AVI muxer with the legacy single-`RIFF AVI ` envelope.
 ///
-/// **Note**: this overload uses [`NullCodecResolver`] for codec → tag
-/// inverse lookup, which means callers can only mux codecs whose
-/// FourCC the muxer can derive without a registry — i.e. PCM /
-/// companded-PCM / `rgb24` audio + uncompressed video, or compressed
-/// codecs whose first 4 bytes of `params.extradata` carry an explicit
-/// FourCC hint. For everything else (mjpeg, h264, mp3, …) call
-/// [`open_with_codecs`] with a registry that has the codec crate's
-/// `register(...)` already applied.
+/// Per-stream wire tags come from each stream's
+/// [`oxideav_core::CodecParameters::tag`] field — the demuxer sets
+/// it from the source container at read-time, encoders set it via
+/// `output_params()`. For codecs that haven't migrated yet the
+/// muxer also accepts a printable FourCC hint in
+/// `params.extradata[0..4]` and synthesises wFormatTag for the PCM
+/// families directly from the codec id. Everything else returns
+/// `Error::Unsupported` from `open()`.
+///
+/// To select the OpenDML 2.0 envelope, use [`open_with_kind`].
 pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
-    open_with_codecs_and_kind(output, streams, &NullCodecResolver, AviKind::Avi10)
+    open_with_kind(output, streams, AviKind::Avi10)
 }
 
 /// Open an AVI muxer with an explicit envelope variant. See [`open`]
-/// for the default codec-resolution behaviour.
+/// for the wire-tag resolution rules.
 pub fn open_with_kind(
     output: Box<dyn WriteSeek>,
     streams: &[StreamInfo],
-    kind: AviKind,
-) -> Result<Box<dyn Muxer>> {
-    open_with_codecs_and_kind(output, streams, &NullCodecResolver, kind)
-}
-
-/// Open an AVI muxer with a codec-tag resolver. The resolver answers
-/// "what FourCC / wFormatTag should I write for this codec_id?" via
-/// [`CodecResolver::tag_for_codec`]. Pass `&CodecRegistry` (after
-/// every relevant codec crate's `register_codecs(&mut reg)` has been
-/// called) to make the muxer codec-aware.
-pub fn open_with_codecs(
-    output: Box<dyn WriteSeek>,
-    streams: &[StreamInfo],
-    codecs: &dyn CodecResolver,
-) -> Result<Box<dyn Muxer>> {
-    open_with_codecs_and_kind(output, streams, codecs, AviKind::Avi10)
-}
-
-/// Most-general muxer constructor: explicit envelope variant + codec
-/// resolver. See [`open`] / [`open_with_kind`] / [`open_with_codecs`]
-/// for the convenience overloads.
-pub fn open_with_codecs_and_kind(
-    output: Box<dyn WriteSeek>,
-    streams: &[StreamInfo],
-    codecs: &dyn CodecResolver,
     kind: AviKind,
 ) -> Result<Box<dyn Muxer>> {
     if streams.is_empty() {
@@ -173,7 +147,7 @@ pub fn open_with_codecs_and_kind(
     }
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
-        let entry = build_strf(&s.params, codecs)?;
+        let entry = build_strf(&s.params)?;
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {
             stream: s.clone(),
