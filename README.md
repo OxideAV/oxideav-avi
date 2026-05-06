@@ -27,13 +27,26 @@ oxideav-avi = "0.0"
 | `idx1` legacy index — parse for keyframe seek    | yes   | yes  |
 | `idx1` offsets — file-absolute + movi-relative   | yes   | yes  |
 | `LIST rec ` packet grouping inside `movi`        | yes   | no   |
-| OpenDML (AVI 2.0) `indx` / `ix##` / > 2 GiB      | no    | no   |
+| OpenDML 2.0 multi-`RIFF AVIX` continuation       | yes   | yes  |
+| OpenDML 2.0 `indx` super-index in `strl`         | yes (parse) | yes (emit) |
+| OpenDML-driven seeking (`indx` super-index)      | no (follow-up) | n/a |
 | Uncompressed `db` video chunks                   | yes   | yes  |
 | Variable stream interleave                       | yes   | yes  |
 | Palette-change (`pc`) chunks                     | skip  | no   |
 
-OpenDML is explicitly out of scope. The muxer refuses to grow past
-~2 GiB and returns `Error::Unsupported`.
+OpenDML 2.0 muxing is opt-in via `muxer::open_with_kind` with an
+`AviKind::OpenDml(RiffSegmentLimit::OneGiB)` (or `Bytes(n)` for
+testing). The muxer rolls a new `RIFF AVIX` segment whenever the
+running segment would exceed the byte ceiling; the primary segment
+carries an `indx` super-index in the first stream's `strl` with one
+entry per segment back-patched in `write_trailer`. Per-stream `ix##`
+chunks are intentionally omitted (spec/06 §6.1: from the codec's POV
+the super-index is informational; sequential decode walks every
+`RIFF AVIX` continuation directly). OpenDML-driven seeking off the
+super-index is a follow-up; `seek_to` still goes through the AVI
+1.0 `idx1` index only. The legacy `muxer::open` (which `Avi10`
+defaults to) refuses to grow past ~2 GiB and returns
+`Error::Unsupported`.
 
 ## Codec mapping
 
@@ -65,6 +78,7 @@ decoder.
 | `theora`       | `THEO`                                                                                          |
 | `huffyuv` / `ffvhuff` | `HFYU`, `FFVH`                                                                           |
 | `utvideo`      | `UTVS`, `ULRG`, `ULRA`, `ULY0`/`ULY2`/`ULY4`, `ULH0`/`ULH2`/`ULH4`                              |
+| `magicyuv`     | 8-bit `M8RG`/`M8RA`/`M8Y4`/`M8Y2`/`M8Y0`/`M8YA`/`M8G0`, 10-bit `M0RG`/`M0RA`/`M0Y4`/`M0Y2`/`M0Y0`/`M0G0`, 12-bit `M2RG`/`M2RA`, 14-bit `M4RG`/`M4RA` |
 | `prores`       | `APCH`, `APCN`, `APCS`, `APCO`, `AP4H`, `AP4X`                                                  |
 | `dv`           | `DVSD`, `DV25`, `DV50`, `DVC `, `DVCP`, `DVHD`, `DVH1`                                          |
 | `wmv1`/`wmv2`/`wmv3` | `WMV1`, `WMV2`, `WMV3`                                                                    |
@@ -111,10 +125,16 @@ decoder.
 
 Muxer-side packaging (`strf` + `strh`) is implemented for a subset of
 the above: `mjpeg`, `ffv1`, `mpeg1video`, `mpeg2video`, `mpeg4video`,
-`h263`, `h264`, `h265`, `vp8`, `vp9`, `av1`, `rgb24`, all six raw PCM
-variants (`pcm_u8`/`s16le`/`s24le`/`s32le`/`f32le`/`f64le`),
+`h263`, `h264`, `h265`, `vp8`, `vp9`, `av1`, `magicyuv`, `rgb24`, all
+six raw PCM variants (`pcm_u8`/`s16le`/`s24le`/`s32le`/`f32le`/`f64le`),
 `pcm_alaw`, `pcm_mulaw`, `mp2`, `mp3`, `aac`, `ac3`, `eac3`, `flac`.
 Other codec ids return `Error::Unsupported` at `open()`.
+
+For codec ids that share several FourCCs (e.g. `mpeg4video` →
+`XVID`/`DIVX`/...; `magicyuv` → 17 native FourCCs), the muxer picks a
+default FourCC unless the caller hints otherwise. For `magicyuv`, the
+hint is the leading 4 bytes of `CodecParameters::extradata` if they
+spell one of the 17 native FourCCs; otherwise `M8RG` is used.
 
 ## Quick use
 

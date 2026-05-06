@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- OpenDML 2.0 super-index encode in the muxer. New `AviKind` enum
+  (`Avi10` / `OpenDml(RiffSegmentLimit)`) and `RiffSegmentLimit` enum
+  (`OneGiB` / `Bytes(u64)`) opt the muxer into multi-`RIFF AVIX`
+  emission with an `indx` super-index in the first stream's `strl`.
+  Per-stream `ix##` chunks are intentionally omitted (spec/06 §6.1
+  carve-out: the codec consumes the sequence of packets one at a
+  time; ix## is informational). Use `muxer::open_with_kind` to opt
+  in; `muxer::open` continues to emit AVI 1.0 single-RIFF.
+- Demuxer now parses `indx` super-index chunks under `strl` for
+  validation (24-byte preamble + nEntriesInUse × 16 B). The existing
+  `RIFF AVIX` continuation walker (which handles multi-segment
+  decoding) was already in place; this round just adds the
+  super-index awareness inside `strl`.
+- MagicYUV native FourCC family (17 entries, spec/01 §4.1):
+  `M8RG`/`M8RA`/`M8Y4`/`M8Y2`/`M8Y0`/`M8YA`/`M8G0` (8-bit),
+  `M0RG`/`M0RA`/`M0Y4`/`M0Y2`/`M0Y0`/`M0G0` (10-bit),
+  `M2RG`/`M2RA` (12-bit), `M4RG`/`M4RA` (14-bit) all map to codec_id
+  `"magicyuv"`. Muxer side: codec_id `"magicyuv"` + an optional
+  4-byte FourCC hint at the start of `extradata` picks the wire
+  FourCC (default `M8RG`).
+
+### Notes
+
+- OpenDML-driven seeking from the `indx` super-index is a follow-up:
+  the demuxer parses `indx` for visibility but `seek_to` still
+  consults only the AVI 1.0 `idx1` table. AVI files without `idx1`
+  (streamed / OpenDML-only) return `Error::Unsupported` for seek;
+  linear decode still walks every `RIFF AVIX` continuation.
+
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-avi/compare/v0.0.4...v0.0.5) - 2026-05-03
 
 ### Other

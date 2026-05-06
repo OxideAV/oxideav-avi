@@ -1,6 +1,6 @@
 //! AVI (RIFF/AVI) muxer.
 //!
-//! Output layout:
+//! Output layout (AVI 1.0):
 //! ```text
 //! RIFF(AVI )
 //!   LIST(hdrl)
@@ -8,15 +8,24 @@
 //!     LIST(strl) × N
 //!       strh                ← stream header
 //!       strf                ← BITMAPINFOHEADER or WAVEFORMATEX
+//!       [ indx ]            ← OpenDML 2.0 super-index (AviKind::OpenDml)
 //!   LIST(movi)              ← packet chunks: NNdc / NNwb / NNdb
 //!   idx1                    ← legacy index (written in write_trailer)
 //! ```
 //!
-//! - The public `Muxer` API is codec-agnostic. The only codec-aware file is
-//!   `codec_map::build_strf`, which errors with `Unsupported` at `open()` for
-//!   codecs we don't package. `write_packet` never branches on codec.
-//! - OpenDML (`ix##`, super-index, > 2 GiB) is out of scope; exceeding the
-//!   32-bit RIFF size returns an error from `write_trailer`.
+//! For [`AviKind::OpenDml`] the muxer rolls additional `RIFF AVIX`
+//! segments after the primary `RIFF AVI ` envelope when the running
+//! file size approaches the configured [`RiffSegmentLimit`]. Each
+//! continuation contains a single `LIST movi` carrying further
+//! packet chunks. The primary segment carries an `indx` super-index
+//! in the first stream's `strl`; its entries are back-patched in
+//! `write_trailer` with each segment's `qwOffset` / `dwSize` /
+//! `dwDuration`.
+//!
+//! - The public `Muxer` API is codec-agnostic. The only codec-aware
+//!   file is `codec_map::build_strf`, which errors with `Unsupported`
+//!   at `open()` for codecs we don't package. `write_packet` never
+//!   branches on codec.
 
 use std::io::{Seek, SeekFrom, Write};
 
@@ -24,7 +33,58 @@ use oxideav_core::{Error, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_map::{build_strf, StrfEntry};
-use crate::riff::{begin_list, finish_chunk, write_chunk, AVI_FORM, LIST, RIFF};
+use crate::riff::{
+    begin_list, finish_chunk, write_chunk, write_chunk_header, AVI_FORM, LIST, RIFF,
+};
+
+/// Per-RIFF-segment byte ceiling for [`AviKind::OpenDml`] output.
+///
+/// AVI 1.0 conventionally caps each RIFF at 1 GiB to leave headroom
+/// for the legacy index and for tools that scan with 32-bit offsets;
+/// OpenDML 2.0 raises the per-segment ceiling but keeps the same
+/// per-RIFF accounting. Tests use `Bytes(small_value)` to force
+/// segmentation on tiny fixtures.
+#[derive(Clone, Copy, Debug)]
+pub enum RiffSegmentLimit {
+    /// 1 GiB per RIFF (the AVI 1.0 / OpenDML 2.0 convention).
+    OneGiB,
+    /// Custom byte ceiling. Clamped to a minimum of 4 KiB so the first
+    /// segment has room for `hdrl` + at least one frame.
+    Bytes(u64),
+}
+
+impl RiffSegmentLimit {
+    /// Resolved byte ceiling. `Bytes(n)` is clamped to `max(n, 4096)`.
+    pub fn bytes(self) -> u64 {
+        match self {
+            RiffSegmentLimit::OneGiB => 1024 * 1024 * 1024,
+            RiffSegmentLimit::Bytes(n) => n.max(4096),
+        }
+    }
+}
+
+/// AVI envelope variant.
+///
+/// `Avi10` is the legacy single-`RIFF AVI ` form; `OpenDml` is the
+/// OpenDML 2.0 multi-`RIFF` form per spec/06 §6.1. The OpenDML
+/// envelope's primary RIFF carries the `indx` super-index in the
+/// first video stream's `strl`; per-stream `ix##` chunks are
+/// intentionally omitted (spec/06 §6.1: "from the codec's POV, the
+/// super-index is informational"). Decoders that need per-frame
+/// random access inside an OpenDML continuation can fall back to
+/// linear walking — the demuxer in this crate already does so.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum AviKind {
+    /// AVI 1.0: single top-level `RIFF AVI ` chunk. Output must stay
+    /// below 2 GiB; exceeding that returns `Error::Unsupported` from
+    /// `write_packet`.
+    #[default]
+    Avi10,
+    /// OpenDML 2.0: a primary `RIFF AVI ` followed by zero or more
+    /// `RIFF AVIX` continuations. Each segment is bounded by the
+    /// supplied [`RiffSegmentLimit`].
+    OpenDml(RiffSegmentLimit),
+}
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
 #[derive(Clone, Copy, Debug)]
@@ -52,8 +112,25 @@ struct TrackState {
     total_bytes: u64,
 }
 
-/// Factory registered with the container registry.
+/// Factory registered with the container registry. Defaults to
+/// [`AviKind::Avi10`]; use [`open_with_kind`] to opt into OpenDML.
 pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    open_with_kind(output, streams, AviKind::Avi10)
+}
+
+/// Open an AVI muxer with an explicit envelope variant.
+///
+/// `Avi10` matches what [`open`] returns. `OpenDml(limit)` emits a
+/// primary `RIFF AVI ` segment with an OpenDML 2.0 super-index in
+/// the first video stream's `strl`, and rolls additional
+/// `RIFF AVIX` continuation segments whenever the running segment
+/// would exceed `limit.bytes()`. The primary segment still carries
+/// the legacy `idx1` for AVI-1.0 readers.
+pub fn open_with_kind(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    kind: AviKind,
+) -> Result<Box<dyn Muxer>> {
     if streams.is_empty() {
         return Err(Error::invalid("avi muxer: need at least one stream"));
     }
@@ -80,10 +157,16 @@ pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dy
     Ok(Box::new(AviMuxer {
         output,
         tracks,
+        kind,
         riff_size_off: 0,
         movi_size_off: 0,
         movi_start_off: 0,
         index: Vec::new(),
+        indx_entries_count_off: None,
+        indx_entries_start_off: None,
+        indx_entries_capacity: 0,
+        segments: Vec::new(),
+        current_segment_packets: 0,
         header_written: false,
         trailer_written: false,
     }))
@@ -96,23 +179,72 @@ fn packet_fourcc_for(index: u32, suffix: [u8; 2]) -> [u8; 4] {
     [tens, ones, suffix[0], suffix[1]]
 }
 
+/// One closed-out RIFF segment in OpenDML mode. Used to back-patch
+/// the `indx` super-index in `write_trailer`.
+#[derive(Clone, Copy, Debug)]
+struct SegmentRecord {
+    /// File-absolute offset of this segment's `RIFF` 4-CC.
+    riff_offset: u64,
+    /// Total byte length of the segment (= 8 + dwSize, including any
+    /// even-pad byte). Stored as the value to write into `dwSize` of
+    /// the indx entry per spec/06 §6.1 ("dwSize is the byte count of
+    /// the entire RIFF chunk including the 8-byte RIFF header").
+    total_size: u64,
+    /// Number of packets (frames) carried in this segment's `movi`
+    /// LIST. Becomes `dwDuration` in the indx entry. We sum across
+    /// all streams; for single-stream MagicYUV / video files this is
+    /// the per-stream frame count, which matches OpenDML's intent.
+    packet_count: u32,
+}
+
 struct AviMuxer {
     output: Box<dyn WriteSeek>,
     tracks: Vec<TrackState>,
-    /// Offset of the RIFF chunk size field.
+    kind: AviKind,
+    /// Offset of the current RIFF chunk's size field.
     riff_size_off: u64,
-    /// Offset of the movi LIST size field.
+    /// Offset of the current movi LIST size field.
     movi_size_off: u64,
-    /// Start offset of movi list body (i.e. of the "movi" form-type word).
-    /// AVI idx1 entries are offsets *from this point*, specifically from the
-    /// byte that is 4 bytes before the first chunk header (i.e. the `movi`
-    /// form-type fourcc).
+    /// Start offset of the current movi list body (i.e. of the
+    /// `"movi"` form-type word). idx1 entries are offsets from this
+    /// byte (specifically, from 4 bytes *before* the first chunk
+    /// header, which lands on the `movi` form-type four-cc).
     movi_start_off: u64,
-    /// Per-packet index entries, built as we write; emitted in `write_trailer`.
+    /// Per-packet idx1 entries for the primary segment. Emitted in
+    /// `write_trailer` regardless of `kind` so legacy AVI-1.0 readers
+    /// can still seek inside the first segment.
     index: Vec<IndexEntry>,
+    /// File offset of the `nEntriesInUse` field within the OpenDML
+    /// `indx` super-index. `None` for `AviKind::Avi10`.
+    indx_entries_count_off: Option<u64>,
+    /// File offset of the first super-index entry slot. `None` for
+    /// `AviKind::Avi10`.
+    indx_entries_start_off: Option<u64>,
+    /// Number of super-index slots reserved at header time. We can't
+    /// pre-determine the actual segment count, so we reserve a
+    /// generous fixed capacity; back-patching only writes
+    /// `min(actual_segments, capacity)` slots.
+    indx_entries_capacity: usize,
+    /// All closed-out segments in OpenDML mode. The primary segment
+    /// is appended to this list when it's closed (i.e. when the next
+    /// `write_packet` would push past the limit, or in
+    /// `write_trailer`). Always empty for `AviKind::Avi10`.
+    segments: Vec<SegmentRecord>,
+    /// Number of packets written into the current open segment's
+    /// `movi` LIST. Reset when a new segment is opened.
+    current_segment_packets: u32,
     header_written: bool,
     trailer_written: bool,
 }
+
+/// Reserved slots in the OpenDML `indx` super-index. 256 slots is
+/// 4 KiB of payload and lets a 1-GiB-segment OpenDML file index up
+/// to 256 GiB, which covers everything users need without forcing
+/// up-front segment-count knowledge. Files with more than 256
+/// segments still mux correctly — the trailing entries simply don't
+/// land in the super-index (the demuxer falls back to walking
+/// `RIFF AVIX` continuations).
+const OPENDML_SUPER_INDEX_CAPACITY: usize = 256;
 
 impl Muxer for AviMuxer {
     fn format_name(&self) -> &str {
@@ -130,12 +262,23 @@ impl Muxer for AviMuxer {
         let hdrl_size_off = begin_list(self.output.as_mut(), &LIST, b"hdrl")?;
         let avih = build_avih(&self.tracks);
         write_chunk(self.output.as_mut(), b"avih", &avih)?;
+        // For OpenDML, embed the super-index in the FIRST stream's strl
+        // (typically video). For Avi10, no super-index.
+        let want_indx = matches!(self.kind, AviKind::OpenDml(_));
         for (i, t) in self.tracks.iter().enumerate() {
-            write_strl(self.output.as_mut(), i as u32, t)?;
+            let with_indx = want_indx && i == 0;
+            let (indx_count_off, indx_entries_off) =
+                write_strl(self.output.as_mut(), i as u32, t, with_indx)?;
+            if with_indx {
+                self.indx_entries_count_off = indx_count_off;
+                self.indx_entries_start_off = indx_entries_off;
+                self.indx_entries_capacity = OPENDML_SUPER_INDEX_CAPACITY;
+            }
         }
         finish_chunk(self.output.as_mut(), hdrl_size_off)?;
 
-        // movi LIST — size patched in write_trailer.
+        // movi LIST — size patched in write_trailer (or when this segment
+        // is closed in OpenDML mode).
         self.movi_size_off = begin_list(self.output.as_mut(), &LIST, b"movi")?;
         // movi_start_off points at the "movi" form-type FourCC — i.e. 4 bytes
         // after the size field. idx1 offsets are relative to this byte (+ 4 =
@@ -144,6 +287,7 @@ impl Muxer for AviMuxer {
         // LIST body (the 'movi' FourCC). Most decoders heuristically detect
         // which — by convention, we make them relative to 'movi'.
         self.movi_start_off = self.movi_size_off + 4; // skip past size → 'movi' fourcc
+        self.current_segment_packets = 0;
         self.header_written = true;
         Ok(())
     }
@@ -161,17 +305,30 @@ impl Muxer for AviMuxer {
         if packet.data.len() > u32::MAX as usize {
             return Err(Error::invalid("avi muxer: packet larger than 4 GiB"));
         }
+
+        // OpenDML: roll a new RIFF AVIX segment if this packet would
+        // push the current segment past the configured byte ceiling.
+        // The check fires only after the segment already has at least
+        // one packet — every segment must carry at least one frame.
+        if let AviKind::OpenDml(limit) = self.kind {
+            let projected = self.output.stream_position()?
+                + 8 // chunk header
+                + packet.data.len() as u64
+                + (packet.data.len() & 1) as u64
+                + 16 /* idx1 entry, only relevant in primary segment */;
+            // Bytes already used in this segment, measured from RIFF start.
+            let segment_start = self.riff_size_off - 4;
+            let segment_used = projected.saturating_sub(segment_start);
+            if self.current_segment_packets > 0 && segment_used > limit.bytes() {
+                self.close_current_segment()?;
+                self.open_avix_segment()?;
+            }
+        }
+
         let fourcc = self.tracks[idx].packet_fourcc;
         // Record offset (relative to 'movi' fourcc) BEFORE writing the chunk.
         let chunk_off = self.output.stream_position()?;
-        let rel_off = chunk_off
-            .checked_sub(self.movi_start_off)
-            .ok_or_else(|| Error::other("avi muxer: movi offset underflow"))?;
-        if rel_off > u32::MAX as u64 {
-            return Err(Error::unsupported(
-                "avi muxer: movi > 4 GiB, use OpenDML (not supported)",
-            ));
-        }
+        let rel_off_opt = chunk_off.checked_sub(self.movi_start_off);
         let size = packet.data.len() as u32;
         let flags = if packet.flags.keyframe {
             0x10 // AVIIF_KEYFRAME
@@ -191,20 +348,35 @@ impl Muxer for AviMuxer {
         // otherwise one sample per packet.
         t.sample_count += sample_count_of_packet(&t.stream, &t.entry, size);
 
-        self.index.push(IndexEntry {
-            ckid: fourcc,
-            flags,
-            offset: rel_off as u32,
-            size,
-        });
+        self.current_segment_packets += 1;
 
-        // Enforce the 2 GiB ceiling (AVI v1 — no OpenDML). Real-world
-        // players often choke between 2 and 4 GiB, so we flag at 2 GiB.
-        let cur = self.output.stream_position()?;
-        if cur > (2 * 1024 * 1024 * 1024) - 1024 {
-            return Err(Error::unsupported(
-                "avi muxer: file would exceed 2 GiB (OpenDML not supported)",
-            ));
+        // idx1 entry — only meaningful for the primary segment in
+        // OpenDML mode (idx1 offsets are 32-bit and relative to the
+        // primary `movi` LIST, so chunks in `RIFF AVIX` continuations
+        // can't be indexed by idx1). For Avi10 mode we always record.
+        let in_primary_segment = self.segments.is_empty();
+        if in_primary_segment {
+            if let Some(rel_off) = rel_off_opt {
+                if rel_off <= u32::MAX as u64 {
+                    self.index.push(IndexEntry {
+                        ckid: fourcc,
+                        flags,
+                        offset: rel_off as u32,
+                        size,
+                    });
+                }
+            }
+        }
+
+        // Enforce the 2 GiB ceiling for AVI 1.0 mode only — OpenDML
+        // can grow arbitrarily large because it segments.
+        if matches!(self.kind, AviKind::Avi10) {
+            let cur = self.output.stream_position()?;
+            if cur > (2 * 1024 * 1024 * 1024) - 1024 {
+                return Err(Error::unsupported(
+                    "avi muxer: file would exceed 2 GiB; use AviKind::OpenDml",
+                ));
+            }
         }
 
         Ok(())
@@ -217,27 +389,55 @@ impl Muxer for AviMuxer {
         if !self.header_written {
             return Err(Error::other("avi muxer: write_trailer before write_header"));
         }
+
+        let in_primary_segment = self.segments.is_empty();
+
         // Close movi LIST (patch its size).
         finish_chunk(self.output.as_mut(), self.movi_size_off)?;
 
-        // idx1: 16 bytes per entry (ckid[4], flags[u32 LE], offset[u32 LE],
-        // size[u32 LE]). Offsets are relative to the `movi` form-type FourCC.
-        let mut idx_body = Vec::with_capacity(self.index.len() * 16);
-        for e in &self.index {
-            idx_body.extend_from_slice(&e.ckid);
-            idx_body.extend_from_slice(&e.flags.to_le_bytes());
-            idx_body.extend_from_slice(&e.offset.to_le_bytes());
-            idx_body.extend_from_slice(&e.size.to_le_bytes());
+        if in_primary_segment {
+            // The whole file is one RIFF — write idx1 inside it (legacy
+            // AVI 1.0 layout). This holds for both AviKind::Avi10 and
+            // AviKind::OpenDml when only the primary segment was used.
+            let idx_body = self.serialize_idx1();
+            write_chunk(self.output.as_mut(), b"idx1", &idx_body)?;
+            // Close outer RIFF.
+            finish_chunk(self.output.as_mut(), self.riff_size_off)?;
+            // Record the primary segment if we're in OpenDML mode so the
+            // super-index back-patch can include it.
+            if matches!(self.kind, AviKind::OpenDml(_)) {
+                let total_size = self.output.stream_position()?;
+                let riff_start = self.riff_size_off - 4;
+                self.segments.push(SegmentRecord {
+                    riff_offset: riff_start,
+                    total_size: total_size - riff_start,
+                    packet_count: self.current_segment_packets,
+                });
+            }
+        } else {
+            // OpenDML continuation: just close the AVIX RIFF. The
+            // primary segment's idx1 was already written when its RIFF
+            // was closed in `close_current_segment`.
+            finish_chunk(self.output.as_mut(), self.riff_size_off)?;
+            let total_size = self.output.stream_position()?;
+            let riff_start = self.riff_size_off - 4;
+            self.segments.push(SegmentRecord {
+                riff_offset: riff_start,
+                total_size: total_size - riff_start,
+                packet_count: self.current_segment_packets,
+            });
         }
-        write_chunk(self.output.as_mut(), b"idx1", &idx_body)?;
-
-        // Close outer RIFF.
-        finish_chunk(self.output.as_mut(), self.riff_size_off)?;
 
         // Optionally patch avih.dwTotalFrames and strh.dwLength now that we
         // know the packet counts. These are located at well-known offsets
         // relative to the RIFF start.
         self.patch_post_counts()?;
+
+        // For OpenDML, back-patch the indx super-index entries with each
+        // segment's qwOffset / dwSize / dwDuration.
+        if matches!(self.kind, AviKind::OpenDml(_)) {
+            self.patch_super_index()?;
+        }
 
         self.output.flush()?;
         self.trailer_written = true;
@@ -253,7 +453,7 @@ impl AviMuxer {
         // stream if no video). strh dwLength = per-stream packet_count for
         // video, sample_count for audio.
         //
-        // Layout we wrote:
+        // Layout we wrote (offsets are within the primary RIFF):
         //   RIFF(12): 4 + size + 4(AVI )         — offset 0..12
         //   LIST(8): 4 + size + 4(hdrl)           — offset 12..20
         //   "avih" chunk:
@@ -265,6 +465,7 @@ impl AviMuxer {
         //     strh(8): 4 + 4 + 56
         //       dwLength at strh body offset 32
         //     strf(8+N) ...
+        //     [ indx(8 + 24 + 16*OPENDML_SUPER_INDEX_CAPACITY) ]
         let total_video_frames = self
             .tracks
             .iter()
@@ -279,26 +480,14 @@ impl AviMuxer {
         self.output.seek(SeekFrom::Start(44))?;
         self.output.write_all(&total_video_frames.to_le_bytes())?;
 
-        // Walk through strl lists to patch each strh.dwLength.
-        // We need to compute the offset of each strl LIST. The hdrl LIST has
-        // size = 4 (form-type) + avih chunk (8+56=64) + sum(strl sizes).
-        // So the first strl LIST starts at:
-        //   20 (hdrl header end skipping "hdrl") + 4(form) +64(avih) = 88
-        // But actually RIFF(8)+AVI_(4)+LIST(8)+hdrl(4)+avih(8+56)=4+8+4+8+4+64 = ... let me recompute:
-        //   RIFF header: 8 bytes (0..8)
-        //   AVI  form type: 4 bytes (8..12)
-        //   LIST header: 8 bytes (12..20)
-        //   hdrl form type: 4 bytes (20..24)
-        //   avih chunk: 8+56 = 64 bytes (24..88)
-        //   → first strl LIST starts at 88
+        // Walk through strl lists to patch each strh.dwLength. The first
+        // strl LIST starts at offset 88 (= 20 + 4 + 64). For OpenDML the
+        // first stream's strl ALSO contains an indx chunk after strf, so
+        // the second stream's strl is offset by an extra
+        // (8 + 24 + 16*OPENDML_SUPER_INDEX_CAPACITY) bytes.
         let mut strl_off: u64 = 88;
-        for t in &self.tracks {
-            // strl LIST layout:
-            //   8 bytes LIST header (offset 0)
-            //   4 bytes "strl" form-type (offset 8)
-            //   strh chunk: 8 bytes header (offset 12) + 56 bytes body (offset 20)
-            //   strf chunk: 8 bytes header + strf.len() bytes body (+ pad if odd)
-            //     starting at offset 76
+        let opendml = matches!(self.kind, AviKind::OpenDml(_));
+        for (i, t) in self.tracks.iter().enumerate() {
             let strh_body_off = strl_off + 20;
             // strh.dwLength is at body offset 32 → file offset strh_body_off + 32.
             let length = if &t.entry.strh_type == b"auds" {
@@ -316,14 +505,101 @@ impl AviMuxer {
             self.output.seek(SeekFrom::Start(strh_body_off + 36))?;
             self.output.write_all(&t.max_chunk_size.to_le_bytes())?;
 
-            // Advance strl_off by the size of the strl LIST (8 header +
-            // body). Body = 4 (form) + 64 (strh) + 8 + strf.len() + pad.
+            // Advance strl_off by the size of this strl LIST (8 header +
+            // body). Body = 4 (form) + 64 (strh) + 8 + strf.len() + pad
+            // [+ 8 + indx_payload_padded if i == 0 and opendml].
             let strf_padded = t.entry.strf.len() + (t.entry.strf.len() & 1);
-            let strl_body = 4 + 64 + 8 + strf_padded;
+            let mut strl_body = 4 + 64 + 8 + strf_padded;
+            if opendml && i == 0 {
+                let indx_payload = 24 + 16 * OPENDML_SUPER_INDEX_CAPACITY;
+                let indx_padded = indx_payload + (indx_payload & 1);
+                strl_body += 8 + indx_padded;
+            }
             strl_off += 8 + strl_body as u64;
         }
 
         // Restore writer position.
+        self.output.seek(SeekFrom::Start(end_pos))?;
+        Ok(())
+    }
+
+    /// Serialize the idx1 body for the primary segment.
+    fn serialize_idx1(&self) -> Vec<u8> {
+        let mut idx_body = Vec::with_capacity(self.index.len() * 16);
+        for e in &self.index {
+            idx_body.extend_from_slice(&e.ckid);
+            idx_body.extend_from_slice(&e.flags.to_le_bytes());
+            idx_body.extend_from_slice(&e.offset.to_le_bytes());
+            idx_body.extend_from_slice(&e.size.to_le_bytes());
+        }
+        idx_body
+    }
+
+    /// Close the current `RIFF` segment in OpenDML mode. Finishes the
+    /// movi LIST, writes idx1 if this is the primary segment, then
+    /// finishes the outer RIFF and records the segment's `(offset,
+    /// total_size, packet_count)`.
+    fn close_current_segment(&mut self) -> Result<()> {
+        let in_primary = self.segments.is_empty();
+        // Close movi LIST.
+        finish_chunk(self.output.as_mut(), self.movi_size_off)?;
+        // idx1 only in primary RIFF (offsets are 32-bit, can't span
+        // continuation segments anyway).
+        if in_primary {
+            let idx_body = self.serialize_idx1();
+            write_chunk(self.output.as_mut(), b"idx1", &idx_body)?;
+        }
+        // Close outer RIFF and snapshot total size.
+        finish_chunk(self.output.as_mut(), self.riff_size_off)?;
+        let after_riff = self.output.stream_position()?;
+        let riff_start = self.riff_size_off - 4;
+        self.segments.push(SegmentRecord {
+            riff_offset: riff_start,
+            total_size: after_riff - riff_start,
+            packet_count: self.current_segment_packets,
+        });
+        Ok(())
+    }
+
+    /// Open a new `RIFF AVIX` continuation segment. Writes the RIFF
+    /// header, `AVIX` form-type, and a fresh `LIST movi`. Resets the
+    /// per-segment cursors but does NOT touch idx1 (continuation
+    /// segments don't carry idx1).
+    fn open_avix_segment(&mut self) -> Result<()> {
+        // Begin a new RIFF AVIX list.
+        self.riff_size_off = begin_list(self.output.as_mut(), &RIFF, b"AVIX")?;
+        // Begin movi LIST.
+        self.movi_size_off = begin_list(self.output.as_mut(), &LIST, b"movi")?;
+        self.movi_start_off = self.movi_size_off + 4;
+        self.current_segment_packets = 0;
+        Ok(())
+    }
+
+    /// Back-patch the OpenDML `indx` super-index entries with each
+    /// segment's `(qwOffset, dwSize, dwDuration)` triple, and write
+    /// the final `nEntriesInUse`.
+    fn patch_super_index(&mut self) -> Result<()> {
+        let (Some(n_off), Some(start_off)) =
+            (self.indx_entries_count_off, self.indx_entries_start_off)
+        else {
+            return Ok(());
+        };
+        let end_pos = self.output.stream_position()?;
+        let n_to_write = self.segments.len().min(self.indx_entries_capacity);
+        // nEntriesInUse.
+        self.output.seek(SeekFrom::Start(n_off))?;
+        self.output.write_all(&(n_to_write as u32).to_le_bytes())?;
+        // Per-entry slots.
+        for (i, seg) in self.segments.iter().take(n_to_write).enumerate() {
+            let slot = start_off + (i as u64) * 16;
+            self.output.seek(SeekFrom::Start(slot))?;
+            self.output.write_all(&seg.riff_offset.to_le_bytes())?;
+            // dwSize: total RIFF byte length per spec/06 §6.1.
+            let dw_size = seg.total_size.min(u32::MAX as u64) as u32;
+            self.output.write_all(&dw_size.to_le_bytes())?;
+            // dwDuration: per-segment frame count.
+            self.output.write_all(&seg.packet_count.to_le_bytes())?;
+        }
         self.output.seek(SeekFrom::Start(end_pos))?;
         Ok(())
     }
@@ -365,8 +641,18 @@ fn build_avih(tracks: &[TrackState]) -> Vec<u8> {
     body
 }
 
-/// Build and write a `strl` LIST (strh + strf).
-fn write_strl<W: Write + Seek + ?Sized>(w: &mut W, _index: u32, t: &TrackState) -> Result<()> {
+/// Build and write a `strl` LIST (strh + strf [+ indx]).
+///
+/// Returns `(indx_n_entries_off, indx_entries_start_off)` when
+/// `with_indx` is set, otherwise `(None, None)`. The two offsets let
+/// the muxer back-patch the OpenDML super-index in `write_trailer`
+/// once each segment's RIFF position is known.
+fn write_strl<W: Write + Seek + ?Sized>(
+    w: &mut W,
+    _index: u32,
+    t: &TrackState,
+    with_indx: bool,
+) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
     // strh body (56 bytes).
@@ -401,8 +687,43 @@ fn write_strl<W: Write + Seek + ?Sized>(w: &mut W, _index: u32, t: &TrackState) 
     // strf chunk.
     write_chunk(w, b"strf", &t.entry.strf)?;
 
+    let mut indx_n_entries_off: Option<u64> = None;
+    let mut indx_entries_start_off: Option<u64> = None;
+    if with_indx {
+        // OpenDML 2.0 super-index. Layout per spec/06 §6.1:
+        //   WORD  wLongsPerEntry  = 4
+        //   BYTE  bIndexSubType   = 0
+        //   BYTE  bIndexType      = 0x00 (AVI_INDEX_OF_INDEXES)
+        //   DWORD nEntriesInUse   (back-patched)
+        //   DWORD dwChunkId       (e.g. b"00dc")
+        //   DWORD dwReserved[3]
+        //   <16-byte entries> × OPENDML_SUPER_INDEX_CAPACITY
+        // Entries are zero-initialised so a partial back-patch leaves
+        // a clean tail of zeros that demuxers tolerate.
+        let chunk_id = packet_fourcc_for(0, t.entry.chunk_suffix);
+        let entries_bytes = OPENDML_SUPER_INDEX_CAPACITY * 16;
+        let payload_len = 24 + entries_bytes;
+        // Write chunk header by hand so we can compute file offsets.
+        write_chunk_header(w, b"indx", payload_len as u32)?;
+        let payload_off = w.stream_position()?;
+        // Pre-fill with zeros and overwrite the preamble bytes.
+        let mut buf = vec![0u8; payload_len];
+        buf[0..2].copy_from_slice(&4u16.to_le_bytes());
+        // bIndexSubType, bIndexType already zero.
+        // nEntriesInUse: zero, will be back-patched.
+        buf[8..12].copy_from_slice(&chunk_id);
+        // dwReserved[3] already zero.
+        w.write_all(&buf)?;
+        // Even-pad if odd length.
+        if payload_len & 1 == 1 {
+            w.write_all(&[0])?;
+        }
+        indx_n_entries_off = Some(payload_off + 4);
+        indx_entries_start_off = Some(payload_off + 24);
+    }
+
     finish_chunk(w, strl_off)?;
-    Ok(())
+    Ok((indx_n_entries_off, indx_entries_start_off))
 }
 
 fn sample_count_of_packet(stream: &StreamInfo, entry: &StrfEntry, size: u32) -> u64 {

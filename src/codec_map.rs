@@ -70,6 +70,15 @@ pub fn video_codec_id(fourcc: &[u8; 4]) -> CodecId {
         b"UTVS" | b"ULRG" | b"ULRA" | b"ULY0" | b"ULY2" | b"ULY4" | b"ULH0" | b"ULH2" | b"ULH4" => {
             "utvideo"
         }
+        // MagicYUV v7 native FourCC family (17 entries) per spec/01 §4.1 +
+        // tables/00-fourcc-table.csv. 8-bit / 10-bit / 12-bit / 14-bit
+        // RGB / RGBA / Y / YA / 4:4:4 / 4:2:2 / 4:2:0 layouts. Owned by
+        // oxideav-magicyuv (no per-FourCC dispatch — every variant decodes
+        // through the same v7 stream entry point).
+        b"M8RG" | b"M8RA" | b"M8Y4" | b"M8Y2" | b"M8Y0" | b"M8YA" | b"M8G0" | b"M0RG" | b"M0RA"
+        | b"M0Y4" | b"M0Y2" | b"M0Y0" | b"M0G0" | b"M2RG" | b"M2RA" | b"M4RG" | b"M4RA" => {
+            "magicyuv"
+        }
         // ProRes (rare in AVI but seen in post-production workflows).
         b"APCH" | b"APCN" | b"APCS" | b"APCO" | b"AP4H" | b"AP4X" => "prores",
         // DV video.
@@ -210,6 +219,14 @@ pub(crate) fn build_strf(params: &CodecParameters) -> Result<StrfEntry> {
         "vp8" => video_entry(params, *b"VP80", 24),
         "vp9" => video_entry(params, *b"VP90", 24),
         "av1" => video_entry(params, *b"AV01", 24),
+        // MagicYUV: pick the FourCC from `extradata` when the caller
+        // populated the first 4 bytes with a v7 native FourCC (matching
+        // `video_codec_id`'s reverse mapping). This mirrors the convention
+        // already used for codecs with multiple FourCCs: the encoder/caller
+        // owns the choice; the AVI muxer is just the wire emitter. When
+        // extradata doesn't carry a hint we default to `M8RG` (8-bit RGB,
+        // the most common production variant).
+        "magicyuv" => magicyuv_entry(params),
         "rgb24" => rgb24_entry(params),
         "pcm_u8" => pcm_int_entry(params, 0x0001, 8),
         "pcm_s16le" => pcm_int_entry(params, 0x0001, 16),
@@ -446,6 +463,56 @@ fn compressed_audio_entry(params: &CodecParameters, format_tag: u16) -> Result<S
     })
 }
 
+/// Pick the MagicYUV FourCC for the muxer.
+///
+/// MagicYUV's 17 native v7 FourCCs (spec/01 §4.1) all map to codec_id
+/// `"magicyuv"` on the demux side, so the muxer needs a hint to pick
+/// the right wire FourCC. The convention is: the first 4 bytes of
+/// `extradata` are inspected; if they spell one of the 17 known
+/// FourCCs, that one is used. Otherwise we default to `M8RG`. The
+/// matched 4 bytes are NOT stripped from `extradata` — extradata is
+/// the codec-private setup block (a 32-byte v7 MAGY header per
+/// spec/06 §4.1 in production), so leaving it intact preserves the
+/// full payload for the decoder. The leading 4-byte hint is
+/// orthogonal to the v7 magic (`MAGY`) — callers that want the
+/// default need not populate it.
+fn magicyuv_entry(params: &CodecParameters) -> Result<StrfEntry> {
+    if params.media_type != MediaType::Video {
+        return Err(Error::invalid("avi muxer: magicyuv must be video"));
+    }
+    let width = params
+        .width
+        .ok_or_else(|| Error::invalid("avi muxer: magicyuv requires width"))?;
+    let height = params
+        .height
+        .ok_or_else(|| Error::invalid("avi muxer: magicyuv requires height"))?;
+    // Recognise a leading 4-byte FourCC hint in extradata. If absent or
+    // not one of the 17 native FourCCs, default to M8RG.
+    let fourcc = if params.extradata.len() >= 4 {
+        let mut hint = [0u8; 4];
+        hint.copy_from_slice(&params.extradata[..4]);
+        match &uppercase4(&hint) {
+            b"M8RG" | b"M8RA" | b"M8Y4" | b"M8Y2" | b"M8Y0" | b"M8YA" | b"M8G0" | b"M0RG"
+            | b"M0RA" | b"M0Y4" | b"M0Y2" | b"M0Y0" | b"M0G0" | b"M2RG" | b"M2RA" | b"M4RG"
+            | b"M4RA" => uppercase4(&hint),
+            _ => *b"M8RG",
+        }
+    } else {
+        *b"M8RG"
+    };
+    let strf = write_bitmap_info_header(width, height, fourcc, 24, &params.extradata);
+    let (scale, rate) = video_scale_rate(params);
+    Ok(StrfEntry {
+        chunk_suffix: *b"dc",
+        handler_fourcc: fourcc,
+        strf,
+        strh_type: *b"vids",
+        sample_size: 0,
+        scale,
+        rate,
+    })
+}
+
 fn video_scale_rate(params: &CodecParameters) -> (u32, u32) {
     // dwRate / dwScale = frames per second.
     if let Some(fr) = params.frame_rate {
@@ -526,6 +593,57 @@ mod tests {
         assert_eq!(video_codec_id(b"IV41").as_str(), "indeo4");
         assert_eq!(video_codec_id(b"SVQ3").as_str(), "svq3");
         assert_eq!(video_codec_id(b"FLV1").as_str(), "flv1");
+    }
+
+    #[test]
+    fn magicyuv_fourccs_map_to_magicyuv() {
+        // All 17 native v7 FourCCs (spec/01 §4.1): 7 8-bit + 6 10-bit +
+        // 2 12-bit + 2 14-bit. Every one must resolve to "magicyuv".
+        let fourccs: [&[u8; 4]; 17] = [
+            b"M8RG", b"M8RA", b"M8Y4", b"M8Y2", b"M8Y0", b"M8YA", b"M8G0", b"M0RG", b"M0RA",
+            b"M0Y4", b"M0Y2", b"M0Y0", b"M0G0", b"M2RG", b"M2RA", b"M4RG", b"M4RA",
+        ];
+        for fc in fourccs {
+            assert_eq!(
+                video_codec_id(fc).as_str(),
+                "magicyuv",
+                "{:?}",
+                std::str::from_utf8(fc).unwrap()
+            );
+        }
+        // Case-insensitive normalisation should also work.
+        assert_eq!(video_codec_id(b"m8rg").as_str(), "magicyuv");
+    }
+
+    #[test]
+    fn magicyuv_muxer_picks_fourcc_from_extradata_hint() {
+        // Default with no extradata → M8RG.
+        let mut p = CodecParameters::video(CodecId::new("magicyuv"));
+        p.width = Some(64);
+        p.height = Some(64);
+        let e = build_strf(&p).unwrap();
+        assert_eq!(&e.handler_fourcc, b"M8RG");
+        assert_eq!(&e.chunk_suffix, b"dc");
+        assert_eq!(&e.strh_type, b"vids");
+
+        // Leading 4-byte hint in extradata picks that FourCC.
+        let mut p = CodecParameters::video(CodecId::new("magicyuv"));
+        p.width = Some(64);
+        p.height = Some(64);
+        p.extradata = b"M8YAtail".to_vec();
+        let e = build_strf(&p).unwrap();
+        assert_eq!(&e.handler_fourcc, b"M8YA");
+        // The whole extradata (including the hint bytes) is preserved
+        // in the BITMAPINFOHEADER trailer.
+        assert!(e.strf.ends_with(b"M8YAtail"));
+
+        // Non-MagicYUV hint falls back to M8RG.
+        let mut p = CodecParameters::video(CodecId::new("magicyuv"));
+        p.width = Some(64);
+        p.height = Some(64);
+        p.extradata = b"XXXXxxxx".to_vec();
+        let e = build_strf(&p).unwrap();
+        assert_eq!(&e.handler_fourcc, b"M8RG");
     }
 
     #[test]

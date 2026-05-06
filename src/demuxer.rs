@@ -3,20 +3,29 @@
 //! On `open()`:
 //! 1. Verify the top-level `RIFF`…`AVI ` header.
 //! 2. Locate the `hdrl` LIST, parse `avih` (main header) and each `strl`
-//!    LIST → `strh` (stream header) + `strf` (stream format).
+//!    LIST → `strh` (stream header) + `strf` (stream format) +
+//!    optionally an `indx` super-index chunk (OpenDML 2.0).
 //! 3. Locate the `movi` LIST. Remember its start offset and size so we can
 //!    walk packet chunks lazily.
 //! 4. If an `idx1` top-level chunk is present, parse it into an in-memory
-//!    seek table (see [`IdxEntry`]). OpenDML `indx`/`ix##` super-indexes
-//!    are out of scope — `seek_to` returns `Unsupported` when no `idx1`
-//!    was seen.
+//!    seek table (see [`IdxEntry`]).
+//! 5. After the primary `RIFF AVI ` envelope, scan for additional
+//!    `RIFF AVIX` continuation segments and append each one's `movi`
+//!    LIST to the segment list (OpenDML 2.0 multi-RIFF carriage).
 //!
-//! `next_packet()` walks chunks inside `movi`. Each payload chunk name is
-//! `NNxx` where `NN` is a two-ASCII-digit stream index and `xx` is one of
-//! `dc` (compressed video), `db` (uncompressed video), `wb` (audio), or
-//! something else which we skip. Unknown or out-of-range indexes are skipped
-//! so we can tolerate files with embedded junk (`JUNK`, `ix##`, unsupported
+//! `next_packet()` walks chunks inside every `movi` segment in
+//! sequence: when one segment is exhausted it advances to the next.
+//! Each payload chunk name is `NNxx` where `NN` is a two-ASCII-digit
+//! stream index and `xx` is one of `dc` (compressed video), `db`
+//! (uncompressed video), `wb` (audio), or something else which we
+//! skip. Unknown or out-of-range indexes are skipped so we can
+//! tolerate files with embedded junk (`JUNK`, `ix##`, unsupported
 //! streams).
+//!
+//! `seek_to(stream, pts)` uses the AVI 1.0 `idx1` table when
+//! present; OpenDML-driven seeking from the `indx` super-index is a
+//! follow-up — `seek_to` returns `Error::Unsupported` when no `idx1`
+//! was seen.
 
 use std::io::{Seek, SeekFrom};
 
@@ -359,6 +368,25 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 strf_buf = Some(read_body_bounded(r, hdr.size)?);
                 skip_pad(r, hdr.size)?;
             }
+            b"indx" => {
+                // OpenDML 2.0 super-index (AVI_INDEX_OF_INDEXES).
+                // Layout (header, 24 B):
+                //   WORD  wLongsPerEntry  (= 4 for super-index)
+                //   BYTE  bIndexSubType
+                //   BYTE  bIndexType      (= 0x00 AVI_INDEX_OF_INDEXES)
+                //   DWORD nEntriesInUse
+                //   DWORD dwChunkId       (e.g. '00dc')
+                //   DWORD dwReserved[3]
+                // Followed by 16-byte entries: qwOffset (u64), dwSize
+                // (u32), dwDuration (u32). We parse for validation and
+                // visibility but don't drive seek off it yet — for
+                // sequential decode the demuxer walks every `movi`
+                // LIST across all RIFF segments anyway. OpenDML-driven
+                // seeking is a follow-up.
+                let body = read_body_bounded(r, hdr.size)?;
+                skip_pad(r, hdr.size)?;
+                validate_indx(&body)?;
+            }
             _ => {
                 skip_chunk(r, &hdr)?;
             }
@@ -371,6 +399,31 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     let strf = strf_buf.unwrap_or_default();
     let parsed = build_stream(index, &strh, &strf, codecs)?;
     Ok((Some(parsed.0), Some(parsed.1)))
+}
+
+/// Light validation of an OpenDML 2.0 `indx` super-index payload. We
+/// confirm the 24-byte preamble is well-formed and that the per-entry
+/// table has room for `nEntriesInUse` slots. Malformed but
+/// non-fatally-broken indexes (e.g. excess padding past the declared
+/// entry count) are tolerated since downstream code doesn't rely on
+/// the super-index for sequential decode. Returns `Error::InvalidData`
+/// only when the chunk is truncated below the 24-byte header.
+fn validate_indx(body: &[u8]) -> Result<()> {
+    if body.len() < 24 {
+        return Err(Error::invalid("AVI: indx super-index header truncated"));
+    }
+    let _w_longs_per_entry = u16::from_le_bytes([body[0], body[1]]);
+    let _b_index_sub_type = body[2];
+    let _b_index_type = body[3];
+    let n_entries_in_use = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let entries_byte_len = n_entries_in_use.saturating_mul(16);
+    let need = 24usize.saturating_add(entries_byte_len);
+    if body.len() < need {
+        return Err(Error::invalid(
+            "AVI: indx super-index entry table truncated",
+        ));
+    }
+    Ok(())
 }
 
 /// Build a StreamInfo from strh + strf payloads.
