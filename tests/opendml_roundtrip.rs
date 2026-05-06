@@ -7,16 +7,27 @@
 //! the AVI envelope.
 //!
 //! Single-stream MagicYUV is the natural exemplar — its native
-//! FourCC family lives in `codec_map.rs` — but the underlying AVI
-//! logic is codec-agnostic; the same envelope works for any video
-//! codec the muxer can package.
+//! FourCC family lives in the codec crate's `register_codecs` — but
+//! the underlying AVI logic is codec-agnostic; the same envelope
+//! works for any video codec the muxer can package.
 
 use oxideav_core::{
-    CodecId, CodecParameters, MediaType, Packet, Rational, ReadSeek, StreamInfo, TimeBase,
-    WriteSeek,
+    CodecId, CodecParameters, CodecRegistry, MediaType, Packet, Rational, ReadSeek, StreamInfo,
+    TimeBase, WriteSeek,
 };
 
-use oxideav_avi::muxer::{open_with_kind, AviKind, RiffSegmentLimit};
+use oxideav_avi::muxer::{open_with_codecs_and_kind, AviKind, RiffSegmentLimit};
+
+/// Build a CodecRegistry pre-populated with `oxideav-magicyuv`'s tag
+/// claims (the 17 native v7 FourCCs) so the muxer can resolve
+/// `codec_id="magicyuv"` to `CodecTag::Fourcc(b"M8RG")` and the
+/// demuxer can invert the lookup. Replaces what used to live in
+/// `codec_map.rs`.
+fn registry_with_magicyuv() -> CodecRegistry {
+    let mut reg = CodecRegistry::new();
+    oxideav_magicyuv::register_codecs(&mut reg);
+    reg
+}
 
 /// One stream of single-stream MagicYUV at 25 fps with the M8RG
 /// FourCC defaulted via the codec_map's "magicyuv" path.
@@ -49,15 +60,93 @@ fn synthesize_payload(seed: u32, base_len: usize) -> Vec<u8> {
 }
 
 #[test]
+fn magicyuv_fourcc_resolution_via_codec_resolver_path() {
+    // Exercises the full registry-driven resolution path: the muxer
+    // uses `CodecResolver::tag_for_codec("magicyuv", Fourcc)` to
+    // pick the wire FourCC, and the demuxer uses
+    // `CodecResolver::resolve_tag(M8RG)` to recover the codec_id.
+    // This is the route that replaces the deleted `codec_map.rs`.
+    let stream = magicyuv_stream(64, 64);
+    let reg = registry_with_magicyuv();
+
+    // Default (no extradata hint) — the registry's first declared
+    // FourCC for "magicyuv" wins, which is `M8RG` per spec/01 §4.1.
+    let payload = synthesize_payload(42, 256);
+    let tmp = std::env::temp_dir().join("oxideav-avi-magicyuv-via-resolver.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux =
+            oxideav_avi::muxer::open_with_codecs(ws, std::slice::from_ref(&stream), &reg).unwrap();
+        mux.write_header().unwrap();
+        let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+        pkt.pts = Some(0);
+        pkt.flags.keyframe = true;
+        mux.write_packet(&pkt).unwrap();
+        mux.write_trailer().unwrap();
+    }
+
+    // The on-wire BITMAPINFOHEADER must carry `M8RG` (the registry's
+    // first-declared FourCC for the magicyuv codec_id).
+    let bytes = std::fs::read(&tmp).unwrap();
+    assert!(
+        bytes.windows(4).any(|w| w == b"M8RG"),
+        "expected M8RG FourCC somewhere in the muxer output",
+    );
+
+    // Demuxer round-trip: codec_id resurfaces via the registry.
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "magicyuv");
+    let got = dmx.next_packet().unwrap();
+    assert_eq!(got.data, payload);
+}
+
+#[test]
+fn extradata_hint_overrides_registry_default_fourcc() {
+    // When `params.extradata`'s first 4 bytes carry a printable
+    // FourCC, the muxer uses it instead of the registry's
+    // first-declared tag. Lets the caller pick among the 17 native
+    // v7 variants without relying on tag-declaration order.
+    let mut stream = magicyuv_stream(64, 64);
+    stream.params.extradata = b"M8YApayload".to_vec();
+    let reg = registry_with_magicyuv();
+
+    let payload = synthesize_payload(99, 128);
+    let tmp = std::env::temp_dir().join("oxideav-avi-magicyuv-hint.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux =
+            oxideav_avi::muxer::open_with_codecs(ws, std::slice::from_ref(&stream), &reg).unwrap();
+        mux.write_header().unwrap();
+        let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+        pkt.pts = Some(0);
+        pkt.flags.keyframe = true;
+        mux.write_packet(&pkt).unwrap();
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&tmp).unwrap();
+    assert!(bytes.windows(4).any(|w| w == b"M8YA"));
+    // The demuxer should still resolve M8YA to "magicyuv".
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "magicyuv");
+}
+
+#[test]
 fn single_riff_avi_with_m8rg_fourcc_roundtrips_5_frames() {
     let stream = magicyuv_stream(64, 64);
     let frames: Vec<Vec<u8>> = (0..5).map(|i| synthesize_payload(i, 256)).collect();
+    let reg = registry_with_magicyuv();
 
     let tmp = std::env::temp_dir().join("oxideav-avi-magicyuv-single.avi");
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+        let mut mux =
+            open_with_codecs_and_kind(ws, std::slice::from_ref(&stream), &reg, AviKind::Avi10)
+                .unwrap();
         mux.write_header().unwrap();
         for (i, payload) in frames.iter().enumerate() {
             let mut pkt = Packet::new(0, stream.time_base, payload.clone());
@@ -68,15 +157,16 @@ fn single_riff_avi_with_m8rg_fourcc_roundtrips_5_frames() {
         mux.write_trailer().unwrap();
     }
 
-    // Demuxer surfaces the magicyuv codec_id via the FourCC map.
+    // Demuxer surfaces the magicyuv codec_id via the registry-based
+    // CodecResolver path (no in-crate codec_map).
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
     assert_eq!(dmx.format_name(), "avi");
     assert_eq!(dmx.streams().len(), 1);
     assert_eq!(
         dmx.streams()[0].params.codec_id.as_str(),
         "magicyuv",
-        "FourCC map should resolve M8RG → magicyuv"
+        "CodecResolver should resolve M8RG → magicyuv via registry",
     );
 
     let mut got: Vec<Vec<u8>> = Vec::new();
@@ -99,14 +189,16 @@ fn opendml_two_riff_segments_recover_8_frames_in_order() {
     // RIFFs.
     let stream = magicyuv_stream(64, 64);
     let frames: Vec<Vec<u8>> = (0..8).map(|i| synthesize_payload(i + 100, 512)).collect();
+    let reg = registry_with_magicyuv();
 
     let tmp = std::env::temp_dir().join("oxideav-avi-opendml-two-riffs.avi");
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux = open_with_kind(
+        let mut mux = open_with_codecs_and_kind(
             ws,
             std::slice::from_ref(&stream),
+            &reg,
             AviKind::OpenDml(RiffSegmentLimit::Bytes(2 * 1024)),
         )
         .unwrap();
@@ -132,7 +224,7 @@ fn opendml_two_riff_segments_recover_8_frames_in_order() {
     assert_eq!(indx_count, 1, "exactly one indx super-index");
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "magicyuv");
 
     let mut got: Vec<Vec<u8>> = Vec::new();
@@ -156,14 +248,16 @@ fn opendml_indx_super_index_entries_match_riff_offsets() {
     // dwDuration.
     let stream = magicyuv_stream(64, 64);
     let frames: Vec<Vec<u8>> = (0..16).map(|i| synthesize_payload(i + 200, 512)).collect();
+    let reg = registry_with_magicyuv();
 
     let tmp = std::env::temp_dir().join("oxideav-avi-opendml-indx.avi");
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux = open_with_kind(
+        let mut mux = open_with_codecs_and_kind(
             ws,
             std::slice::from_ref(&stream),
+            &reg,
             AviKind::OpenDml(RiffSegmentLimit::Bytes(4 * 1024)),
         )
         .unwrap();
@@ -264,7 +358,7 @@ fn opendml_indx_super_index_entries_match_riff_offsets() {
 
     // Demuxer round-trip: all 16 frames recovered byte-equal.
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
     let mut got: Vec<Vec<u8>> = Vec::new();
     loop {
         match dmx.next_packet() {
@@ -285,14 +379,16 @@ fn opendml_single_segment_when_limit_is_large() {
     // and the indx super-index should declare exactly one entry.
     let stream = magicyuv_stream(64, 64);
     let frames: Vec<Vec<u8>> = (0..3).map(|i| synthesize_payload(i + 300, 256)).collect();
+    let reg = registry_with_magicyuv();
 
     let tmp = std::env::temp_dir().join("oxideav-avi-opendml-onesegment.avi");
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux = open_with_kind(
+        let mut mux = open_with_codecs_and_kind(
             ws,
             std::slice::from_ref(&stream),
+            &reg,
             AviKind::OpenDml(RiffSegmentLimit::OneGiB),
         )
         .unwrap();
@@ -326,7 +422,7 @@ fn opendml_single_segment_when_limit_is_large() {
     assert_eq!(top_level_riffs, 1, "OpenDML with generous limit → 1 RIFF");
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
     let mut count = 0;
     while let Ok(_p) = dmx.next_packet() {
         count += 1;

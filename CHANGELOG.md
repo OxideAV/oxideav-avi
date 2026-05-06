@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Drop the `codec_map.rs` parallel codec table**; demuxer + muxer
+  now resolve codec identity via `oxideav_core::CodecResolver`.
+  Each codec crate is the source of truth for its own AVI FourCCs /
+  WAVE format tags via `CodecInfo::tag(s)`. Replaces a 300-LOC
+  hand-maintained table with the shared registry surface and
+  removes a class of "container forgot to update its codec_map"
+  bugs entirely.
+  - **Demuxer**: `biCompression` (video) and `wFormatTag` (audio)
+    flow through `CodecResolver::resolve_tag` first; on a miss the
+    demuxer surfaces synthetic placeholder ids
+    (`avi:<fourcc>` for video, `avi:tag_<hex>` for audio, plus the
+    depth-aware `pcm_*` fallback for `WAVE_FORMAT_PCM` /
+    `WAVE_FORMAT_IEEE_FLOAT`) so downstream `make_decoder` lookup
+    fails with a clean "codec not registered" error.
+  - **Muxer**: `CodecParameters::codec_id` flows through
+    `CodecResolver::tag_for_codec(codec_id, CodecTagKind::Fourcc)`
+    (video) / `CodecTagKind::WaveFormat` (audio) for the inverse
+    direction. The first 4 bytes of `extradata` are still honoured
+    as a wire-FourCC hint (multi-FourCC codecs like `mpeg4video` or
+    `magicyuv`'s 17 native v7 variants — the caller picks).
+- New `muxer::open_with_codecs` and `muxer::open_with_codecs_and_kind`
+  ctors accept an `&dyn CodecResolver`. The legacy
+  `muxer::open` / `muxer::open_with_kind` overloads default to
+  `&NullCodecResolver` and only succeed for codecs the muxer can
+  derive without registry data (PCM families + extradata-hint
+  codecs + uncompressed `rgb24`); compressed codecs require the
+  registry-aware constructor.
+
 ### Added
 
 - OpenDML 2.0 super-index encode in the muxer. New `AviKind` enum

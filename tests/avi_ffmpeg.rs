@@ -5,7 +5,18 @@
 use std::path::Path;
 use std::process::Command;
 
-use oxideav_core::ReadSeek;
+use oxideav_core::{CodecRegistry, ReadSeek};
+
+/// Build a registry populated with mjpeg's tag claims so the
+/// resolver surfaces `mjpeg` for `MJPG`. ffv1's claims are
+/// declared by `oxideav-ffv1` (not a dev-dep here); the
+/// `avi:FFV1` synthetic fallback is the test-correct expectation
+/// when ffv1 isn't registered.
+fn registry_with_mjpeg() -> CodecRegistry {
+    let mut reg = CodecRegistry::new();
+    oxideav_mjpeg::register_codecs(&mut reg);
+    reg
+}
 
 const FFMPEG: &str = "/usr/bin/ffmpeg";
 
@@ -47,9 +58,9 @@ fn demux_ffmpeg_mjpeg_avi() {
         return;
     }
 
+    let reg = registry_with_mjpeg();
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(path).unwrap());
-    let mut dmx =
-        oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).expect("AVI demuxer open");
     assert_eq!(dmx.format_name(), "avi");
     let streams = dmx.streams().to_vec();
     assert_eq!(streams.len(), 1, "expected one stream");
@@ -93,12 +104,16 @@ fn demux_ffmpeg_ffv1_avi() {
         return;
     }
 
+    // ffv1 isn't registered as a dev-dep here, so the resolver
+    // surfaces the synthetic `avi:FFV1` placeholder. Pipelines that
+    // include `oxideav-ffv1` would resolve this to `ffv1` via the
+    // registry; this test asserts the placeholder fallback shape.
+    let reg = CodecRegistry::new();
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(path).unwrap());
-    let mut dmx =
-        oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).expect("AVI demuxer open");
     let streams = dmx.streams().to_vec();
     assert_eq!(streams.len(), 1);
-    assert_eq!(streams[0].params.codec_id.as_str(), "ffv1");
+    assert_eq!(streams[0].params.codec_id.as_str(), "avi:FFV1");
     assert_eq!(streams[0].params.width, Some(64));
     assert_eq!(streams[0].params.height, Some(64));
 
@@ -130,13 +145,16 @@ fn demux_ffmpeg_av_avi() {
         return;
     }
 
+    let reg = registry_with_mjpeg();
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(path).unwrap());
-    let dmx =
-        oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).expect("AVI demuxer open");
+    let dmx = oxideav_avi::demuxer::open(rs, &reg).expect("AVI demuxer open");
     let streams = dmx.streams();
     assert_eq!(streams.len(), 2, "expected video + audio stream");
     // Declaration order: ffmpeg writes video first, then audio.
     assert_eq!(streams[0].params.codec_id.as_str(), "mjpeg");
+    // pcm_s16le falls through the demuxer's depth-aware
+    // WAVE_FORMAT_PCM synthesiser; the codec crate doesn't need to
+    // be registered for this to work.
     assert_eq!(streams[1].params.codec_id.as_str(), "pcm_s16le");
     assert_eq!(streams[1].params.sample_rate, Some(44_100));
 }

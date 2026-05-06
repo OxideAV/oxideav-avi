@@ -7,10 +7,19 @@
 use std::io::Cursor;
 
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, PixelFormat, Rational, SampleFormat,
-    StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecRegistry, Error, MediaType, Packet, PixelFormat, Rational,
+    SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{ReadSeek, WriteSeek};
+
+/// Build a CodecRegistry pre-populated with `oxideav-mjpeg`'s tag
+/// claims so the muxer can resolve `codec_id="mjpeg"` to
+/// `CodecTag::Fourcc(b"MJPG")` via the registry.
+fn registry_with_mjpeg() -> CodecRegistry {
+    let mut reg = CodecRegistry::new();
+    oxideav_mjpeg::register_codecs(&mut reg);
+    reg
+}
 
 /// Build a deterministic JPEG-ish payload. The demuxer round-trips the bytes
 /// verbatim so we don't actually need a valid JPEG — just something unique
@@ -72,11 +81,12 @@ fn seek_to_video_midway_lands_on_keyframe() {
     // Mux into an in-memory buffer. All video frames flagged as keyframes
     // (every MJPEG frame is a keyframe). Use a temp file so we can hand
     // the demuxer a fresh `Box<dyn ReadSeek>` independent of the writer.
+    let reg = registry_with_mjpeg();
     let tmp = std::env::temp_dir().join("oxideav-avi-seek-video.avi");
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let writer: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux = oxideav_avi::muxer::open(writer, &streams).unwrap();
+        let mut mux = oxideav_avi::muxer::open_with_codecs(writer, &streams, &reg).unwrap();
         mux.write_header().unwrap();
 
         // 10 video frames + matching audio packets per frame (1920 samples
@@ -99,7 +109,7 @@ fn seek_to_video_midway_lands_on_keyframe() {
 
     // Demux and seek.
     let reader: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_avi::demuxer::open(reader, &oxideav_core::NullCodecResolver).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(reader, &reg).unwrap();
     assert_eq!(dmx.streams().len(), 2);
 
     // Seek video stream to pts 5. The muxer flagged every video chunk as a
@@ -145,11 +155,14 @@ fn seek_to_without_idx1_is_unsupported() {
         params: vparams,
     };
 
+    let reg = registry_with_mjpeg();
     let tmp = std::env::temp_dir().join("oxideav-avi-seek-noidx.avi");
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let writer: Box<dyn WriteSeek> = Box::new(f);
-        let mut mux = oxideav_avi::muxer::open(writer, std::slice::from_ref(&stream)).unwrap();
+        let mut mux =
+            oxideav_avi::muxer::open_with_codecs(writer, std::slice::from_ref(&stream), &reg)
+                .unwrap();
         mux.write_header().unwrap();
         let mut pkt = Packet::new(0, stream.time_base, fake_video_packet(0));
         pkt.pts = Some(0);
@@ -173,7 +186,7 @@ fn seek_to_without_idx1_is_unsupported() {
     backing[pos..pos + 4].copy_from_slice(b"JUNK");
 
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(backing));
-    let mut dmx = oxideav_avi::demuxer::open(reader, &oxideav_core::NullCodecResolver).unwrap();
+    let mut dmx = oxideav_avi::demuxer::open(reader, &reg).unwrap();
     match dmx.seek_to(0, 0) {
         Err(Error::Unsupported(_)) => {}
         other => panic!("expected Unsupported without idx1, got {other:?}"),

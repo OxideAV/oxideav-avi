@@ -35,7 +35,6 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::codec_map::{audio_codec_id_full, video_codec_id};
 use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_FORM, LIST, RIFF};
 use crate::stream_format::{parse_bitmap_info_header, parse_waveformatex};
 
@@ -428,14 +427,15 @@ fn validate_indx(body: &[u8]) -> Result<()> {
 
 /// Build a StreamInfo from strh + strf payloads.
 ///
-/// Codec identification flows through `codecs.resolve_tag()` first: a codec
-/// crate may have claimed the AVI FourCC (for video streams) or the
-/// WAVEFORMATEX `wFormatTag` (for audio) via the shared registry, which
-/// gives the codec's own crate ownership of the mapping and lets it attach
-/// a probe function for tag-collision cases (e.g. `DIV3` that's actually
-/// MPEG-4 Part 2). When the registry returns nothing — most of the legacy
-/// codecs (Cinepak, Indeo, WMA, DV, raw PCM flavours) aren't registered —
-/// we fall back to the static table in `codec_map`.
+/// Codec identification flows through `codecs.resolve_tag()`: a codec
+/// crate claims the AVI FourCC (for video streams) or the WAVEFORMATEX
+/// `wFormatTag` (for audio) via the shared registry, which gives the
+/// codec's own crate ownership of the mapping and lets it attach a
+/// probe function for tag-collision cases (e.g. `DIV3` that's actually
+/// MPEG-4 Part 2). When the registry returns nothing the demuxer
+/// surfaces a synthetic `avi:<fourcc>` (or `avi:tag_<hex>`) codec_id;
+/// downstream decoder lookup will then fail with a clean error, which
+/// is the right signal for "this codec crate hasn't been wired in".
 fn build_stream(
     index: u32,
     strh: &[u8],
@@ -484,7 +484,7 @@ fn build_stream(
             }
             let codec_id = codecs
                 .resolve_tag(&ctx)
-                .unwrap_or_else(|| video_codec_id(&compression));
+                .unwrap_or_else(|| video_codec_id_fallback(&compression));
             let mut p = CodecParameters::video(codec_id.clone());
             if let Some(b) = &bmih {
                 p.width = Some(b.width);
@@ -519,7 +519,7 @@ fn build_stream(
             }
             let codec_id = codecs
                 .resolve_tag(&ctx)
-                .unwrap_or_else(|| audio_codec_id_full(format_tag, bits));
+                .unwrap_or_else(|| audio_codec_id_fallback(format_tag, bits));
             let mut p = CodecParameters::audio(codec_id.clone());
             if let Some(w) = &wfx {
                 p.channels = Some(w.channels);
@@ -574,6 +574,57 @@ fn build_stream(
     };
     let _ = sample_size;
     Ok((stream, suffix))
+}
+
+/// Synthesise a placeholder `avi:<fourcc>` codec_id when the resolver
+/// has no claim on the FourCC. Downstream `make_decoder` will return
+/// `CodecNotFound` for these; the prefix lets callers tell "the codec
+/// crate isn't wired in" apart from "the codec id is genuinely unknown".
+fn video_codec_id_fallback(fourcc: &[u8; 4]) -> CodecId {
+    if fourcc == &[0, 0, 0, 0] {
+        // BI_RGB sentinel. There's no meaningful FourCC string to print
+        // and `rgb24` is the conventional codec_id we'd ascribe; emit it
+        // here as the one historical exception so unregistered builds
+        // still surface uncompressed AVI as `rgb24`.
+        return CodecId::new("rgb24");
+    }
+    let printable = fourcc.iter().all(|b| b.is_ascii_graphic() || *b == b' ');
+    if printable {
+        let s = std::str::from_utf8(fourcc).unwrap_or("????");
+        CodecId::new(format!("avi:{s}"))
+    } else {
+        CodecId::new(format!(
+            "avi:0x{:02X}{:02X}{:02X}{:02X}",
+            fourcc[0], fourcc[1], fourcc[2], fourcc[3]
+        ))
+    }
+}
+
+/// Synthesise a placeholder `avi:tag_<hex>` codec_id (or one of the PCM
+/// pseudo-claims for the integer / float WAVE_FORMAT_PCM tags) when the
+/// resolver has no claim on the wFormatTag. This is the only place the
+/// AVI demuxer hard-codes audio codec mappings; codec crates that want
+/// proper resolution for their wFormatTag should claim it via
+/// `CodecInfo::tags(...)`.
+fn audio_codec_id_fallback(format_tag: u16, bits: u16) -> CodecId {
+    let name = match format_tag {
+        // WAVE_FORMAT_PCM — pick the integer flavour by bit depth.
+        // Even when no `pcm_*` codec is registered, surfacing the
+        // depth-aware id keeps downstream demux+inspect tools useful
+        // for raw-PCM AVIs.
+        0x0001 => match bits {
+            8 => "pcm_u8",
+            24 => "pcm_s24le",
+            32 => "pcm_s32le",
+            _ => "pcm_s16le",
+        },
+        0x0003 => match bits {
+            64 => "pcm_f64le",
+            _ => "pcm_f32le",
+        },
+        _ => return CodecId::new(format!("avi:tag_{format_tag:04x}")),
+    };
+    CodecId::new(name)
 }
 
 /// Map a decoded audio codec + WAVEFORMATEX `bits_per_sample` to the

@@ -7,9 +7,9 @@
 //! `muxer::write_packet` which returns an error if the output approaches
 //! 2 GiB.
 
-pub mod codec_map;
 pub mod demuxer;
 pub mod muxer;
+pub(crate) mod packaging;
 pub mod riff;
 pub mod stream_format;
 

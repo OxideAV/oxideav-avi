@@ -23,16 +23,17 @@
 //! `dwDuration`.
 //!
 //! - The public `Muxer` API is codec-agnostic. The only codec-aware
-//!   file is `codec_map::build_strf`, which errors with `Unsupported`
-//!   at `open()` for codecs we don't package. `write_packet` never
-//!   branches on codec.
+//!   call site is `packaging::build_strf`, which errors with
+//!   `Unsupported` at `open()` for codecs the supplied
+//!   `CodecResolver` can't resolve to a wire FourCC / wFormatTag.
+//!   `write_packet` never branches on codec.
 
 use std::io::{Seek, SeekFrom, Write};
 
-use oxideav_core::{Error, Packet, Result, StreamInfo};
+use oxideav_core::{CodecResolver, Error, NullCodecResolver, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
-use crate::codec_map::{build_strf, StrfEntry};
+use crate::packaging::{build_strf, StrfEntry};
 use crate::riff::{
     begin_list, finish_chunk, write_chunk, write_chunk_header, AVI_FORM, LIST, RIFF,
 };
@@ -113,22 +114,52 @@ struct TrackState {
 }
 
 /// Factory registered with the container registry. Defaults to
-/// [`AviKind::Avi10`]; use [`open_with_kind`] to opt into OpenDML.
+/// [`AviKind::Avi10`]; use [`open_with_kind`] / [`open_with_codecs`]
+/// to opt into OpenDML or pass a populated codec registry for
+/// `codec_id → wire FourCC` resolution.
+///
+/// **Note**: this overload uses [`NullCodecResolver`] for codec → tag
+/// inverse lookup, which means callers can only mux codecs whose
+/// FourCC the muxer can derive without a registry — i.e. PCM /
+/// companded-PCM / `rgb24` audio + uncompressed video, or compressed
+/// codecs whose first 4 bytes of `params.extradata` carry an explicit
+/// FourCC hint. For everything else (mjpeg, h264, mp3, …) call
+/// [`open_with_codecs`] with a registry that has the codec crate's
+/// `register(...)` already applied.
 pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
-    open_with_kind(output, streams, AviKind::Avi10)
+    open_with_codecs_and_kind(output, streams, &NullCodecResolver, AviKind::Avi10)
 }
 
-/// Open an AVI muxer with an explicit envelope variant.
-///
-/// `Avi10` matches what [`open`] returns. `OpenDml(limit)` emits a
-/// primary `RIFF AVI ` segment with an OpenDML 2.0 super-index in
-/// the first video stream's `strl`, and rolls additional
-/// `RIFF AVIX` continuation segments whenever the running segment
-/// would exceed `limit.bytes()`. The primary segment still carries
-/// the legacy `idx1` for AVI-1.0 readers.
+/// Open an AVI muxer with an explicit envelope variant. See [`open`]
+/// for the default codec-resolution behaviour.
 pub fn open_with_kind(
     output: Box<dyn WriteSeek>,
     streams: &[StreamInfo],
+    kind: AviKind,
+) -> Result<Box<dyn Muxer>> {
+    open_with_codecs_and_kind(output, streams, &NullCodecResolver, kind)
+}
+
+/// Open an AVI muxer with a codec-tag resolver. The resolver answers
+/// "what FourCC / wFormatTag should I write for this codec_id?" via
+/// [`CodecResolver::tag_for_codec`]. Pass `&CodecRegistry` (after
+/// every relevant codec crate's `register_codecs(&mut reg)` has been
+/// called) to make the muxer codec-aware.
+pub fn open_with_codecs(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Muxer>> {
+    open_with_codecs_and_kind(output, streams, codecs, AviKind::Avi10)
+}
+
+/// Most-general muxer constructor: explicit envelope variant + codec
+/// resolver. See [`open`] / [`open_with_kind`] / [`open_with_codecs`]
+/// for the convenience overloads.
+pub fn open_with_codecs_and_kind(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    codecs: &dyn CodecResolver,
     kind: AviKind,
 ) -> Result<Box<dyn Muxer>> {
     if streams.is_empty() {
@@ -142,7 +173,7 @@ pub fn open_with_kind(
     }
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
-        let entry = build_strf(&s.params)?;
+        let entry = build_strf(&s.params, codecs)?;
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {
             stream: s.clone(),
