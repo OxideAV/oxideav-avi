@@ -111,6 +111,28 @@ struct TrackState {
     max_chunk_size: u32,
     /// Max output bytes per packet (used for ffmpeg compatibility).
     total_bytes: u64,
+    /// Per-segment OpenDML standard-index entries (one per packet in
+    /// the current segment). Flushed into an `ix##` chunk at segment
+    /// close. Always populated so the OpenDML emit path can decide
+    /// whether to write `ix##` regardless of stream type.
+    ix_entries: Vec<IxStdEntry>,
+}
+
+/// One AVISTDINDEX_ENTRY-shaped record for a packet inside the current
+/// OpenDML segment's `ix##` chunk. Offsets are relative to the
+/// enclosing `movi` LIST's first chunk header (`qwBaseOffset` in the
+/// std-index header), which is what AVI 2.0 §"AVI Index Locations"
+/// describes as the canonical reference point.
+#[derive(Clone, Copy, Debug)]
+struct IxStdEntry {
+    /// Byte offset of the chunk **data** (just past its 8-byte header)
+    /// from the segment's `qwBaseOffset` (which is the first chunk
+    /// header inside the movi LIST — what we expose in
+    /// `movi_start_off`).
+    dw_offset: u32,
+    /// Payload size + keyframe-bit clear ⇒ keyframe; high bit set ⇒
+    /// non-keyframe (delta).
+    dw_size_with_flag: u32,
 }
 
 /// Open an AVI muxer with the legacy single-`RIFF AVI ` envelope.
@@ -157,6 +179,7 @@ pub fn open_with_kind(
             sample_count: 0,
             max_chunk_size: 0,
             total_bytes: 0,
+            ix_entries: Vec::new(),
         });
     }
     Ok(Box::new(AviMuxer {
@@ -341,6 +364,33 @@ impl Muxer for AviMuxer {
             0
         };
 
+        // Stamp an `AVISTDINDEX_ENTRY`-shaped record for this packet
+        // before the chunk is actually written: `dw_offset` is from the
+        // segment's `qwBaseOffset` (= `movi_start_off + 4`, the first
+        // chunk header inside the LIST) to the chunk *data* (= just
+        // past its 8-byte header). We accumulate per-track and flush
+        // them into an `ix##` chunk at segment close (`flush_ix_chunks`).
+        if matches!(self.kind, AviKind::OpenDml(_)) {
+            // qwBaseOffset = first chunk header inside movi
+            //              = movi_start_off + 4 ('movi' fourcc width).
+            let qw_base = self.movi_start_off + 4;
+            // chunk-data offset = chunk_header + 8.
+            let data_off = chunk_off + 8;
+            if let Some(d) = data_off.checked_sub(qw_base) {
+                if d <= u32::MAX as u64 {
+                    let dw_size_with_flag = if packet.flags.keyframe {
+                        size
+                    } else {
+                        size | 0x8000_0000
+                    };
+                    self.tracks[idx].ix_entries.push(IxStdEntry {
+                        dw_offset: d as u32,
+                        dw_size_with_flag,
+                    });
+                }
+            }
+        }
+
         write_chunk(self.output.as_mut(), &fourcc, &packet.data)?;
 
         let t = &mut self.tracks[idx];
@@ -397,6 +447,12 @@ impl Muxer for AviMuxer {
 
         let in_primary_segment = self.segments.is_empty();
 
+        // OpenDML: flush `ix##` chunks at the tail of the current
+        // segment's movi LIST before closing it. Mirrors the
+        // close_current_segment path for the trailing partial segment.
+        if matches!(self.kind, AviKind::OpenDml(_)) {
+            self.flush_ix_chunks()?;
+        }
         // Close movi LIST (patch its size).
         finish_chunk(self.output.as_mut(), self.movi_size_off)?;
 
@@ -459,18 +515,17 @@ impl AviMuxer {
         // video, sample_count for audio.
         //
         // Layout we wrote (offsets are within the primary RIFF):
-        //   RIFF(12): 4 + size + 4(AVI )         — offset 0..12
-        //   LIST(8): 4 + size + 4(hdrl)           — offset 12..20
-        //   "avih" chunk:
-        //     header: 4(avih) + 4(size)           — offset 20..28
-        //     body  : 56 bytes                    — offset 28..84
-        //       total_frames at body offset 16    — file offset 44..48
+        //   "RIFF"(4) + size(4) + "AVI "(4)         — offset 0..12
+        //   "LIST"(4) + size(4) + "hdrl"(4)         — offset 12..24
+        //   "avih"(4) + size(4) + body(56)          — offset 24..88
+        //     body[16] = TotalFrames                — file offset 48..52
         //   For each stream i:
-        //     LIST(8): 4 + size + 4(strl)
-        //     strh(8): 4 + 4 + 56
-        //       dwLength at strh body offset 32
-        //     strf(8+N) ...
-        //     [ indx(8 + 24 + 16*OPENDML_SUPER_INDEX_CAPACITY) ]
+        //     "LIST"(4) + size(4) + "strl"(4)       — strl LIST opener
+        //     "strh"(4) + size(4) + body(56)        — strh
+        //       body[32] = dwLength                 — strl_off + 20 + 32
+        //       body[36] = dwSuggestedBufferSize    — strl_off + 20 + 36
+        //     "strf"(4) + size(4) + body(N)
+        //     [ "indx"(4) + size(4) + payload ]     — only if OpenDML & i==0
         let total_video_frames = self
             .tracks
             .iter()
@@ -480,16 +535,20 @@ impl AviMuxer {
 
         let end_pos = self.output.stream_position()?;
 
-        // avih.dwTotalFrames is at offset 20 (LIST hdrl header end) + 8
-        // ("avih" chunk header) + 16 (body offset of TotalFrames) = 44.
-        self.output.seek(SeekFrom::Start(44))?;
+        // avih.dwTotalFrames file offset:
+        //   12 (RIFF preamble) + 12 (LIST hdrl preamble) + 8 ("avih" + size)
+        //   + 16 (TotalFrames body offset) = 48.
+        self.output.seek(SeekFrom::Start(48))?;
         self.output.write_all(&total_video_frames.to_le_bytes())?;
 
-        // Walk through strl lists to patch each strh.dwLength. The first
-        // strl LIST starts at offset 88 (= 20 + 4 + 64). For OpenDML the
-        // first stream's strl ALSO contains an indx chunk after strf, so
-        // the second stream's strl is offset by an extra
-        // (8 + 24 + 16*OPENDML_SUPER_INDEX_CAPACITY) bytes.
+        // First strl LIST starts at the file offset right after the avih
+        // chunk: 12 + 12 + 8 + 56 = 88 ... wait, but the avih body is
+        // 56 B → avih chunk = 64 B → first strl LIST starts at
+        //   12 (RIFF preamble) + 12 (hdrl LIST preamble) + 64 (avih chunk)
+        // = 88.  However for the OpenDML envelope the first stream's
+        // strl ALSO contains an indx chunk after strf, so the second
+        // stream's strl starts an extra
+        //   (8 + 24 + 16*OPENDML_SUPER_INDEX_CAPACITY) bytes later.
         let mut strl_off: u64 = 88;
         let opendml = matches!(self.kind, AviKind::OpenDml(_));
         for (i, t) in self.tracks.iter().enumerate() {
@@ -540,12 +599,19 @@ impl AviMuxer {
         idx_body
     }
 
-    /// Close the current `RIFF` segment in OpenDML mode. Finishes the
-    /// movi LIST, writes idx1 if this is the primary segment, then
-    /// finishes the outer RIFF and records the segment's `(offset,
-    /// total_size, packet_count)`.
+    /// Close the current `RIFF` segment in OpenDML mode. Flushes
+    /// per-stream `ix##` chunks at the tail of the movi LIST, finishes
+    /// the movi LIST, writes `idx1` if this is the primary segment,
+    /// then finishes the outer RIFF and records the segment's
+    /// `(offset, total_size, packet_count)`.
     fn close_current_segment(&mut self) -> Result<()> {
         let in_primary = self.segments.is_empty();
+        // Flush `ix##` AVISTDINDEX chunks at the tail of the current
+        // segment's movi LIST. One per track with at least one packet
+        // recorded in this segment. Per OpenDML 2.0 §"Index Locations",
+        // these live INSIDE the movi LIST so consumers walking movi
+        // see them while scanning forward.
+        self.flush_ix_chunks()?;
         // Close movi LIST.
         finish_chunk(self.output.as_mut(), self.movi_size_off)?;
         // idx1 only in primary RIFF (offsets are 32-bit, can't span
@@ -563,6 +629,56 @@ impl AviMuxer {
             total_size: after_riff - riff_start,
             packet_count: self.current_segment_packets,
         });
+        Ok(())
+    }
+
+    /// Write one `ix##` AVISTDINDEX chunk per track that has packets
+    /// recorded in the current segment. After flushing, the per-track
+    /// `ix_entries` lists are cleared so the next segment starts
+    /// fresh. The `qwBaseOffset` we serialise is `movi_start_off + 4`
+    /// — i.e. the offset of the first chunk header inside the
+    /// segment's movi LIST, which matches what the demuxer's
+    /// `parse_ix_chunk` uses as the base for `dw_offset` resolution.
+    fn flush_ix_chunks(&mut self) -> Result<()> {
+        let qw_base = self.movi_start_off + 4;
+        // Take ownership so we can mutate per-track state and then
+        // borrow `self.output` mutably alongside.
+        let ix_entries_per_track: Vec<Vec<IxStdEntry>> = self
+            .tracks
+            .iter_mut()
+            .map(|t| std::mem::take(&mut t.ix_entries))
+            .collect();
+        for (track_idx, entries) in ix_entries_per_track.iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            // FourCC is "ix" + the two-ASCII-decimal-digit stream index
+            // — per OpenDML 2.0 §"Index Locations": "the corresponding
+            // index chunks are marked with 'ix##' in the 'movi' data."
+            let stream_digits = packet_fourcc_for(track_idx as u32, *b"xx");
+            let ix_id = [b'i', b'x', stream_digits[0], stream_digits[1]];
+            let mut payload = Vec::with_capacity(32 + entries.len() * 8);
+            // wLongsPerEntry = 2 (8 B per entry).
+            payload.extend_from_slice(&2u16.to_le_bytes());
+            // bIndexSubType = 0 (default, not 2-field).
+            payload.push(0);
+            // bIndexType = AVI_INDEX_OF_CHUNKS (0x01).
+            payload.push(0x01);
+            // nEntriesInUse.
+            payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            // dwChunkId.
+            payload.extend_from_slice(&self.tracks[track_idx].packet_fourcc);
+            // qwBaseOffset.
+            payload.extend_from_slice(&qw_base.to_le_bytes());
+            // dwReserved3.
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            // Entries.
+            for e in entries.iter() {
+                payload.extend_from_slice(&e.dw_offset.to_le_bytes());
+                payload.extend_from_slice(&e.dw_size_with_flag.to_le_bytes());
+            }
+            write_chunk(self.output.as_mut(), &ix_id, &payload)?;
+        }
         Ok(())
     }
 

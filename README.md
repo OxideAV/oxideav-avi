@@ -29,7 +29,8 @@ oxideav-avi = "0.0"
 | `LIST rec ` packet grouping inside `movi`        | yes   | no   |
 | OpenDML 2.0 multi-`RIFF AVIX` continuation       | yes   | yes  |
 | OpenDML 2.0 `indx` super-index in `strl`         | yes (parse) | yes (emit) |
-| OpenDML-driven seeking (`indx` super-index)      | no (follow-up) | n/a |
+| OpenDML 2.0 `ix##` per-segment std-index in `movi` | yes (parse) | yes (emit) |
+| OpenDML-driven seeking (`ix##` std-index)        | yes (no-idx1 fallback) | n/a |
 | Uncompressed `db` video chunks                   | yes   | yes  |
 | Variable stream interleave                       | yes   | yes  |
 | Palette-change (`pc`) chunks                     | skip  | no   |
@@ -40,12 +41,12 @@ OpenDML 2.0 muxing is opt-in via `muxer::open_with_kind` with an
 testing). The muxer rolls a new `RIFF AVIX` segment whenever the
 running segment would exceed the byte ceiling; the primary segment
 carries an `indx` super-index in the first stream's `strl` with one
-entry per segment back-patched in `write_trailer`. Per-stream `ix##`
-chunks are intentionally omitted (spec/06 §6.1: from the codec's POV
-the super-index is informational; sequential decode walks every
-`RIFF AVIX` continuation directly). OpenDML-driven seeking off the
-super-index is a follow-up; `seek_to` still goes through the AVI
-1.0 `idx1` index only. The legacy `muxer::open` (which `Avi10`
+entry per segment back-patched in `write_trailer`, and each segment
+emits a per-stream `ix##` `AVISTDINDEX` chunk at the tail of its
+`movi` LIST. Demuxer-side, `seek_to` falls back to the `ix##`
+standard indexes when no AVI 1.0 `idx1` is present (typical for
+OpenDML-only files written by recent ffmpeg / VirtualDub2 with
+`--max_riff_size` set). The legacy `muxer::open` (which `Avi10`
 defaults to) refuses to grow past ~2 GiB and returns
 `Error::Unsupported`.
 

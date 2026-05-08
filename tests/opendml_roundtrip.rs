@@ -377,6 +377,180 @@ fn opendml_indx_super_index_entries_match_riff_offsets() {
 }
 
 #[test]
+fn opendml_emits_ix_chunks_per_segment() {
+    // OpenDML 2.0 §"Index Locations": each `RIFF AVIX` continuation
+    // (and the primary RIFF) is expected to carry per-stream `ix##`
+    // AVISTDINDEX chunks at the tail of its `movi` LIST. With 12
+    // frames at 512 B and limit=4 KiB we land on multiple segments;
+    // every segment that has at least one packet should have an
+    // `ix00` chunk written after the packet data.
+    let stream = magicyuv_stream(64, 64);
+    let frames: Vec<Vec<u8>> = (0..12).map(|i| synthesize_payload(i + 400, 512)).collect();
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-opendml-ix-chunks.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_kind(
+            ws,
+            std::slice::from_ref(&stream),
+            AviKind::OpenDml(RiffSegmentLimit::Bytes(4 * 1024)),
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        for (i, payload) in frames.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+            pkt.pts = Some(i as i64);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let bytes = std::fs::read(&tmp).unwrap();
+    // Count distinct top-level RIFF segments.
+    let mut riff_count = 0usize;
+    let mut cursor = 0usize;
+    while cursor + 12 <= bytes.len() {
+        if &bytes[cursor..cursor + 4] != b"RIFF" {
+            break;
+        }
+        riff_count += 1;
+        let sz = u32::from_le_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        cursor += 8 + sz + (sz & 1);
+    }
+    assert!(riff_count >= 2, "expected ≥ 2 RIFFs for ix## test");
+
+    // Count `ix00` FourCCs in the file. Every segment with packets
+    // emits one. Search by looking for the 8-byte chunk header
+    // `ix00 <size>` and verifying the size > 32 (payload contains at
+    // least the 32-byte preamble).
+    let ix00_chunks: usize = bytes
+        .windows(8)
+        .filter(|w| {
+            &w[0..4] == b"ix00" && {
+                let sz = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
+                sz >= 32
+            }
+        })
+        .count();
+    assert_eq!(
+        ix00_chunks, riff_count,
+        "expected one ix00 per segment, got {ix00_chunks} for {riff_count} RIFFs"
+    );
+}
+
+#[test]
+fn opendml_seek_via_std_index_when_idx1_missing() {
+    // Synthesise an OpenDML AVI, then strip the `idx1` chunk so the
+    // demuxer must fall back to the OpenDML `ix##` standard-index
+    // path. Seek halfway through and verify the next packet's PTS
+    // matches the requested seek target.
+    let stream = magicyuv_stream(64, 64);
+    let frames: Vec<Vec<u8>> = (0..16).map(|i| synthesize_payload(i + 500, 512)).collect();
+    let reg = registry_with_magicyuv();
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-opendml-seek-ix.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_kind(
+            ws,
+            std::slice::from_ref(&stream),
+            AviKind::OpenDml(RiffSegmentLimit::Bytes(4 * 1024)),
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        for (i, payload) in frames.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+            pkt.pts = Some(i as i64);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    // Replace `idx1` FourCC with `JUNK` so the demuxer treats it as
+    // padding. The size field stays valid; `JUNK` chunks are
+    // unconditionally skipped by the walker.
+    let mut backing = std::fs::read(&tmp).unwrap();
+    let mut found = None;
+    for (i, w) in backing.windows(4).enumerate() {
+        if w == b"idx1" {
+            found = Some(i);
+            break;
+        }
+    }
+    let pos = found.expect("muxer always emits idx1");
+    backing[pos..pos + 4].copy_from_slice(b"JUNK");
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(backing));
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
+    // Now `seek_to` must use the std-index. Target frame 8 (mid-file).
+    let landed = dmx
+        .seek_to(0, 8)
+        .expect("std-index-backed seek must succeed without idx1");
+    // All frames are keyframes, so the landed pts matches the target.
+    assert_eq!(landed, 8, "expected exact landing on frame-8");
+    let pkt = dmx.next_packet().expect("packet after seek");
+    assert_eq!(pkt.stream_index, 0);
+    let pts = pkt.pts.expect("pts set");
+    assert!(
+        pts >= landed,
+        "post-seek pts {pts} should be ≥ landed {landed}"
+    );
+    // Payload should match frame 8 byte-for-byte.
+    assert_eq!(
+        pkt.data, frames[8],
+        "post-seek packet must equal source frame 8 (byte-equal)"
+    );
+}
+
+#[test]
+fn opendml_metadata_surfaces_avih_fields() {
+    // The demuxer's `metadata()` should expose key AVIMAINHEADER fields
+    // under the `avi:*` namespace so consumers can introspect dimensions
+    // / flags without re-parsing the file. Verify against a small
+    // OpenDML round-trip.
+    let stream = magicyuv_stream(128, 96);
+    let payload = synthesize_payload(7, 64);
+    let reg = registry_with_magicyuv();
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-opendml-metadata.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_kind(
+            ws,
+            std::slice::from_ref(&stream),
+            AviKind::OpenDml(RiffSegmentLimit::OneGiB),
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+        pkt.pts = Some(0);
+        pkt.flags.keyframe = true;
+        mux.write_packet(&pkt).unwrap();
+        mux.write_trailer().unwrap();
+    }
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
+    let md = dmx.metadata();
+    let get = |k: &str| md.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    assert_eq!(get("avi:width").as_deref(), Some("128"));
+    assert_eq!(get("avi:height").as_deref(), Some("96"));
+    assert_eq!(get("avi:streams").as_deref(), Some("1"));
+    assert_eq!(get("avi:flags").as_deref(), Some("0x00000810"));
+    // Truncated flag should NOT be set on a clean round-trip.
+    assert_eq!(get("avi:truncated"), None);
+}
+
+#[test]
 fn opendml_single_segment_when_limit_is_large() {
     // Generous limit → only one segment. Output should still parse,
     // and the indx super-index should declare exactly one entry.

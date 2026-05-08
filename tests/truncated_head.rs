@@ -299,6 +299,33 @@ fn hdrl_oversize_with_present_movi_still_walks() {
     }
 }
 
+/// Fixture (g): truncation surfaces an `avi:truncated=true` metadata
+/// entry so a downstream tool can warn the user without itself
+/// re-probing the file. Combined with the avih dimensions surfaced
+/// under `avi:width` / `avi:height` this gives container consumers a
+/// complete picture of the file's claimed shape vs. its physical
+/// bounds.
+#[test]
+fn truncated_head_surfaces_metadata_flag() {
+    let mut buf = build_pcm_avi("trunc-md", 4, 256);
+    // Inflate the RIFF size by 100 MiB so file_len < declared end.
+    let original = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    patch_u32(&mut buf, 4, original.saturating_add(100 * 1024 * 1024));
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+    let dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let md = dmx.metadata();
+    let truncated = md
+        .iter()
+        .find(|(k, _)| k == "avi:truncated")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(
+        truncated,
+        Some("true"),
+        "demuxer should surface avi:truncated=true under metadata()"
+    );
+}
+
 // ----------------------------------------------------------------------
 // Negative tests — genuinely-malformed inputs still error cleanly.
 // ----------------------------------------------------------------------

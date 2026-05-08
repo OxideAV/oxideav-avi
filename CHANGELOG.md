@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenDML 2.0 `ix##` standard-index emit + parse + seek.** Muxer
+  flushes one `AVISTDINDEX` (`ix##`) chunk per stream at the tail
+  of every `RIFF AVIX` segment's `movi` LIST (spec/06 §"Index
+  Locations"). Demuxer scans every `movi` segment for `ix##`
+  chunks and uses them as a fallback for `seek_to` when the AVI
+  1.0 `idx1` table is absent — the canonical case for files
+  written by recent ffmpeg / VirtualDub2 with `--max_riff_size`
+  set. The fallback walks every keyframe entry across all
+  segments and lands on the latest one whose synthesised pts is
+  ≤ the requested target. Per-stream PTS counters are reset to
+  match the landed entry so `next_packet` resumes with correct
+  timestamps.
+- **`indx` super-index full parse.** Demuxer now decodes the
+  per-stream `AVISUPERINDEX` (24-byte preamble + 16-byte entries
+  with `qwOffset`/`dwSize`/`dwDuration`) into a structured
+  `SuperIndex` per stream. Round-trip-paired with the existing
+  emit path. Used to gate the `ix##` scan when the super-index
+  declares one (some encoders emit `ix##` without an `indx`,
+  which the scan still picks up).
+- **`avih` AVIMAINHEADER metadata.** Demuxer surfaces the
+  AVIMAINHEADER fields beyond duration (`width`, `height`,
+  `streams`, `flags`, `suggested_buffer_size`,
+  `max_bytes_per_sec`) under namespaced metadata keys
+  (`avi:width`, `avi:height`, …) so a media-info dumper can
+  inspect the global header without re-parsing.
+- **`avi:truncated` metadata flag.** Demuxer detects when the
+  declared top-level RIFF length exceeds the physical file
+  length (capture-card crash dumps, copy-aborted recordings)
+  and surfaces `avi:truncated=true` so a downstream player UI
+  can warn the user. Distinct from the existing best-effort
+  packet-walk tolerance — this is the "did clamping take
+  effect" signal.
+
+### Fixed
+
+- **`avih.dwTotalFrames` patch offset (off-by-4).** The muxer's
+  post-mux back-patch wrote `dwTotalFrames` at file offset 44
+  (which lands inside `dwFlags`); the correct offset for our
+  layout (RIFF preamble 12 + LIST hdrl preamble 12 + avih
+  chunk-header 8 + body offset 16) is 48. Fixes a silent
+  AVIMAINHEADER corruption visible only when consumers read
+  `dwFlags` or `dwTotalFrames` back; existing tests passed
+  because none asserted on these.
+
 - **Truncated-head AVI tolerance.** Demuxer now best-effort parses
   AVI 1.0 files whose top-level `RIFF` / `LIST hdrl` / `LIST movi`
   size fields over-declare the bytes physically present (capture-card

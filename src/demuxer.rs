@@ -65,6 +65,13 @@ use oxideav_core::{Demuxer, ReadSeek};
 use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_FORM, LIST, RIFF};
 use crate::stream_format::{parse_bitmap_info_header, parse_waveformatex};
 
+/// `bIndexType` of an `AVIMETAINDEX` super-index (`indx` of indexes).
+const AVI_INDEX_OF_INDEXES: u8 = 0x00;
+/// `bIndexType` of an `AVIMETAINDEX` chunk index (`ix##`).
+const AVI_INDEX_OF_CHUNKS: u8 = 0x01;
+/// `dwSize` high bit in an `AVISTDINDEX_ENTRY` flags a non-keyframe (delta).
+const AVISTDINDEX_DELTA_BIT: u32 = 0x8000_0000;
+
 /// Factory registered with the container registry.
 pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Probe the actual file length so we can clamp over-declared chunk sizes
@@ -86,11 +93,16 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     if form != AVI_FORM {
         return Err(Error::invalid("AVI: RIFF form type is not AVI"));
     }
+    // Detect truncated-head by comparing the declared full RIFF length
+    // (8 + top.size) to the physical file length. Over-declared by 8+
+    // bytes ⇒ the file ends before its own RIFF claims to.
+    let declared_riff_total = 8u64.saturating_add(top.size as u64);
+    let truncated_head = declared_riff_total > file_len;
     // End of the primary RIFF (exclusive). `top.size` does not include the
     // 8-byte RIFF header itself; its body starts right after the 4-byte
     // form-type and ends at this offset. Clamp against the actual file
     // length so a truncated-head AVI doesn't surface an out-of-range walk.
-    let riff_end = (8u64 + top.size as u64).min(file_len);
+    let riff_end = declared_riff_total.min(file_len);
 
     // Walk top-level nested chunks until we've processed both hdrl and movi.
     let mut streams: Vec<StreamInfo> = Vec::new();
@@ -101,6 +113,11 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     let mut avih: Option<AviMainHeader> = None;
     let mut metadata: Vec<(String, String)> = Vec::new();
     let mut idx1_raw: Option<Vec<u8>> = None;
+    // OpenDML 2.0 super-indexes, one per stream that declared an `indx`
+    // chunk in its `strl` LIST. Empty for AVI 1.0 files. The vector is
+    // indexed by stream number so a sparse population (only video carries
+    // an `indx`) leaves audio entries empty.
+    let mut super_indexes: Vec<SuperIndex> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -112,6 +129,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         &mut avih,
         &mut metadata,
         &mut idx1_raw,
+        &mut super_indexes,
         codecs,
         /* is_primary */ true,
     )?;
@@ -135,6 +153,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                     &mut avih,
                     &mut metadata,
                     &mut idx1_raw,
+                    &mut super_indexes,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -163,6 +182,44 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         _ => 0,
     };
 
+    // Surface AVIMAINHEADER-derived diagnostics through `metadata()` —
+    // see `Demuxer::metadata()`. Keys are namespaced under `avi:` so a
+    // generic consumer can ignore them while a container-aware caller
+    // (a player UI, a media-info dumper) can still display them.
+    if let Some(h) = &avih {
+        if h.width > 0 {
+            metadata.push(("avi:width".into(), h.width.to_string()));
+        }
+        if h.height > 0 {
+            metadata.push(("avi:height".into(), h.height.to_string()));
+        }
+        if h.streams > 0 {
+            metadata.push(("avi:streams".into(), h.streams.to_string()));
+        }
+        if h.flags != 0 {
+            metadata.push(("avi:flags".into(), format!("0x{:08X}", h.flags)));
+        }
+        if h.suggested_buffer_size > 0 {
+            metadata.push((
+                "avi:suggested_buffer_size".into(),
+                h.suggested_buffer_size.to_string(),
+            ));
+        }
+        if h.max_bytes_per_sec > 0 {
+            metadata.push((
+                "avi:max_bytes_per_sec".into(),
+                h.max_bytes_per_sec.to_string(),
+            ));
+        }
+    }
+    // Truncated-head signal: capture-card crash dumps, copy-aborted
+    // recordings. The demuxer is best-effort for this case (see
+    // module docs) — a downstream tool can decide to surface a
+    // warning to the user.
+    if truncated_head {
+        metadata.push(("avi:truncated".into(), "true".into()));
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -171,6 +228,24 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     } else {
         Vec::new()
     };
+
+    // OpenDML 2.0 standard-index scan: walk every `movi` segment looking
+    // for `ix##` chunks. Each maps back to one stream via the two ASCII
+    // digits at the start of its FourCC. We perform this regardless of
+    // whether a `super_index` was declared in `strl`, because some
+    // writers emit `ix##` directly without a corresponding `indx` slot.
+    let std_indexes =
+        if super_indexes.iter().any(|s| !s.entries.is_empty()) || movi_segments.len() > 1 {
+            scan_ix_in_movi(&mut *input, &movi_segments).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+    // Pad super_indexes to streams.len() so per-stream lookup is always
+    // safe even if some strl LISTs didn't declare an indx.
+    while super_indexes.len() < streams.len() {
+        super_indexes.push(SuperIndex::default());
+    }
 
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
@@ -186,6 +261,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         metadata,
         duration_micros,
         idx_table,
+        super_indexes,
+        std_indexes,
     }))
 }
 
@@ -205,6 +282,7 @@ fn walk_riff_body(
     avih: &mut Option<AviMainHeader>,
     metadata: &mut Vec<(String, String)>,
     idx1_raw: &mut Option<Vec<u8>>,
+    super_indexes: &mut Vec<SuperIndex>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -225,10 +303,11 @@ fn walk_riff_body(
             let body_end = (body_start + body_len as u64).min(end).min(file_len);
             match &list_type {
                 b"hdrl" if is_primary => {
-                    let (main, stream_infos, suffixes) = parse_hdrl(input, body_end, codecs)?;
+                    let (main, stream_infos, suffixes, sxs) = parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
                     *packet_chunk_suffix = suffixes;
+                    *super_indexes = sxs;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -355,21 +434,20 @@ fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
 
 /// Decoded AVIMAINHEADER (dwMicroSecPerFrame / … struct).
 ///
-/// Most fields are retained for future use (seek tables, buffer sizing) even
-/// though the current demuxer consumes them only during parsing.
-#[allow(dead_code)]
+/// Per Microsoft's `aviriff.h` `AVIMAINHEADER` definition (see
+/// `docs/container/riff/avi-riff-file-reference.md` Appendix A). Fields
+/// kept beyond what the demuxer's seek logic needs are surfaced via
+/// `Demuxer::metadata()` under the `avi:*` namespace so callers can
+/// inspect AVIMAINHEADER without re-parsing the file.
 #[derive(Clone, Copy, Debug, Default)]
 struct AviMainHeader {
     micro_sec_per_frame: u32,
-    #[allow(dead_code)]
     max_bytes_per_sec: u32,
-    #[allow(dead_code)]
     flags: u32,
     total_frames: u32,
     #[allow(dead_code)]
     initial_frames: u32,
     streams: u32,
-    #[allow(dead_code)]
     suggested_buffer_size: u32,
     width: u32,
     height: u32,
@@ -394,19 +472,31 @@ fn parse_avih(buf: &[u8]) -> Result<AviMainHeader> {
     })
 }
 
+/// Bundle of values returned from [`parse_hdrl`]: the parsed
+/// [`AviMainHeader`], the list of per-stream [`StreamInfo`]s, the
+/// matching list of packet-chunk suffixes (e.g. `b"dc"`, `b"wb"`),
+/// and the OpenDML 2.0 super-index per stream (empty for streams
+/// that don't declare an `indx` chunk in their `strl`).
+type HdrlOutput = (
+    AviMainHeader,
+    Vec<StreamInfo>,
+    Vec<[u8; 2]>,
+    Vec<SuperIndex>,
+);
+
 /// Parse the `hdrl` LIST body.
 ///
 /// Reads `avih`, then walks each nested `strl` LIST to build one `StreamInfo`
-/// per stream. Returns also the list of expected packet-chunk suffixes (e.g.
-/// `b"dc"`, `b"wb"`) so the demuxer can recognise packets.
+/// per stream. See [`HdrlOutput`] for the return shape.
 fn parse_hdrl<R: ReadSeek + ?Sized>(
     r: &mut R,
     end_pos: u64,
     codecs: &dyn CodecResolver,
-) -> Result<(AviMainHeader, Vec<StreamInfo>, Vec<[u8; 2]>)> {
+) -> Result<HdrlOutput> {
     let mut main = AviMainHeader::default();
     let mut streams: Vec<StreamInfo> = Vec::new();
     let mut suffixes: Vec<[u8; 2]> = Vec::new();
+    let mut super_indexes: Vec<SuperIndex> = Vec::new();
 
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
@@ -425,10 +515,11 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
+                    let (si, suf, sx) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
                         suffixes.push(suf.unwrap_or(*b"xx"));
+                        super_indexes.push(sx);
                     }
                 }
                 r.seek(SeekFrom::Start(body_end))?;
@@ -439,18 +530,21 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
             }
         }
     }
-    Ok((main, streams, suffixes))
+    Ok((main, streams, suffixes, super_indexes))
 }
 
-/// Parse a `strl` LIST. Returns the `StreamInfo` and expected packet suffix.
+/// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
+/// suffix, and the OpenDML 2.0 [`SuperIndex`] parsed from the `indx`
+/// chunk inside the strl (empty if absent).
 fn parse_strl<R: ReadSeek + ?Sized>(
     r: &mut R,
     end_pos: u64,
     index: u32,
     codecs: &dyn CodecResolver,
-) -> Result<(Option<StreamInfo>, Option<[u8; 2]>)> {
+) -> Result<(Option<StreamInfo>, Option<[u8; 2]>, SuperIndex)> {
     let mut strh_buf: Option<Vec<u8>> = None;
     let mut strf_buf: Option<Vec<u8>> = None;
+    let mut super_index = SuperIndex::default();
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
             Some(h) => h,
@@ -467,7 +561,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
             }
             b"indx" => {
                 // OpenDML 2.0 super-index (AVI_INDEX_OF_INDEXES).
-                // Layout (header, 24 B):
+                // Layout (preamble, 24 B):
                 //   WORD  wLongsPerEntry  (= 4 for super-index)
                 //   BYTE  bIndexSubType
                 //   BYTE  bIndexType      (= 0x00 AVI_INDEX_OF_INDEXES)
@@ -475,14 +569,15 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 //   DWORD dwChunkId       (e.g. '00dc')
                 //   DWORD dwReserved[3]
                 // Followed by 16-byte entries: qwOffset (u64), dwSize
-                // (u32), dwDuration (u32). We parse for validation and
-                // visibility but don't drive seek off it yet — for
-                // sequential decode the demuxer walks every `movi`
-                // LIST across all RIFF segments anyway. OpenDML-driven
-                // seeking is a follow-up.
+                // (u32), dwDuration (u32). Each entry points at one
+                // `ix##` standard-index chunk in a movi LIST (typically
+                // a different RIFF segment for OpenDML 2.0 multi-RIFF
+                // files). The standard-index chunks themselves are
+                // located opportunistically during the per-segment
+                // movi scan in `scan_ix_in_movi`.
                 let body = read_body_bounded(r, hdr.size)?;
                 skip_pad(r, hdr.size)?;
-                validate_indx(&body)?;
+                super_index = parse_indx(&body)?;
             }
             _ => {
                 skip_chunk(r, &hdr)?;
@@ -491,28 +586,30 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     }
     let strh = match strh_buf {
         Some(b) => b,
-        None => return Ok((None, None)),
+        None => return Ok((None, None, super_index)),
     };
     let strf = strf_buf.unwrap_or_default();
     let parsed = build_stream(index, &strh, &strf, codecs)?;
-    Ok((Some(parsed.0), Some(parsed.1)))
+    Ok((Some(parsed.0), Some(parsed.1), super_index))
 }
 
-/// Light validation of an OpenDML 2.0 `indx` super-index payload. We
-/// confirm the 24-byte preamble is well-formed and that the per-entry
-/// table has room for `nEntriesInUse` slots. Malformed but
-/// non-fatally-broken indexes (e.g. excess padding past the declared
-/// entry count) are tolerated since downstream code doesn't rely on
-/// the super-index for sequential decode. Returns `Error::InvalidData`
-/// only when the chunk is truncated below the 24-byte header.
-fn validate_indx(body: &[u8]) -> Result<()> {
+/// Parse an OpenDML 2.0 `indx` super-index payload into a structured
+/// [`SuperIndex`]. Validates the 24-byte preamble + the per-entry
+/// table; tolerates excess padding past the declared `nEntriesInUse`
+/// (some writers preallocate a fixed-size slot table and back-patch
+/// only the used entries). Returns `Error::InvalidData` only when the
+/// chunk is truncated below the 24-byte header or the entry table
+/// short-reads `nEntriesInUse * 16` bytes.
+fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
     if body.len() < 24 {
         return Err(Error::invalid("AVI: indx super-index header truncated"));
     }
-    let _w_longs_per_entry = u16::from_le_bytes([body[0], body[1]]);
-    let _b_index_sub_type = body[2];
-    let _b_index_type = body[3];
+    let w_longs_per_entry = u16::from_le_bytes([body[0], body[1]]);
+    let b_index_sub_type = body[2];
+    let b_index_type = body[3];
     let n_entries_in_use = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let mut chunk_id = [0u8; 4];
+    chunk_id.copy_from_slice(&body[8..12]);
     let entries_byte_len = n_entries_in_use.saturating_mul(16);
     let need = 24usize.saturating_add(entries_byte_len);
     if body.len() < need {
@@ -520,7 +617,168 @@ fn validate_indx(body: &[u8]) -> Result<()> {
             "AVI: indx super-index entry table truncated",
         ));
     }
-    Ok(())
+    if b_index_type != AVI_INDEX_OF_INDEXES {
+        // Per spec/06 §6.1 the `indx` chunk in the strl always carries
+        // bIndexType = AVI_INDEX_OF_INDEXES. Some encoders are sloppy
+        // here, so we tolerate it but won't have working seek.
+        return Ok(SuperIndex::default());
+    }
+    let mut entries = Vec::with_capacity(n_entries_in_use);
+    for i in 0..n_entries_in_use {
+        let base = 24 + i * 16;
+        let qw_offset = u64::from_le_bytes([
+            body[base],
+            body[base + 1],
+            body[base + 2],
+            body[base + 3],
+            body[base + 4],
+            body[base + 5],
+            body[base + 6],
+            body[base + 7],
+        ]);
+        let dw_size = u32::from_le_bytes([
+            body[base + 8],
+            body[base + 9],
+            body[base + 10],
+            body[base + 11],
+        ]);
+        let dw_duration = u32::from_le_bytes([
+            body[base + 12],
+            body[base + 13],
+            body[base + 14],
+            body[base + 15],
+        ]);
+        // Skip zero-offset slots — those are unused capacity (the muxer
+        // reserves a fixed number of slots and back-patches only the
+        // ones it filled).
+        if qw_offset == 0 {
+            continue;
+        }
+        entries.push(SuperIndexEntry {
+            qw_offset,
+            dw_size,
+            dw_duration,
+        });
+    }
+    Ok(SuperIndex {
+        w_longs_per_entry,
+        b_index_sub_type,
+        chunk_id,
+        entries,
+    })
+}
+
+/// Parse an `ix##` AVISTDINDEX body. Layout per
+/// `aviriff.h::AVISTDINDEX` (preamble = 24 B; the chunk header's
+/// `fcc`+`cb` aren't part of the body we receive here):
+///
+/// ```text
+///   WORD      wLongsPerEntry  (= 2 for std-index; entry is 8 B)
+///   BYTE      bIndexSubType   (0 default; 1 for 2-field)
+///   BYTE      bIndexType      (= 0x01 AVI_INDEX_OF_CHUNKS)
+///   DWORD     nEntriesInUse
+///   DWORD     dwChunkId       (e.g. '00dc')
+///   DWORDLONG qwBaseOffset    (typically the file offset of the 'movi' LIST)
+///   DWORD     dwReserved3
+///   AVISTDINDEX_ENTRY aIndex[]   // 8 B each: dwOffset + dwSize/flags
+/// ```
+///
+/// Each `AVISTDINDEX_ENTRY.dwOffset` is added to `qwBaseOffset` to get
+/// the file-absolute offset of the chunk's data (i.e. just after its
+/// 8-byte header). `dwSize`'s high bit being set marks a non-keyframe.
+fn parse_ix_chunk(body: &[u8]) -> Option<StdIndex> {
+    if body.len() < 24 {
+        return None;
+    }
+    let w_longs_per_entry = u16::from_le_bytes([body[0], body[1]]);
+    let _b_index_sub_type = body[2];
+    let b_index_type = body[3];
+    if b_index_type != AVI_INDEX_OF_CHUNKS || w_longs_per_entry != 2 {
+        return None;
+    }
+    let n_entries_in_use = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let mut chunk_id = [0u8; 4];
+    chunk_id.copy_from_slice(&body[8..12]);
+    let qw_base_offset = u64::from_le_bytes([
+        body[12], body[13], body[14], body[15], body[16], body[17], body[18], body[19],
+    ]);
+    let entries_byte_len = n_entries_in_use.saturating_mul(8);
+    let need = 24usize.saturating_add(entries_byte_len);
+    if body.len() < need {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(n_entries_in_use);
+    for i in 0..n_entries_in_use {
+        let base = 24 + i * 8;
+        let dw_offset =
+            u32::from_le_bytes([body[base], body[base + 1], body[base + 2], body[base + 3]]);
+        let dw_size_raw = u32::from_le_bytes([
+            body[base + 4],
+            body[base + 5],
+            body[base + 6],
+            body[base + 7],
+        ]);
+        let is_keyframe = (dw_size_raw & AVISTDINDEX_DELTA_BIT) == 0;
+        let dw_size = dw_size_raw & !AVISTDINDEX_DELTA_BIT;
+        entries.push(StdIndexEntry {
+            dw_offset,
+            dw_size,
+            is_keyframe,
+        });
+    }
+    Some(StdIndex {
+        chunk_id,
+        qw_base_offset,
+        entries,
+    })
+}
+
+/// Walk the per-segment `movi` LIST scanning for `ix##` AVISTDINDEX
+/// chunks. Used for OpenDML 2.0 random-access seek when no `idx1`
+/// table is present (typical for files written by recent ffmpeg /
+/// VirtualDub2 with `--max_riff_size` set). Returns the parsed
+/// std-index per `ix##` chunk found (each maps back to one stream via
+/// the `##` ASCII digits in its FourCC).
+fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
+    r: &mut R,
+    movi_segments: &[(u64, u64)],
+) -> Result<Vec<StdIndex>> {
+    let mut out: Vec<StdIndex> = Vec::new();
+    for &(start, end) in movi_segments {
+        r.seek(SeekFrom::Start(start))?;
+        while r.stream_position()? + 8 <= end {
+            let hdr = match read_chunk_header_lenient(r)? {
+                Some(h) => h,
+                None => break,
+            };
+            // `ix##` FourCCs (ASCII digits at bytes 2..4 instead of
+            // 0..2 — note the spec's "##ix" → "ix##" reversal for AVI
+            // backward compatibility): the two ASCII digits live at
+            // hdr.id[2..4] for std-index chunks. Microsoft's
+            // aviriff.h-style notation is "ix##"; some files in the
+            // wild also flip and emit "##ix" but those are rare.
+            let body_end = (r.stream_position()? + hdr.size as u64).min(end);
+            if hdr.id[0] == b'i' && hdr.id[1] == b'x' {
+                let body = read_body_bounded(r, hdr.size).ok();
+                if let Some(b) = body {
+                    if let Some(idx) = parse_ix_chunk(&b) {
+                        out.push(idx);
+                    }
+                }
+                skip_pad(r, hdr.size)?;
+            } else if hdr.id == LIST {
+                // Skip the 4-byte form-type and continue scanning the
+                // body — `LIST rec ` clusters can contain ix## too.
+                let _ = read_form_type(r)?;
+                continue;
+            } else {
+                // Skip every other chunk (frames, JUNK, …).
+                let _ = body_end; // documentation aid
+                skip_chunk(r, &hdr)?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Build a StreamInfo from strh + strf payloads.
@@ -936,6 +1194,77 @@ struct AviDemuxer {
     duration_micros: i64,
     /// Optional idx1-derived seek table (empty = not available).
     idx_table: Vec<IdxEntry>,
+    /// Optional OpenDML 2.0 super-index per stream (parallel to `streams`,
+    /// indexed by stream number). Empty `SuperIndex` for streams that
+    /// didn't declare an `indx` chunk in their strl. Used as a probe
+    /// signal for the std-index scan; the actual seek table is built
+    /// from [`AviDemuxer::std_indexes`] (the `ix##` chunks the
+    /// super-index points at).
+    #[allow(dead_code)]
+    super_indexes: Vec<SuperIndex>,
+    /// Standard `ix##` index chunks (one per (stream, segment) pair) if
+    /// present. Combined with `super_indexes` to drive seek for
+    /// OpenDML files with no `idx1`.
+    std_indexes: Vec<StdIndex>,
+}
+
+/// One `AVISUPERINDEX_ENTRY` parsed from an `indx` chunk.
+///
+/// We don't dereference `qw_offset` directly — the `ix##` chunks it
+/// points to are picked up by the in-movi scan in `scan_ix_in_movi`,
+/// which is more robust when the super-index entries are stale or
+/// pointing into the wrong segment (some encoders are sloppy here).
+/// The fields are retained for diagnostics / debug-print use.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct SuperIndexEntry {
+    /// File-absolute offset of the matching `ix##` (`AVISTDINDEX`) chunk.
+    qw_offset: u64,
+    /// Size of the `AVISTDINDEX` segment in bytes.
+    dw_size: u32,
+    /// Time span covered by chunks indexed by that `ix##`, in stream ticks.
+    dw_duration: u32,
+}
+
+/// One `indx` AVISUPERINDEX chunk found inside a `strl` LIST.
+///
+/// Empty (zero entries, all-zero chunk_id) for streams that don't carry
+/// one — tracked alongside [`StreamInfo`] for index-by-stream lookup.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct SuperIndex {
+    /// 4 for AVI 2.0 super-indexes (each entry is 4 DWORDs = 16 bytes).
+    /// Captured for diagnostics; not used in seek.
+    w_longs_per_entry: u16,
+    /// 0 (default) or `AVI_INDEX_SUB_2FIELD`.
+    b_index_sub_type: u8,
+    /// FourCC of indexed chunks (`00dc` etc.). Tags every `ix##` slot.
+    chunk_id: [u8; 4],
+    entries: Vec<SuperIndexEntry>,
+}
+
+/// One `AVISTDINDEX_ENTRY` parsed from an `ix##` chunk.
+#[derive(Clone, Copy, Debug)]
+struct StdIndexEntry {
+    /// `dwOffset`: byte offset from `StdIndex::qw_base_offset` to the
+    /// chunk's data (i.e. just past its 8-byte header).
+    dw_offset: u32,
+    /// `dwSize` with the keyframe-bit cleared: payload size in bytes.
+    dw_size: u32,
+    /// True iff the std-index entry's `dwSize` high bit is clear.
+    is_keyframe: bool,
+}
+
+/// One `ix##` AVISTDINDEX chunk parsed out of a `movi` LIST.
+#[derive(Clone, Debug)]
+struct StdIndex {
+    /// FourCC of indexed chunks (`00dc` etc.). The two ASCII digits at
+    /// `chunk_id[0..2]` give the stream number.
+    chunk_id: [u8; 4],
+    /// Base offset for `dw_offset` lookups — typically the file offset
+    /// of the enclosing `movi` LIST's first chunk header.
+    qw_base_offset: u64,
+    entries: Vec<StdIndexEntry>,
 }
 
 /// One entry parsed from the `idx1` top-level chunk, normalised to
@@ -1070,9 +1399,17 @@ impl Demuxer for AviDemuxer {
                 "AVI: stream index {stream_index} out of range"
             )));
         }
+        // OpenDML-driven seek: when the AVI 1.0 `idx1` table is missing
+        // but OpenDML 2.0 `ix##` standard indexes are present, we can
+        // still seek by walking the std-index entries for the matching
+        // stream. The std-indexes index every chunk across every RIFF
+        // segment, so they're the canonical OpenDML-only seek path.
         if self.idx_table.is_empty() {
+            if !self.std_indexes.is_empty() {
+                return self.seek_via_std_indexes(stream_index, pts);
+            }
             return Err(Error::unsupported(
-                "AVI: seek requires idx1; OpenDML indx/ix## not implemented",
+                "AVI: seek requires idx1 or OpenDML ix## standard indexes",
             ));
         }
 
@@ -1157,6 +1494,135 @@ impl Demuxer for AviDemuxer {
         } else {
             None
         }
+    }
+}
+
+impl AviDemuxer {
+    /// OpenDML 2.0 fallback for `seek_to` when no AVI 1.0 `idx1` table
+    /// is present.
+    ///
+    /// Walks the in-memory `StdIndex` collection (one per (stream,
+    /// segment) pair, parsed from the `ix##` chunks during `open()`)
+    /// and lands on the last keyframe entry for `stream_index` whose
+    /// running pts is ≤ `target_pts`. Each entry's pts is synthesised
+    /// the same way `build_idx_table` does it for `idx1`: walk the
+    /// per-stream entries in file order, advancing per-stream pts by
+    /// `packet_time_delta(stream, size)` per chunk.
+    ///
+    /// Per-stream PTS counters are reset to the landed entry's value so
+    /// `next_packet` resumes synthesising correct PTS post-seek.
+    fn seek_via_std_indexes(&mut self, stream_index: u32, target_pts: i64) -> Result<i64> {
+        // Collect every entry for this stream from `std_indexes`,
+        // tagged with the running per-stream pts, the file offset of
+        // the chunk header, and the keyframe flag. Std-indexes appear
+        // in file order so the running pts is monotonic across them.
+        let mut per_stream_entries: Vec<(u64, i64, bool)> = Vec::new();
+        let mut running_pts: i64 = 0;
+        for ix in &self.std_indexes {
+            let stream = match parse_stream_index(&ix.chunk_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            if stream != stream_index {
+                continue;
+            }
+            let s = stream as usize;
+            for e in &ix.entries {
+                let abs_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
+                // The std-index dwOffset points at the chunk *data*
+                // (just past the 8-byte header). Our `next_packet`
+                // expects to land on the chunk header, so back off 8.
+                let header_off = abs_off.saturating_sub(8);
+                per_stream_entries.push((header_off, running_pts, e.is_keyframe));
+                let bump = packet_time_delta(&self.streams[s], e.dw_size as usize) as i64;
+                running_pts = running_pts.saturating_add(bump);
+            }
+        }
+        if per_stream_entries.is_empty() {
+            return Err(Error::unsupported(format!(
+                "AVI: no OpenDML std-index entries for stream {stream_index}"
+            )));
+        }
+        // Find last keyframe entry with pts <= target_pts.
+        let mut best: Option<(u64, i64)> = None;
+        for &(off, pts, kf) in &per_stream_entries {
+            if !kf {
+                continue;
+            }
+            if pts <= target_pts {
+                best = Some(match best {
+                    Some(b) if b.1 >= pts => b,
+                    _ => (off, pts),
+                });
+            }
+        }
+        // Fall back to the first keyframe if nothing matches.
+        if best.is_none() {
+            for &(off, pts, kf) in &per_stream_entries {
+                if kf {
+                    best = Some((off, pts));
+                    break;
+                }
+            }
+        }
+        let (target_off, landed_pts) = best.ok_or_else(|| {
+            Error::unsupported(format!(
+                "AVI: no keyframes in std-index for stream {stream_index}"
+            ))
+        })?;
+        // Find which segment hosts this offset.
+        let seg = self
+            .movi_segments
+            .iter()
+            .position(|&(s, e)| target_off >= s && target_off < e)
+            .ok_or_else(|| Error::invalid("AVI: ix## entry points outside of any movi segment"))?;
+        self.current_segment = seg;
+        self.input.seek(SeekFrom::Start(target_off))?;
+
+        // Reset per-stream PTS counters. Walk every std-index entry in
+        // file order and assign each stream's running pts to the value
+        // at-the-entry whose offset is the latest at-or-before
+        // target_off. `next_packet` then resumes synthesising correct
+        // timestamps because it picks up from per_stream_counter[s]
+        // and only bumps after returning each packet.
+        if self.per_stream_counter.len() != self.streams.len() {
+            self.per_stream_counter = vec![0u64; self.streams.len()];
+        } else {
+            for c in self.per_stream_counter.iter_mut() {
+                *c = 0;
+            }
+        }
+        // Per-stream running pts threaded across every ix-block so
+        // boundary entries carry over correctly. (A naive
+        // re-initialisation from per_stream_counter[s] at the start
+        // of every ix block would drop one tick each time because
+        // we assign-before-bump and the previous block's tail bump
+        // is in a local that doesn't survive the boundary.) For each
+        // entry, we always advance running_pts; we only stamp
+        // per_stream_counter when the entry sits at-or-before
+        // target_off — that way per_stream_counter ends up holding
+        // the pts of the latest qualifying entry per stream.
+        let mut running_pts: Vec<u64> = vec![0u64; self.streams.len()];
+        for ix in &self.std_indexes {
+            let stream = match parse_stream_index(&ix.chunk_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let s = stream as usize;
+            if s >= self.per_stream_counter.len() {
+                continue;
+            }
+            for e in &ix.entries {
+                let abs_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
+                let header_off = abs_off.saturating_sub(8);
+                if header_off <= target_off {
+                    self.per_stream_counter[s] = running_pts[s];
+                }
+                let bump = packet_time_delta(&self.streams[s], e.dw_size as usize);
+                running_pts[s] = running_pts[s].saturating_add(bump);
+            }
+        }
+        Ok(landed_pts)
     }
 }
 
