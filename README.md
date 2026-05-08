@@ -32,7 +32,9 @@ oxideav-avi = "0.0"
 | OpenDML 2.0 `ix##` per-segment std-index in `movi` | yes (parse) | yes (emit) |
 | OpenDML 2.0 `LIST odml dmlh` extended header     | yes (parse) | yes (emit) |
 | OpenDML 2.0 `vprp` Video Properties Header       | yes (parse) | yes (NTSC/PAL/SECAM presets + custom aspect) |
-| OpenDML 2.0 `AVI_INDEX_2FIELD` interlaced std-index | yes (parse + metadata surface) | yes (`open_avi` + `set_field2_offset`) |
+| OpenDML 2.0 `AVI_INDEX_2FIELD` interlaced std-index | yes (parse + metadata surface + per-packet `field2_offset_for_packet` accessor) | yes (`open_avi` + `set_field2_offset`) |
+| OpenDML 2.0 super-index overflow signalling      | yes (`avi:indx.<n>.overflow_entries`) | yes (`AviMuxer::truncated_super_index_segments()`) |
+| VBR audio framing via `Packet.duration`          | n/a   | yes (drives `strh.dwLength` for non-PCM) |
 | OpenDML-driven seeking (`ix##` std-index)        | yes (no-idx1 fallback) | n/a |
 | Uncompressed `db` video chunks                   | yes   | yes  |
 | Variable stream interleave                       | yes   | yes  |

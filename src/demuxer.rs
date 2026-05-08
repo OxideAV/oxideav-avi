@@ -77,8 +77,36 @@ const AVI_INDEX_SUB_2FIELD: u8 = 0x01;
 /// `dwSize` high bit in an `AVISTDINDEX_ENTRY` flags a non-keyframe (delta).
 const AVISTDINDEX_DELTA_BIT: u32 = 0x8000_0000;
 
-/// Factory registered with the container registry.
-pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+/// Soft cap on `indx` super-index entry count. Mirrors the muxer's
+/// `OPENDML_SUPER_INDEX_CAPACITY` (256 slots = 4 KiB of payload). When
+/// a parsed `indx` declares more entries than this, the demuxer
+/// surfaces an `avi:indx.<stream>.overflow_entries` metadata key so
+/// downstream tools can flag files written by encoders that didn't
+/// pre-reserve enough super-index slots (round-5 candidate 4).
+///
+/// Per OpenDML 2.0 §3.0 "Super Index Chunk", `nEntriesInUse` is a
+/// DWORD and a writer may legitimately reserve > 256 entries. We
+/// don't truncate the parsed entry list (a downstream consumer may
+/// still want every entry), we only signal the overflow.
+const OPENDML_SUPER_INDEX_SOFT_CAP: usize = 256;
+
+/// Factory registered with the container registry. Returns a boxed
+/// trait object — callers that need AVI-specific accessors like
+/// [`AviDemuxer::field2_offset_for_packet`] should use [`open_avi`]
+/// instead.
+pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(open_avi(input, codecs)?))
+}
+
+/// Open an AVI demuxer and return the concrete [`AviDemuxer`] so
+/// callers can access AVI-specific accessors like
+/// [`AviDemuxer::field2_offset_for_packet`] (round-5 candidate 1).
+///
+/// Same parsing behaviour as the trait-object [`open`]; the only
+/// difference is the return type so callers can hold the concrete
+/// handle alongside the [`oxideav_core::Demuxer`] trait it
+/// implements.
+pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<AviDemuxer> {
     // Probe the actual file length so we can clamp over-declared chunk sizes
     // against it. Truncated-head AVI files (capture-card crash dumps,
     // copy-aborted recordings) routinely declare RIFF / LIST sizes that
@@ -353,6 +381,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // `bIndexSubType == AVI_INDEX_2FIELD` we emit
     // `avi:ix.<index>.is_2field = true` and the comma-separated list
     // of `dwOffsetField2` values (qwBaseOffset-relative).
+    let mut field2_streams_seen: std::collections::BTreeSet<u32> =
+        std::collections::BTreeSet::new();
     {
         use std::collections::BTreeMap;
         let mut per_stream_offsets: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
@@ -370,6 +400,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         }
         for (stream, _) in per_stream_2field.iter() {
             metadata.push((format!("avi:ix.{stream}.is_2field"), "true".into()));
+            field2_streams_seen.insert(*stream);
             if let Some(offsets) = per_stream_offsets.get(stream) {
                 let joined = offsets
                     .iter()
@@ -377,6 +408,48 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                     .collect::<Vec<_>>()
                     .join(",");
                 metadata.push((format!("avi:ix.{stream}.field2_offsets"), joined));
+            }
+        }
+    }
+
+    // Round-5 candidate 4: surface a soft-cap warning when a parsed
+    // `indx` super-index declared more entries than the conventional
+    // 256-slot reserve. Per OpenDML 2.0 §3.0 "Super Index Chunk" the
+    // `nEntriesInUse` field is a DWORD so this is technically valid,
+    // but an entry count beyond ~256 is unusual and may signal a
+    // writer that didn't allow for fixed-slot back-patching (the
+    // round-trip muxer caps at 256 and silently drops the tail).
+    // Emitting `avi:indx.<stream>.overflow_entries` lets downstream
+    // tools flag the file even if seek still works.
+    for (i, sx) in super_indexes.iter().enumerate() {
+        if sx.entries.len() > OPENDML_SUPER_INDEX_SOFT_CAP {
+            metadata.push((
+                format!("avi:indx.{i}.overflow_entries"),
+                sx.entries.len().to_string(),
+            ));
+        }
+    }
+
+    // Round-5 candidate 2: when an idx1 table is present alongside
+    // an `AVI_INDEX_2FIELD` ix## for the same stream, surface a
+    // per-stream "interlaced via idx1" hint at the idx1 layer. The
+    // AVI 1.0 idx1 entry layout (`AVIINDEXENTRY`) doesn't define
+    // its own field-2 columns, but vfw.h's `AVIIF_FIRSTPART` /
+    // `AVIIF_LASTPART` flags semantically mean "this idx1 entry's
+    // chunk is the first/last part of a multi-part frame". For our
+    // single-chunk-per-frame 2-field carriage both bits would be
+    // set on every idx1 entry; rather than rewrite the parsed
+    // flags we surface the equivalent `avi:idx1.<stream>.is_2field`
+    // metadata key so consumers can apply field-aware rendering
+    // when seeking via idx1 too.
+    if !idx_table.is_empty() {
+        for s in &field2_streams_seen {
+            // Only stamp the hint when idx1 actually carries entries
+            // for this stream — otherwise the idx1 layer doesn't
+            // describe field carriage anyway.
+            let any = idx_table.iter().any(|e| e.stream == *s);
+            if any {
+                metadata.push((format!("avi:idx1.{s}.is_2field"), "true".into()));
             }
         }
     }
@@ -390,7 +463,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
-    Ok(Box::new(AviDemuxer {
+    Ok(AviDemuxer {
         input,
         streams,
         packet_chunk_suffix,
@@ -403,7 +476,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         idx_table,
         super_indexes,
         std_indexes,
-    }))
+    })
 }
 
 /// Walk the body of one RIFF (`AVI ` or `AVIX`). Collects `hdrl` metadata
@@ -1463,7 +1536,12 @@ fn probe_offset_has_ckid<R: ReadSeek + ?Sized>(
 
 // --- Demuxer runtime ------------------------------------------------------
 
-struct AviDemuxer {
+/// Concrete AVI demuxer. Returned by [`open_avi`] for callers that
+/// need direct access to AVI-specific accessors like
+/// [`AviDemuxer::field2_offset_for_packet`] (round-5 candidate 1).
+/// Implements [`oxideav_core::Demuxer`] for the usual streams /
+/// next_packet / seek_to / metadata / duration_micros entry points.
+pub struct AviDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     /// For each stream, the expected 2-byte chunk-name suffix in `movi`.
@@ -1836,6 +1914,61 @@ impl Demuxer for AviDemuxer {
 }
 
 impl AviDemuxer {
+    /// Per-packet `dwOffsetField2` accessor for OpenDML 2.0 2-field
+    /// streams (round-5 candidate 1).
+    ///
+    /// Until now the field-2 offsets surfaced only as the comma-joined
+    /// `avi:ix.<stream>.field2_offsets` metadata value, which forces
+    /// callers walking packets to re-parse the demuxer's own metadata
+    /// just to associate a field-2 byte position with the packet they
+    /// just read. This accessor returns `Some(offset)` when:
+    ///
+    /// 1. A 2-field `ix##` (`bIndexSubType == AVI_INDEX_2FIELD`) was
+    ///    parsed for `stream_index`,
+    /// 2. `packet_seq` (the zero-based packet ordinal **for that
+    ///    stream** in file order) is within the std-index entry list,
+    /// 3. The matching std-index entry has a non-zero
+    ///    `dwOffsetField2`.
+    ///
+    /// Returned offsets are `qwBaseOffset`-relative (i.e. relative to
+    /// the first chunk header inside the enclosing `movi` LIST), per
+    /// OpenDML 2.0 §3.0 "AVI Field Index Chunk". Callers that want a
+    /// file-absolute offset can add the matching segment's
+    /// `movi_start` (= `(start, end)` from the segment list, which
+    /// the demuxer already exposes via the public `metadata()`
+    /// `avi:ix.<stream>.is_2field` key — the public surface
+    /// intentionally stays minimal).
+    ///
+    /// Returns `None` for non-2-field streams, out-of-range
+    /// `packet_seq`, or unknown `stream_index`.
+    pub fn field2_offset_for_packet(&self, stream_index: u32, packet_seq: usize) -> Option<u32> {
+        // Walk std_indexes in file order and pick the per-stream
+        // `packet_seq`-th entry whose parent index carries
+        // AVI_INDEX_SUB_2FIELD.
+        let mut seen = 0usize;
+        for ix in &self.std_indexes {
+            let stream = parse_stream_index(&ix.chunk_id)?;
+            if stream != stream_index {
+                continue;
+            }
+            if ix.b_index_sub_type != AVI_INDEX_SUB_2FIELD {
+                // Non-2-field index for this stream: still advances
+                // the per-stream packet ordinal so callers can use a
+                // single counter even for streams whose carriage
+                // changes mid-file.
+                seen = seen.saturating_add(ix.entries.len());
+                continue;
+            }
+            let local = packet_seq.checked_sub(seen)?;
+            if local < ix.entries.len() {
+                let v = ix.entries[local].dw_offset_field2;
+                return if v == 0 { None } else { Some(v) };
+            }
+            seen = seen.saturating_add(ix.entries.len());
+        }
+        None
+    }
+
     /// OpenDML 2.0 fallback for `seek_to` when no AVI 1.0 `idx1` table
     /// is present.
     ///

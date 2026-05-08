@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **2-field-aware per-packet accessor (round 5 C1).** New
+  `AviDemuxer::field2_offset_for_packet(stream, pkt_id) -> Option<u32>`
+  surfaces the per-packet `dwOffsetField2` directly, parallel to
+  the comma-joined `avi:ix.<n>.field2_offsets` metadata key. New
+  `demuxer::open_avi(...) -> AviDemuxer` concrete-type entry
+  point so callers can hold the typed handle alongside the
+  `Demuxer` trait it implements. Returns `None` for non-2-field
+  streams, out-of-range `pkt_id`, or unknown `stream` indexes.
+- **idx1 + 2-field correlation hint (round 5 C2).** When an
+  `idx1` table is present alongside an `ix##` carrying
+  `bIndexSubType == AVI_INDEX_2FIELD` for the same stream, the
+  demuxer surfaces an `avi:idx1.<n>.is_2field = "true"` metadata
+  key so consumers seeking via the legacy idx1 path know the
+  entries describe interlaced frames. The AVI 1.0 `AVIINDEXENTRY`
+  layout itself doesn't define field-2 columns; this hint makes
+  the OpenDML interpretation visible at the idx1 layer too.
+- **VBR audio framing via `Packet.duration` (round 5 C3).** Non-PCM
+  audio (`strh.dwSampleSize == 0`) now accumulates each packet's
+  `Packet.duration` (in stream ticks) into the running sample
+  count so `strh.dwLength` reflects a real frame count rather
+  than the round-3 "1 per packet" placeholder. PCM audio still
+  uses the block-align-driven `size / sample_size` path; VBR
+  streams that don't set `Packet.duration` keep the legacy
+  fallback.
+- **OpenDML super-index overflow signalling (round 5 C4).**
+  Muxer-side: new
+  `AviMuxer::truncated_super_index_segments() -> usize` returns the
+  number of segments that overflowed the 256-slot
+  `OPENDML_SUPER_INDEX_CAPACITY` reserve (silently truncated by
+  `patch_super_index` until now). Demuxer-side: an
+  `avi:indx.<stream>.overflow_entries = "<count>"` metadata key
+  is emitted when a parsed `indx` super-index declares more
+  entries than the conventional 256-slot soft cap, so downstream
+  inspectors can flag files with degraded super-index fidelity.
 - **2-field interlaced encoder (round 4 P1).** New
   `AviMuxOptions::with_field2_stream(idx)` plus the concrete-type
   entry point `open_avi(...) -> AviMuxer` so callers can invoke

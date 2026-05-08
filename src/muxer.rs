@@ -736,9 +736,14 @@ impl Muxer for AviMuxer {
             t.max_chunk_size = size;
         }
         t.total_bytes += size as u64;
-        // Sample count: for audio with block_align, add the frame count;
-        // otherwise one sample per packet.
-        t.sample_count += sample_count_of_packet(&t.stream, &t.entry, size);
+        // Sample count: for PCM (block_align > 0) we derive the frame
+        // count from `size / block_align`; for VBR audio we prefer the
+        // packet's `duration` field (round-5 candidate 3) so
+        // `strh.dwLength` reflects per-packet sample budgets that can't
+        // be reconstructed from a fixed block_align. Falls back to one
+        // sample per packet (the round-3 behaviour) when neither is
+        // available.
+        t.sample_count += sample_count_of_packet(&t.stream, &t.entry, size, packet.duration);
 
         self.current_segment_packets += 1;
         if self.options.rec_cluster_packets.is_some() || self.options.rec_cluster_bytes.is_some() {
@@ -1120,6 +1125,33 @@ impl AviMuxer {
         self.pending_field2_offset = Some(payload_offset);
     }
 
+    /// Number of OpenDML segments that overflowed the
+    /// `OPENDML_SUPER_INDEX_CAPACITY` (256) reserve in the `indx`
+    /// super-index (round-5 candidate 4).
+    ///
+    /// Returns `0` when every segment lands in the super-index, or
+    /// when `kind` is `AviKind::Avi10` (the legacy envelope has no
+    /// super-index). When > 0, the trailing entries silently miss
+    /// the super-index — the file is still demuxable (the demuxer
+    /// walks `RIFF AVIX` continuations linearly) but a downstream
+    /// inspector can flag the file as having lost some
+    /// random-access fidelity.
+    ///
+    /// Meaningful only after [`oxideav_core::Muxer::write_trailer`]
+    /// — until then `segments.len()` doesn't reflect the trailing
+    /// open segment.
+    pub fn truncated_super_index_segments(&self) -> usize {
+        if !matches!(self.kind, AviKind::OpenDml(_)) {
+            return 0;
+        }
+        if self.indx_entries_capacity == 0 {
+            return 0;
+        }
+        self.segments
+            .len()
+            .saturating_sub(self.indx_entries_capacity)
+    }
+
     /// Back-patch the OpenDML `indx` super-index entries with each
     /// segment's `(qwOffset, dwSize, dwDuration)` triple, and write
     /// the final `nEntriesInUse`.
@@ -1359,13 +1391,46 @@ fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> 
     body
 }
 
-fn sample_count_of_packet(stream: &StreamInfo, entry: &StrfEntry, size: u32) -> u64 {
-    if &entry.strh_type == b"auds" && entry.sample_size > 0 {
-        (size as u64) / (entry.sample_size as u64)
-    } else {
-        let _ = stream;
-        1
+/// Compute how much to advance `TrackState::sample_count` for a
+/// freshly-written packet.
+///
+/// PCM audio (`strh.fccType == "auds" && entry.sample_size > 0`)
+/// uses `size / sample_size` so `strh.dwLength` ends up as the total
+/// number of audio frames — exactly what the AVI 1.0 spec
+/// (`AVISTREAMHEADER.dwLength`) wants for fixed block_align streams.
+///
+/// VBR audio (`sample_size == 0`) is the round-5 candidate 3
+/// addition: when the encoder supplies `Packet.duration` (in stream
+/// ticks; for audio that's `samples_per_second` time-base ticks per
+/// the [`Demuxer::time_base`] convention), we accumulate that into
+/// `sample_count` so `dwLength` ends up as the real frame count.
+/// Without `duration` we fall back to the round-3 "1 per packet"
+/// behaviour, which is at least monotonic — it just can't be
+/// converted back to a wall-clock duration.
+///
+/// Non-audio streams always get 1 per packet (frame count).
+fn sample_count_of_packet(
+    stream: &StreamInfo,
+    entry: &StrfEntry,
+    size: u32,
+    duration: Option<i64>,
+) -> u64 {
+    if &entry.strh_type == b"auds" {
+        if entry.sample_size > 0 {
+            return (size as u64) / (entry.sample_size as u64);
+        }
+        // VBR (e.g. MP3, AC3, AAC): prefer the packet's duration when
+        // the caller bothered to set it. The AVI strh.dwLength is in
+        // the stream's ticks (= samples_per_sec for PCM-like audio),
+        // so a positive `Packet.duration` lands directly here.
+        if let Some(d) = duration {
+            if d > 0 {
+                return d as u64;
+            }
+        }
     }
+    let _ = stream;
+    1
 }
 
 #[cfg(test)]
