@@ -22,14 +22,14 @@ oxideav-avi = "0.0"
 |--------------------------------------------------|:-----:|:----:|
 | RIFF/AVI 1.0 (hdrl/strl/movi/idx1)               | yes   | yes  |
 | Multi-stream (video + audio + ...)               | yes   | yes  |
-| `LIST INFO` metadata (title/artist/album/...)    | yes   | no   |
+| `LIST INFO` metadata (title/artist/album/...)    | yes (known FourCCs + `avi:info.<fourcc>` for unknowns) | yes (`AviMuxOptions::with_info`) |
 | Duration from `avih` (microseconds-per-frame)    | yes   | n/a  |
 | `idx1` legacy index — parse for keyframe seek    | yes   | yes  |
 | `idx1` offsets — file-absolute + movi-relative   | yes   | yes  |
 | `LIST rec ` packet grouping inside `movi`        | yes   | yes (packet-cap or byte-budget) |
 | OpenDML 2.0 multi-`RIFF AVIX` continuation       | yes   | yes  |
 | OpenDML 2.0 `indx` super-index in `strl`         | yes (parse) | yes (emit) |
-| OpenDML 2.0 `ix##` per-segment std-index in `movi` | yes (parse) | yes (emit) |
+| OpenDML 2.0 `ix##` per-segment std-index in `movi` | yes (parse) | yes (segment-tail emit + opt-in mid-`movi` periodic flush via `AviMuxOptions::with_mid_movi_index`) |
 | OpenDML 2.0 `LIST odml dmlh` extended header     | yes (parse) | yes (emit) |
 | OpenDML 2.0 `vprp` Video Properties Header       | yes (parse) | yes (NTSC/PAL/SECAM presets + custom aspect) |
 | OpenDML 2.0 `AVI_INDEX_2FIELD` interlaced std-index | yes (parse + metadata surface + per-packet `field2_offset_for_packet` accessor) | yes (`open_avi` + `set_field2_offset`) |
