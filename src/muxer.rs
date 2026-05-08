@@ -91,16 +91,126 @@ pub enum AviKind {
 ///
 /// All fields default to off / disabled so existing callers (which
 /// pass nothing) get the same byte output they did pre-round-3.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AviMuxOptions {
     /// When `Some(n)`, group every `n` consecutive packet chunks into
     /// a `LIST rec ` cluster inside `movi`. Per OpenDML 2.0 spec/06
     /// §"Stream Data ('movi' List)", `LIST rec ` clusters keep the
     /// per-cluster size manageable for files that grow past 1 GiB.
-    /// Default `None` (no clustering — every packet sits as a direct
-    /// child of `movi`). The minimum useful value is 2; `Some(0)` and
-    /// `Some(1)` are treated as `None`.
+    /// Default `None` (no clustering). The minimum useful value is
+    /// 2; `Some(0)` and `Some(1)` are treated as `None`.
     pub rec_cluster_packets: Option<u32>,
+    /// When `Some(n)`, close the current `LIST rec ` cluster as soon
+    /// as the packet that just landed pushes the cluster body past
+    /// `n` bytes (round-4 P4). May be combined with
+    /// [`Self::rec_cluster_packets`] (whichever cap fires first
+    /// closes the cluster). `n < 256` is treated as `None`.
+    pub rec_cluster_bytes: Option<u32>,
+    /// Per-stream `vprp` populator (round-4 P2). Each entry is keyed
+    /// by stream index; absent entries fall back to the round-3
+    /// `FORMAT_UNKNOWN` / `STANDARD_UNKNOWN` defaults. Only emitted
+    /// in `AviKind::OpenDml` mode.
+    pub vprp_overrides: Vec<(u32, VprpConfig)>,
+    /// Per-stream 2-field interlaced index opt-in (round-4 P1). When
+    /// the listed stream is a video stream and the envelope is
+    /// `AviKind::OpenDml`, the muxer emits `AVI_INDEX_2FIELD`
+    /// super + standard indexes for it (12-byte std-index entries
+    /// carrying `dwOffsetField2`). Encoders should call
+    /// [`AviMuxer::set_field2_offset`] before each `write_packet`
+    /// for an interlaced stream.
+    pub field2_streams: Vec<u32>,
+}
+
+/// Per-stream override values for the OpenDML 2.0 `vprp` Video
+/// Properties Header (round-4 P2). All fields are optional; a zero
+/// value falls back to the round-3 default the muxer already emits
+/// for that field.
+///
+/// Per OpenDML 2.0 §5.0 the spec defines four well-known
+/// `(VideoFormatToken, VideoStandard)` pairs — the helpers
+/// [`VprpConfig::ntsc`] / [`VprpConfig::pal`] / [`VprpConfig::secam`]
+/// fill in the well-known refresh rates so callers don't have to
+/// remember the table.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VprpConfig {
+    /// `VideoFormatToken` per OpenDML §5.0 enum. 0 = FORMAT_UNKNOWN.
+    pub video_format_token: u32,
+    /// `VideoStandard` per OpenDML §5.0 enum. 0 = STANDARD_UNKNOWN.
+    pub video_standard: u32,
+    /// `dwVerticalRefreshRate` in Hz. 0 = use stream-derived fps.
+    pub vertical_refresh_rate: u32,
+    /// `dwFrameAspectRatio` packed `(X << 16) | Y`. 0 = 4:3 default.
+    pub frame_aspect_ratio: u32,
+    /// `nbFieldPerFrame` — 1 progressive, 2 interlaced. 0 = 1.
+    pub nb_field_per_frame: u32,
+}
+
+/// OpenDML 2.0 §5.0 video-format token: `FORMAT_UNKNOWN`.
+pub const VIDEO_FORMAT_UNKNOWN: u32 = 0;
+/// OpenDML 2.0 §5.0 video-format token: PAL square-pixel.
+pub const VIDEO_FORMAT_PAL_SQUARE: u32 = 1;
+/// OpenDML 2.0 §5.0 video-format token: PAL CCIR 601.
+pub const VIDEO_FORMAT_PAL_CCIR_601: u32 = 2;
+/// OpenDML 2.0 §5.0 video-format token: NTSC square-pixel.
+pub const VIDEO_FORMAT_NTSC_SQUARE: u32 = 3;
+/// OpenDML 2.0 §5.0 video-format token: NTSC CCIR 601.
+pub const VIDEO_FORMAT_NTSC_CCIR_601: u32 = 4;
+
+/// OpenDML 2.0 §5.0 video-standard: `STANDARD_UNKNOWN`.
+pub const VIDEO_STANDARD_UNKNOWN: u32 = 0;
+/// OpenDML 2.0 §5.0 video-standard: PAL.
+pub const VIDEO_STANDARD_PAL: u32 = 1;
+/// OpenDML 2.0 §5.0 video-standard: NTSC.
+pub const VIDEO_STANDARD_NTSC: u32 = 2;
+/// OpenDML 2.0 §5.0 video-standard: SECAM.
+pub const VIDEO_STANDARD_SECAM: u32 = 3;
+
+impl VprpConfig {
+    /// NTSC CCIR-601 preset: 60 Hz, interlaced, 4:3.
+    pub fn ntsc() -> Self {
+        Self {
+            video_format_token: VIDEO_FORMAT_NTSC_CCIR_601,
+            video_standard: VIDEO_STANDARD_NTSC,
+            vertical_refresh_rate: 60,
+            frame_aspect_ratio: (4u32 << 16) | 3,
+            nb_field_per_frame: 2,
+        }
+    }
+    /// PAL CCIR-601 preset: 50 Hz, interlaced, 4:3.
+    pub fn pal() -> Self {
+        Self {
+            video_format_token: VIDEO_FORMAT_PAL_CCIR_601,
+            video_standard: VIDEO_STANDARD_PAL,
+            vertical_refresh_rate: 50,
+            frame_aspect_ratio: (4u32 << 16) | 3,
+            nb_field_per_frame: 2,
+        }
+    }
+    /// SECAM preset: 50 Hz, interlaced, 4:3 (no SECAM token in §5.0).
+    pub fn secam() -> Self {
+        Self {
+            video_format_token: VIDEO_FORMAT_UNKNOWN,
+            video_standard: VIDEO_STANDARD_SECAM,
+            vertical_refresh_rate: 50,
+            frame_aspect_ratio: (4u32 << 16) | 3,
+            nb_field_per_frame: 2,
+        }
+    }
+    /// Builder: pin `nbFieldPerFrame`.
+    pub fn with_nb_field_per_frame(mut self, n: u32) -> Self {
+        self.nb_field_per_frame = n;
+        self
+    }
+    /// Builder: pin `dwFrameAspectRatio` packed as `(X << 16) | Y`.
+    pub fn with_frame_aspect_ratio(mut self, packed: u32) -> Self {
+        self.frame_aspect_ratio = packed;
+        self
+    }
+    /// Builder: pin `dwFrameAspectRatio` from `(X, Y)`.
+    pub fn with_aspect(mut self, x: u32, y: u32) -> Self {
+        self.frame_aspect_ratio = ((x & 0xFFFF) << 16) | (y & 0xFFFF);
+        self
+    }
 }
 
 impl AviMuxOptions {
@@ -113,6 +223,36 @@ impl AviMuxOptions {
     /// per cluster (`n` must be ≥ 2 to take effect).
     pub fn with_rec_cluster_packets(mut self, n: u32) -> Self {
         self.rec_cluster_packets = if n >= 2 { Some(n) } else { None };
+        self
+    }
+
+    /// Builder helper: enable byte-budget `LIST rec ` clustering
+    /// (round-4 P4) — close the cluster as soon as the body exceeds
+    /// `n` bytes. May be combined with
+    /// [`Self::with_rec_cluster_packets`]. `n < 256` is treated as
+    /// no clustering.
+    pub fn with_rec_cluster_bytes(mut self, n: u32) -> Self {
+        self.rec_cluster_bytes = if n >= 256 { Some(n) } else { None };
+        self
+    }
+
+    /// Builder helper: register a `vprp` override for `stream_index`
+    /// (round-4 P2). Replaces any prior override for the same index.
+    pub fn with_vprp(mut self, stream_index: u32, config: VprpConfig) -> Self {
+        self.vprp_overrides.retain(|(i, _)| *i != stream_index);
+        self.vprp_overrides.push((stream_index, config));
+        self
+    }
+
+    /// Builder helper: mark `stream_index` as a 2-field interlaced
+    /// stream (round-4 P1). Encoders must call
+    /// [`AviMuxer::set_field2_offset`] before each `write_packet`
+    /// for the stream so `dwOffsetField2` lands on the std-index
+    /// entry.
+    pub fn with_field2_stream(mut self, stream_index: u32) -> Self {
+        if !self.field2_streams.contains(&stream_index) {
+            self.field2_streams.push(stream_index);
+        }
         self
     }
 }
@@ -156,13 +296,17 @@ struct TrackState {
 #[derive(Clone, Copy, Debug)]
 struct IxStdEntry {
     /// Byte offset of the chunk **data** (just past its 8-byte header)
-    /// from the segment's `qwBaseOffset` (which is the first chunk
-    /// header inside the movi LIST — what we expose in
-    /// `movi_start_off`).
+    /// from the segment's `qwBaseOffset`.
     dw_offset: u32,
     /// Payload size + keyframe-bit clear ⇒ keyframe; high bit set ⇒
     /// non-keyframe (delta).
     dw_size_with_flag: u32,
+    /// `dwOffsetField2` per OpenDML 2.0 §3.0 "AVI Field Index Chunk"
+    /// — `qwBaseOffset`-relative byte offset of the second field's
+    /// first byte. Zero for default progressive entries; only used
+    /// when the parent index has `bIndexSubType == AVI_INDEX_2FIELD`
+    /// (round-4 P1).
+    dw_offset_field2: u32,
 }
 
 /// Open an AVI muxer with the legacy single-`RIFF AVI ` envelope.
@@ -193,14 +337,30 @@ pub fn open_with_kind(
 
 /// Open an AVI muxer with full control over envelope variant and
 /// per-feature options. See [`open`] for the wire-tag resolution
-/// rules and [`AviMuxOptions`] for available toggles (currently
-/// `rec_cluster_packets` for OpenDML §"Stream Data" cluster grouping).
+/// rules and [`AviMuxOptions`] for available toggles. Returns a
+/// trait object — callers that need the concrete type to access
+/// AVI-specific hooks (e.g. [`AviMuxer::set_field2_offset`]) should
+/// use [`open_avi`] instead.
 pub fn open_with_options(
     output: Box<dyn WriteSeek>,
     streams: &[StreamInfo],
     kind: AviKind,
     options: AviMuxOptions,
 ) -> Result<Box<dyn Muxer>> {
+    let m = open_avi(output, streams, kind, options)?;
+    Ok(Box::new(m))
+}
+
+/// Open an AVI muxer and return the concrete [`AviMuxer`] so callers
+/// can access AVI-specific hooks like [`AviMuxer::set_field2_offset`]
+/// (round-4 P1/P3) before invoking the standard
+/// [`oxideav_core::Muxer`] methods.
+pub fn open_avi(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    kind: AviKind,
+    options: AviMuxOptions,
+) -> Result<AviMuxer> {
     if streams.is_empty() {
         return Err(Error::invalid("avi muxer: need at least one stream"));
     }
@@ -225,7 +385,7 @@ pub fn open_with_options(
             ix_entries: Vec::new(),
         });
     }
-    Ok(Box::new(AviMuxer {
+    Ok(AviMuxer {
         output,
         tracks,
         kind,
@@ -237,14 +397,17 @@ pub fn open_with_options(
         indx_entries_count_off: None,
         indx_entries_start_off: None,
         indx_entries_capacity: 0,
+        indx_for_2field: false,
         dmlh_total_frames_off: None,
         segments: Vec::new(),
         current_segment_packets: 0,
         rec_open_size_off: None,
         rec_packets_in_cluster: 0,
+        rec_bytes_in_cluster: 0,
+        pending_field2_offset: None,
         header_written: false,
         trailer_written: false,
-    }))
+    })
 }
 
 fn packet_fourcc_for(index: u32, suffix: [u8; 2]) -> [u8; 4] {
@@ -272,7 +435,12 @@ struct SegmentRecord {
     packet_count: u32,
 }
 
-struct AviMuxer {
+/// Concrete AVI muxer. Returned by [`open_avi`] for callers that
+/// need direct access to AVI-specific hooks like
+/// [`AviMuxer::set_field2_offset`] (round-4 P1/P3). Implements
+/// [`oxideav_core::Muxer`] for the usual write-header /
+/// write-packet / write-trailer flow.
+pub struct AviMuxer {
     output: Box<dyn WriteSeek>,
     tracks: Vec<TrackState>,
     kind: AviKind,
@@ -301,6 +469,10 @@ struct AviMuxer {
     /// generous fixed capacity; back-patching only writes
     /// `min(actual_segments, capacity)` slots.
     indx_entries_capacity: usize,
+    /// True iff the `indx` super-index was stamped with
+    /// `bIndexSubType = AVI_INDEX_2FIELD` per OpenDML 2.0 §3.0
+    /// "Super Index Chunk" (round-4 P1).
+    indx_for_2field: bool,
     /// File offset of the `dwTotalFrames` DWORD inside the
     /// `LIST odml dmlh` chunk. Back-patched in `write_trailer` once
     /// every packet has been written. `None` for `AviKind::Avi10`.
@@ -319,9 +491,16 @@ struct AviMuxer {
     rec_open_size_off: Option<u64>,
     /// Number of packets written into the currently-open `LIST rec `
     /// cluster. Reset to zero each time a new cluster is opened or
-    /// the previous one is closed. Unused when
-    /// `options.rec_cluster_packets` is `None`.
+    /// the previous one is closed. Unused when no clustering is set.
     rec_packets_in_cluster: u32,
+    /// Bytes (chunk header + body + pad) written into the currently
+    /// open `LIST rec ` cluster body, used to enforce
+    /// [`AviMuxOptions::rec_cluster_bytes`] (round-4 P4).
+    rec_bytes_in_cluster: u64,
+    /// Pending `dwOffsetField2` for the next `write_packet` call
+    /// (round-4 P1/P3). Set via [`AviMuxer::set_field2_offset`]
+    /// and consumed by the next `write_packet`.
+    pending_field2_offset: Option<u32>,
     header_written: bool,
     trailer_written: bool,
 }
@@ -355,11 +534,30 @@ impl Muxer for AviMuxer {
         // (typically video). For Avi10, no super-index.
         let want_indx = matches!(self.kind, AviKind::OpenDml(_));
         let want_vprp = want_indx; // emit `vprp` for video streams in OpenDML mode
+                                   // Round-4 P1: when stream 0 is registered as 2-field, the
+                                   // super-index for stream 0 must carry
+                                   // `bIndexSubType = AVI_INDEX_2FIELD` per OpenDML 2.0 §3.0.
+        let indx_is_2field = want_indx && self.options.field2_streams.contains(&0);
+        self.indx_for_2field = indx_is_2field;
         for (i, t) in self.tracks.iter().enumerate() {
             let with_indx = want_indx && i == 0;
             let with_vprp = want_vprp && &t.entry.strh_type == b"vids";
-            let (indx_count_off, indx_entries_off) =
-                write_strl(self.output.as_mut(), i as u32, t, with_indx, with_vprp)?;
+            let vprp_override = self
+                .options
+                .vprp_overrides
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, c)| *c);
+            let indx_2field_here = indx_is_2field && with_indx;
+            let (indx_count_off, indx_entries_off) = write_strl(
+                self.output.as_mut(),
+                i as u32,
+                t,
+                with_indx,
+                with_vprp,
+                vprp_override,
+                indx_2field_here,
+            )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
                 self.indx_entries_start_off = indx_entries_off;
@@ -435,12 +633,33 @@ impl Muxer for AviMuxer {
 
         // Optional `LIST rec ` clustering (OpenDML 2.0 spec/06 §"Stream
         // Data ('movi' List)"). Open a new cluster when we don't have
-        // one and close+reopen when the current one has reached its
-        // packet count cap.
-        if let Some(cluster_cap) = self.options.rec_cluster_packets {
+        // one; close+reopen when the current one has reached either
+        // its packet-count cap or — when set — its byte budget. The
+        // caps are independent: whichever fires first closes the
+        // cluster (round-4 P4).
+        let want_clustering =
+            self.options.rec_cluster_packets.is_some() || self.options.rec_cluster_bytes.is_some();
+        if want_clustering {
+            // Bytes this packet would add: chunk header (8) + payload
+            // + even-pad (the pad lives inside the LIST rec body too).
+            let projected_packet_bytes =
+                8u64 + packet.data.len() as u64 + (packet.data.len() & 1) as u64;
+            let needs_close_for_packets = self
+                .options
+                .rec_cluster_packets
+                .map(|n| self.rec_packets_in_cluster >= n)
+                .unwrap_or(false);
+            let needs_close_for_bytes = self
+                .options
+                .rec_cluster_bytes
+                .map(|n| {
+                    self.rec_packets_in_cluster > 0
+                        && self.rec_bytes_in_cluster + projected_packet_bytes > n as u64
+                })
+                .unwrap_or(false);
             if self.rec_open_size_off.is_none() {
                 self.open_rec_cluster()?;
-            } else if self.rec_packets_in_cluster >= cluster_cap {
+            } else if needs_close_for_packets || needs_close_for_bytes {
                 self.close_rec_cluster()?;
                 self.open_rec_cluster()?;
             }
@@ -456,6 +675,12 @@ impl Muxer for AviMuxer {
         } else {
             0
         };
+
+        // Round-4 P1/P3: consume any pending field-2 offset signalled
+        // by `set_field2_offset`. Always consume so a stray hook on a
+        // non-2-field stream can't leak onto the next packet.
+        let pending_field2 = self.pending_field2_offset.take();
+        let stream_is_2field = self.options.field2_streams.contains(&(idx as u32));
 
         // Stamp an `AVISTDINDEX_ENTRY`-shaped record for this packet
         // before the chunk is actually written: `dw_offset` is from the
@@ -476,9 +701,28 @@ impl Muxer for AviMuxer {
                     } else {
                         size | 0x8000_0000
                     };
+                    // dwOffsetField2 is qwBaseOffset-relative (per
+                    // OpenDML 2.0 §3.0); the caller's value is
+                    // payload-relative. Convert by adding `d`.
+                    let dw_offset_field2 = if stream_is_2field {
+                        match pending_field2 {
+                            Some(payload_off) => {
+                                let abs = d + payload_off as u64;
+                                if abs <= u32::MAX as u64 {
+                                    abs as u32
+                                } else {
+                                    0
+                                }
+                            }
+                            None => 0,
+                        }
+                    } else {
+                        0
+                    };
                     self.tracks[idx].ix_entries.push(IxStdEntry {
                         dw_offset: d as u32,
                         dw_size_with_flag,
+                        dw_offset_field2,
                     });
                 }
             }
@@ -497,8 +741,12 @@ impl Muxer for AviMuxer {
         t.sample_count += sample_count_of_packet(&t.stream, &t.entry, size);
 
         self.current_segment_packets += 1;
-        if self.options.rec_cluster_packets.is_some() {
+        if self.options.rec_cluster_packets.is_some() || self.options.rec_cluster_bytes.is_some() {
             self.rec_packets_in_cluster += 1;
+            // Track on-disk bytes added to the cluster body: 8-byte
+            // chunk header + payload + even-pad.
+            self.rec_bytes_in_cluster +=
+                8u64 + packet.data.len() as u64 + (packet.data.len() & 1) as u64;
         }
 
         // idx1 entry — only meaningful for the primary segment in
@@ -777,16 +1025,23 @@ impl AviMuxer {
             if entries.is_empty() {
                 continue;
             }
+            let stream_is_2field = self.options.field2_streams.contains(&(track_idx as u32));
             // FourCC is "ix" + the two-ASCII-decimal-digit stream index
             // — per OpenDML 2.0 §"Index Locations": "the corresponding
             // index chunks are marked with 'ix##' in the 'movi' data."
             let stream_digits = packet_fourcc_for(track_idx as u32, *b"xx");
             let ix_id = [b'i', b'x', stream_digits[0], stream_digits[1]];
-            let mut payload = Vec::with_capacity(32 + entries.len() * 8);
-            // wLongsPerEntry = 2 (8 B per entry).
-            payload.extend_from_slice(&2u16.to_le_bytes());
-            // bIndexSubType = 0 (default, not 2-field).
-            payload.push(0);
+            // wLongsPerEntry: 2 = default 8-B entries; 3 = AVI Field
+            // Index Chunk (round-4 P1) with 12-B entries that carry
+            // dwOffsetField2 per OpenDML 2.0 §3.0.
+            let (w_longs, sub_type, entry_size) = if stream_is_2field {
+                (3u16, 0x01u8, 12usize)
+            } else {
+                (2u16, 0u8, 8usize)
+            };
+            let mut payload = Vec::with_capacity(32 + entries.len() * entry_size);
+            payload.extend_from_slice(&w_longs.to_le_bytes());
+            payload.push(sub_type);
             // bIndexType = AVI_INDEX_OF_CHUNKS (0x01).
             payload.push(0x01);
             // nEntriesInUse.
@@ -801,6 +1056,9 @@ impl AviMuxer {
             for e in entries.iter() {
                 payload.extend_from_slice(&e.dw_offset.to_le_bytes());
                 payload.extend_from_slice(&e.dw_size_with_flag.to_le_bytes());
+                if stream_is_2field {
+                    payload.extend_from_slice(&e.dw_offset_field2.to_le_bytes());
+                }
             }
             write_chunk(self.output.as_mut(), &ix_id, &payload)?;
         }
@@ -820,6 +1078,7 @@ impl AviMuxer {
         self.current_segment_packets = 0;
         self.rec_open_size_off = None;
         self.rec_packets_in_cluster = 0;
+        self.rec_bytes_in_cluster = 0;
         Ok(())
     }
 
@@ -831,6 +1090,7 @@ impl AviMuxer {
         let off = begin_list(self.output.as_mut(), &LIST, b"rec ")?;
         self.rec_open_size_off = Some(off);
         self.rec_packets_in_cluster = 0;
+        self.rec_bytes_in_cluster = 0;
         Ok(())
     }
 
@@ -840,8 +1100,24 @@ impl AviMuxer {
         if let Some(off) = self.rec_open_size_off.take() {
             finish_chunk(self.output.as_mut(), off)?;
             self.rec_packets_in_cluster = 0;
+            self.rec_bytes_in_cluster = 0;
         }
         Ok(())
+    }
+
+    /// Stamp `payload_offset` onto the next [`oxideav_core::Muxer::write_packet`]
+    /// call so the corresponding `ix##` `AVISTDINDEX_ENTRY.dwOffsetField2`
+    /// (per OpenDML 2.0 §3.0 "AVI Field Index Chunk") points at the
+    /// second field's first byte. `payload_offset` is measured from
+    /// the first byte of the packet's payload.
+    ///
+    /// Round-4 P1/P3 hook. One-shot — consumed by the next
+    /// `write_packet` (regardless of stream) and then cleared. For
+    /// streams not in [`AviMuxOptions::field2_streams`] the value is
+    /// dropped at `write_packet` time and the std-index entry stays
+    /// 8 bytes wide.
+    pub fn set_field2_offset(&mut self, payload_offset: u32) {
+        self.pending_field2_offset = Some(payload_offset);
     }
 
     /// Back-patch the OpenDML `indx` super-index entries with each
@@ -923,12 +1199,15 @@ fn build_avih(tracks: &[TrackState]) -> Vec<u8> {
 /// STANDARD_UNKNOWN, single-field, 4:3 aspect" hint for callers that
 /// don't carry signal-shape metadata; the chunk lets a downstream
 /// tool detect the file as OpenDML 2.0-aware regardless.
+#[allow(clippy::too_many_arguments)]
 fn write_strl<W: Write + Seek + ?Sized>(
     w: &mut W,
     _index: u32,
     t: &TrackState,
     with_indx: bool,
     with_vprp: bool,
+    vprp_override: Option<VprpConfig>,
+    indx_2field: bool,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -986,7 +1265,13 @@ fn write_strl<W: Write + Seek + ?Sized>(
         // Pre-fill with zeros and overwrite the preamble bytes.
         let mut buf = vec![0u8; payload_len];
         buf[0..2].copy_from_slice(&4u16.to_le_bytes());
-        // bIndexSubType, bIndexType already zero.
+        // bIndexSubType: 0 (default) or AVI_INDEX_2FIELD per the
+        // OpenDML 2.0 §3.0 "Super Index Chunk" rule that the super
+        // index inherits the subtype of its child indexes (round-4 P1).
+        if indx_2field {
+            buf[2] = 0x01; // AVI_INDEX_SUB_2FIELD
+        }
+        // bIndexType already zero (AVI_INDEX_OF_INDEXES).
         // nEntriesInUse: zero, will be back-patched.
         buf[8..12].copy_from_slice(&chunk_id);
         // dwReserved[3] already zero.
@@ -1007,7 +1292,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     // muxer doesn't currently emit interlaced indexes, so single
     // field is correct.
     if with_vprp {
-        let body = build_vprp_body(t);
+        let body = build_vprp_body(t, vprp_override);
         write_chunk(w, b"vprp", &body)?;
     }
 
@@ -1018,31 +1303,51 @@ fn write_strl<W: Write + Seek + ?Sized>(
 /// Build a `vprp` body for a video track. 9 fixed DWORDs followed by
 /// a single `VIDEO_FIELD_DESC` (8 DWORDs) describing the lone
 /// progressive field. Total length = 9*4 + 1*32 = 68 bytes.
-fn build_vprp_body(t: &TrackState) -> Vec<u8> {
+///
+/// `override_cfg`, when supplied, replaces the per-field defaults
+/// with caller-chosen values per OpenDML 2.0 §5.0 (round-4 P2). A
+/// zero override field falls back to the default so callers can
+/// override only what they care about.
+fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> {
     let width = t.stream.params.width.unwrap_or(0);
     let height = t.stream.params.height.unwrap_or(0);
     // Vertical refresh rate in Hz: rate / scale (samples per second).
     // For video this is conventionally fps (e.g. 25, 30000/1001).
-    // Round to nearest integer; a downstream tool that needs the
-    // exact ratio can still read strh's scale/rate.
-    let refresh_rate = if t.entry.scale > 0 {
+    let stream_refresh_rate = if t.entry.scale > 0 {
         ((t.entry.rate as u64 + (t.entry.scale as u64 / 2)) / t.entry.scale as u64) as u32
     } else {
         0
     };
-    // 4:3 aspect ratio default, packed as (X << 16) | Y.
-    let frame_aspect_ratio: u32 = (4u32 << 16) | 3u32;
+    let cfg = override_cfg.unwrap_or_default();
+    let video_format_token = cfg.video_format_token; // 0 stays FORMAT_UNKNOWN
+    let video_standard = cfg.video_standard; // 0 stays STANDARD_UNKNOWN
+    let refresh_rate = if cfg.vertical_refresh_rate > 0 {
+        cfg.vertical_refresh_rate
+    } else {
+        stream_refresh_rate
+    };
+    let frame_aspect_ratio = if cfg.frame_aspect_ratio > 0 {
+        cfg.frame_aspect_ratio
+    } else {
+        (4u32 << 16) | 3u32
+    };
+    let nb_field_per_frame = if cfg.nb_field_per_frame > 0 {
+        cfg.nb_field_per_frame
+    } else {
+        1
+    };
     let mut body = Vec::with_capacity(68);
-    body.extend_from_slice(&0u32.to_le_bytes()); // VideoFormatToken = FORMAT_UNKNOWN
-    body.extend_from_slice(&0u32.to_le_bytes()); // VideoStandard = STANDARD_UNKNOWN
+    body.extend_from_slice(&video_format_token.to_le_bytes());
+    body.extend_from_slice(&video_standard.to_le_bytes());
     body.extend_from_slice(&refresh_rate.to_le_bytes()); // dwVerticalRefreshRate
     body.extend_from_slice(&width.to_le_bytes()); // dwHTotalInT (unknown — fall back to width)
     body.extend_from_slice(&height.to_le_bytes()); // dwVTotalInLines
     body.extend_from_slice(&frame_aspect_ratio.to_le_bytes()); // dwFrameAspectRatio
     body.extend_from_slice(&width.to_le_bytes()); // dwFrameWidthInPixels
     body.extend_from_slice(&height.to_le_bytes()); // dwFrameHeightInLines
-    body.extend_from_slice(&1u32.to_le_bytes()); // nbFieldPerFrame = 1 (progressive)
-                                                 // VIDEO_FIELD_DESC[0]: full-frame valid bitmap.
+    body.extend_from_slice(&nb_field_per_frame.to_le_bytes());
+    // VIDEO_FIELD_DESC[0]: full-frame valid bitmap. (We always emit
+    // a single descriptor; downstream tolerates short tails.)
     body.extend_from_slice(&height.to_le_bytes()); // CompressedBMHeight
     body.extend_from_slice(&width.to_le_bytes()); // CompressedBMWidth
     body.extend_from_slice(&height.to_le_bytes()); // ValidBMHeight

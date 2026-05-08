@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **2-field interlaced encoder (round 4 P1).** New
+  `AviMuxOptions::with_field2_stream(idx)` plus the concrete-type
+  entry point `open_avi(...) -> AviMuxer` so callers can invoke
+  `AviMuxer::set_field2_offset(payload_off)` immediately before
+  `write_packet`. The muxer then stamps `bIndexSubType =
+  AVI_INDEX_2FIELD` on the `indx` super-index AND emits each
+  `ix##` standard-index with `wLongsPerEntry = 3` and 12-byte
+  entries `(dwOffset, dwSize, dwOffsetField2)` per OpenDML 2.0 §3.0
+  "AVI Field Index Chunk" / "Super Index Chunk". Default-off; no
+  output change for non-2-field callers.
+- **`vprp` per-stream populator API (round 4 P2).** New
+  `VprpConfig` struct + `AviMuxOptions::with_vprp(stream_idx,
+  config)` builder. Presets `VprpConfig::ntsc()` / `pal()` /
+  `secam()` fill in the well-known §5.0 token + 60/50 Hz refresh
+  + interlaced framing + 4:3 aspect. Builders
+  `with_aspect(x, y)` / `with_frame_aspect_ratio(packed)` /
+  `with_nb_field_per_frame(n)` for individual overrides. Public
+  constants `VIDEO_FORMAT_*` and `VIDEO_STANDARD_*` mirror the
+  §5.0 enums. Zero override fields fall back to the round-3
+  defaults so a partial override (e.g. just the standard token)
+  doesn't lose the muxer's stream-derived refresh rate.
+- **`dwOffsetField2` surfaced via `Demuxer::metadata()` (round 4
+  P3).** The demuxer emits `avi:ix.<index>.is_2field = "true"` and
+  `avi:ix.<index>.field2_offsets = "<comma-separated u32 list>"`
+  for every stream whose `ix##` carries
+  `bIndexSubType == AVI_INDEX_2FIELD`. Offsets are
+  `qwBaseOffset`-relative — same byte-offset space as the
+  std-index entries themselves. The `ix##` scan now also fires
+  when the super-index alone declares `AVI_INDEX_2FIELD`, fixing
+  a pre-existing single-segment-OpenDML scan-skip caused by the
+  spec's "qwOffset = 0 is unused" convention dropping the
+  primary-segment slot.
+- **`LIST rec ` cluster threshold by byte budget (round 4 P4).**
+  New `AviMuxOptions::with_rec_cluster_bytes(n)` (`n < 256`
+  treated as no clustering). Cluster closes as soon as the next
+  packet would push its body past `n` bytes. May be combined with
+  `with_rec_cluster_packets(k)` — whichever cap fires first
+  closes the cluster. Useful for VBR streams where a fixed
+  packet count produces wildly varying cluster sizes.
 - **OpenDML 2.0 `LIST odml dmlh` extended header (round 3 P1).** The
   muxer emits a `LIST odml` containing a `dmlh` chunk inside `hdrl`
   whenever `AviKind::OpenDml` is selected; its single `dwTotalFrames`

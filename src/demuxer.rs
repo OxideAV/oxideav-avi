@@ -327,12 +327,59 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // digits at the start of its FourCC. We perform this regardless of
     // whether a `super_index` was declared in `strl`, because some
     // writers emit `ix##` directly without a corresponding `indx` slot.
-    let std_indexes =
-        if super_indexes.iter().any(|s| !s.entries.is_empty()) || movi_segments.len() > 1 {
-            scan_ix_in_movi(&mut *input, &movi_segments).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    // Trigger ix## scan when ANY of:
+    //   - a super-index with at least one resolved entry was parsed,
+    //   - more than one movi segment exists (OpenDML multi-RIFF),
+    //   - any super-index declares `bIndexSubType = AVI_INDEX_2FIELD`
+    //     (round-4 P3) — even a single-segment file may carry
+    //     2-field std-indexes that we need to surface for downstream
+    //     consumers, and the primary segment's qwOffset = 0 makes
+    //     parse_indx drop the entry slot per spec/06's "0 is unused"
+    //     convention.
+    let want_ix_scan = super_indexes.iter().any(|s| !s.entries.is_empty())
+        || movi_segments.len() > 1
+        || super_indexes
+            .iter()
+            .any(|s| s.b_index_sub_type == AVI_INDEX_SUB_2FIELD);
+    let std_indexes = if want_ix_scan {
+        scan_ix_in_movi(&mut *input, &movi_segments).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Round-4 P3: surface per-stream 2-field signalling so downstream
+    // consumers can detect interlaced AVIs from `Demuxer::metadata`.
+    // For every stream whose ix## carries
+    // `bIndexSubType == AVI_INDEX_2FIELD` we emit
+    // `avi:ix.<index>.is_2field = true` and the comma-separated list
+    // of `dwOffsetField2` values (qwBaseOffset-relative).
+    {
+        use std::collections::BTreeMap;
+        let mut per_stream_offsets: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut per_stream_2field: BTreeMap<u32, bool> = BTreeMap::new();
+        for ix in &std_indexes {
+            if let Some(stream) = parse_stream_index(&ix.chunk_id) {
+                if ix.b_index_sub_type == AVI_INDEX_SUB_2FIELD {
+                    per_stream_2field.insert(stream, true);
+                    let v = per_stream_offsets.entry(stream).or_default();
+                    for e in &ix.entries {
+                        v.push(e.dw_offset_field2);
+                    }
+                }
+            }
+        }
+        for (stream, _) in per_stream_2field.iter() {
+            metadata.push((format!("avi:ix.{stream}.is_2field"), "true".into()));
+            if let Some(offsets) = per_stream_offsets.get(stream) {
+                let joined = offsets
+                    .iter()
+                    .map(|o| o.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                metadata.push((format!("avi:ix.{stream}.field2_offsets"), joined));
+            }
+        }
+    }
 
     // Pad super_indexes to streams.len() so per-stream lookup is always
     // safe even if some strl LISTs didn't declare an indx.
