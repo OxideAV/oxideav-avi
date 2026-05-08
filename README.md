@@ -26,10 +26,13 @@ oxideav-avi = "0.0"
 | Duration from `avih` (microseconds-per-frame)    | yes   | n/a  |
 | `idx1` legacy index — parse for keyframe seek    | yes   | yes  |
 | `idx1` offsets — file-absolute + movi-relative   | yes   | yes  |
-| `LIST rec ` packet grouping inside `movi`        | yes   | no   |
+| `LIST rec ` packet grouping inside `movi`        | yes   | yes (packet-cap or byte-budget) |
 | OpenDML 2.0 multi-`RIFF AVIX` continuation       | yes   | yes  |
 | OpenDML 2.0 `indx` super-index in `strl`         | yes (parse) | yes (emit) |
 | OpenDML 2.0 `ix##` per-segment std-index in `movi` | yes (parse) | yes (emit) |
+| OpenDML 2.0 `LIST odml dmlh` extended header     | yes (parse) | yes (emit) |
+| OpenDML 2.0 `vprp` Video Properties Header       | yes (parse) | yes (NTSC/PAL/SECAM presets + custom aspect) |
+| OpenDML 2.0 `AVI_INDEX_2FIELD` interlaced std-index | yes (parse + metadata surface) | yes (`open_avi` + `set_field2_offset`) |
 | OpenDML-driven seeking (`ix##` std-index)        | yes (no-idx1 fallback) | n/a |
 | Uncompressed `db` video chunks                   | yes   | yes  |
 | Variable stream interleave                       | yes   | yes  |
