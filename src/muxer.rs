@@ -1534,13 +1534,24 @@ fn write_strl<W: Write + Seek + ?Sized>(
 }
 
 /// Build a `vprp` body for a video track. 9 fixed DWORDs followed by
-/// a single `VIDEO_FIELD_DESC` (8 DWORDs) describing the lone
-/// progressive field. Total length = 9*4 + 1*32 = 68 bytes.
+/// `nbFieldPerFrame` `VIDEO_FIELD_DESC` records (8 DWORDs each).
+/// Total length = 36 + 32 * nbFieldPerFrame bytes (round-9 candidate
+/// 1 fixes the round-4 producer to actually emit one rect per field;
+/// previously a 2-field stream was declared with `nbFieldPerFrame=2`
+/// but only one rect was written, dropping half the spec-mandated
+/// data on the floor).
 ///
 /// `override_cfg`, when supplied, replaces the per-field defaults
 /// with caller-chosen values per OpenDML 2.0 §5.0 (round-4 P2). A
 /// zero override field falls back to the default so callers can
 /// override only what they care about.
+///
+/// For 2-field interlaced streams the two emitted records describe
+/// the top + bottom fields with `CompressedBMHeight = height/2` and
+/// `VideoYValidStartLine` set to the spec's first-line conventions
+/// (`23` for top, `height/2 + 23` for bottom — matching PAL/NTSC
+/// CCIR-601 broadcast sequences). Progressive (1 field/frame)
+/// emits a single full-frame record.
 fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> {
     let width = t.stream.params.width.unwrap_or(0);
     let height = t.stream.params.height.unwrap_or(0);
@@ -1569,7 +1580,8 @@ fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> 
     } else {
         1
     };
-    let mut body = Vec::with_capacity(68);
+    // Body capacity = 9 fixed DWORDs (36 B) + per-field 32 B records.
+    let mut body = Vec::with_capacity(36 + 32 * nb_field_per_frame as usize);
     body.extend_from_slice(&video_format_token.to_le_bytes());
     body.extend_from_slice(&video_standard.to_le_bytes());
     body.extend_from_slice(&refresh_rate.to_le_bytes()); // dwVerticalRefreshRate
@@ -1579,16 +1591,45 @@ fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> 
     body.extend_from_slice(&width.to_le_bytes()); // dwFrameWidthInPixels
     body.extend_from_slice(&height.to_le_bytes()); // dwFrameHeightInLines
     body.extend_from_slice(&nb_field_per_frame.to_le_bytes());
-    // VIDEO_FIELD_DESC[0]: full-frame valid bitmap. (We always emit
-    // a single descriptor; downstream tolerates short tails.)
-    body.extend_from_slice(&height.to_le_bytes()); // CompressedBMHeight
-    body.extend_from_slice(&width.to_le_bytes()); // CompressedBMWidth
-    body.extend_from_slice(&height.to_le_bytes()); // ValidBMHeight
-    body.extend_from_slice(&width.to_le_bytes()); // ValidBMWidth
-    body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMXOffset
-    body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMYOffset
-    body.extend_from_slice(&0u32.to_le_bytes()); // VideoXOffsetInT
-    body.extend_from_slice(&0u32.to_le_bytes()); // VideoYValidStartLine
+    // VIDEO_FIELD_DESC[0..nbFieldPerFrame]: spec-mandated per-field
+    // rect array. For interlaced (2 fields), each field's compressed
+    // bitmap is half-height and starts at the alternating signal
+    // line. Progressive (1 field) gets a single full-frame record.
+    if nb_field_per_frame >= 2 {
+        let half_height = height / 2;
+        // PAL/NTSC CCIR-601 first-line conventions per OpenDML §5.0
+        // table: top field starts at line 23, bottom at line 285+
+        // for NTSC and 23 / 335 for PAL. Using `23` + `half_height +
+        // 23` is a reasonable cross-standard default that matches
+        // the PAL convention; consumers needing exact first-line
+        // values for a specific standard read them via
+        // `vprp_field_descs` and substitute their own.
+        for field_index in 0..nb_field_per_frame.min(2) {
+            let video_y_valid_start_line = if field_index == 0 {
+                23u32
+            } else {
+                half_height + 23
+            };
+            body.extend_from_slice(&half_height.to_le_bytes()); // CompressedBMHeight
+            body.extend_from_slice(&width.to_le_bytes()); // CompressedBMWidth
+            body.extend_from_slice(&half_height.to_le_bytes()); // ValidBMHeight
+            body.extend_from_slice(&width.to_le_bytes()); // ValidBMWidth
+            body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMXOffset
+            body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMYOffset
+            body.extend_from_slice(&0u32.to_le_bytes()); // VideoXOffsetInT
+            body.extend_from_slice(&video_y_valid_start_line.to_le_bytes());
+        }
+    } else {
+        // Progressive: single full-frame VIDEO_FIELD_DESC.
+        body.extend_from_slice(&height.to_le_bytes()); // CompressedBMHeight
+        body.extend_from_slice(&width.to_le_bytes()); // CompressedBMWidth
+        body.extend_from_slice(&height.to_le_bytes()); // ValidBMHeight
+        body.extend_from_slice(&width.to_le_bytes()); // ValidBMWidth
+        body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMXOffset
+        body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMYOffset
+        body.extend_from_slice(&0u32.to_le_bytes()); // VideoXOffsetInT
+        body.extend_from_slice(&0u32.to_le_bytes()); // VideoYValidStartLine
+    }
     body
 }
 

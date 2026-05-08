@@ -339,6 +339,77 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
             format!("{prefix}.nb_field_per_frame"),
             vp.nb_field_per_frame.to_string(),
         ));
+        // Round-9 candidate 1: per-field VIDEO_FIELD_DESC rects. The
+        // 8 DWORDs per record describe (compressed_bm_*, valid_bm_*
+        // dims + offset, video_x_offset_in_t, video_y_valid_start_line).
+        // Surface each non-default field as
+        // `avi:vprp.<i>.field<j>.<key>` so downstream consumers wanting
+        // per-field rendering (interlaced PAL/NTSC) can read the
+        // active rectangle without re-parsing the chunk. Skip
+        // all-zero records (default-init / muxer-emitted placeholder
+        // for streams that didn't supply a real rect).
+        for (j, fd) in vp.field_descs.iter().enumerate() {
+            let all_zero = fd.compressed_bm_height == 0
+                && fd.compressed_bm_width == 0
+                && fd.valid_bm_height == 0
+                && fd.valid_bm_width == 0
+                && fd.valid_bm_x_offset == 0
+                && fd.valid_bm_y_offset == 0
+                && fd.video_x_offset_in_t == 0
+                && fd.video_y_valid_start_line == 0;
+            if all_zero {
+                continue;
+            }
+            let fp = format!("{prefix}.field{j}");
+            if fd.compressed_bm_height > 0 {
+                metadata.push((
+                    format!("{fp}.compressed_bm_height"),
+                    fd.compressed_bm_height.to_string(),
+                ));
+            }
+            if fd.compressed_bm_width > 0 {
+                metadata.push((
+                    format!("{fp}.compressed_bm_width"),
+                    fd.compressed_bm_width.to_string(),
+                ));
+            }
+            if fd.valid_bm_height > 0 {
+                metadata.push((
+                    format!("{fp}.valid_bm_height"),
+                    fd.valid_bm_height.to_string(),
+                ));
+            }
+            if fd.valid_bm_width > 0 {
+                metadata.push((
+                    format!("{fp}.valid_bm_width"),
+                    fd.valid_bm_width.to_string(),
+                ));
+            }
+            if fd.valid_bm_x_offset > 0 {
+                metadata.push((
+                    format!("{fp}.valid_bm_x_offset"),
+                    fd.valid_bm_x_offset.to_string(),
+                ));
+            }
+            if fd.valid_bm_y_offset > 0 {
+                metadata.push((
+                    format!("{fp}.valid_bm_y_offset"),
+                    fd.valid_bm_y_offset.to_string(),
+                ));
+            }
+            if fd.video_x_offset_in_t > 0 {
+                metadata.push((
+                    format!("{fp}.video_x_offset_in_t"),
+                    fd.video_x_offset_in_t.to_string(),
+                ));
+            }
+            if fd.video_y_valid_start_line > 0 {
+                metadata.push((
+                    format!("{fp}.video_y_valid_start_line"),
+                    fd.video_y_valid_start_line.to_string(),
+                ));
+            }
+        }
     }
 
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
@@ -540,6 +611,8 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
         std_indexes,
         idx1_flags_per_stream,
         palette_change_counts,
+        vprps,
+        dmlh_total_frames,
     })
 }
 
@@ -1012,8 +1085,9 @@ fn parse_strl<R: ReadSeek + ?Sized>(
 ///
 /// Returns `None` when the chunk is shorter than 36 B (the fixed
 /// preamble); returns the parsed header even when the trailing
-/// per-field-rect array is missing or truncated (we don't expose those
-/// fields on the surfaced metadata yet).
+/// per-field-rect array is missing or truncated (round-9 candidate 1
+/// surfaces whatever rect records fit in the body, capped at
+/// `nb_field_per_frame`).
 fn parse_vprp(body: &[u8]) -> Option<VprpHeader> {
     if body.len() < 36 {
         return None;
@@ -1021,6 +1095,30 @@ fn parse_vprp(body: &[u8]) -> Option<VprpHeader> {
     let read_dword = |off: usize| -> u32 {
         u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]])
     };
+    let nb_field_per_frame = read_dword(32);
+    // Cap parse against:
+    //   1. nbFieldPerFrame (the spec's intent),
+    //   2. the bytes actually present after the 36-byte preamble (some
+    //      writers truncate the tail; we surface the prefix that fits),
+    //   3. a sanity ceiling of 8 — production AVIs never declare more
+    //      than 2 fields/frame, so any larger value is almost certainly
+    //      garbage.
+    let max_descs_by_body = (body.len().saturating_sub(36)) / 32;
+    let n = (nb_field_per_frame as usize).min(max_descs_by_body).min(8);
+    let mut field_descs = Vec::with_capacity(n);
+    for i in 0..n {
+        let base = 36 + i * 32;
+        field_descs.push(VprpFieldDesc {
+            compressed_bm_height: read_dword(base),
+            compressed_bm_width: read_dword(base + 4),
+            valid_bm_height: read_dword(base + 8),
+            valid_bm_width: read_dword(base + 12),
+            valid_bm_x_offset: read_dword(base + 16),
+            valid_bm_y_offset: read_dword(base + 20),
+            video_x_offset_in_t: read_dword(base + 24),
+            video_y_valid_start_line: read_dword(base + 28),
+        });
+    }
     Some(VprpHeader {
         video_format_token: read_dword(0),
         video_standard: read_dword(4),
@@ -1030,7 +1128,8 @@ fn parse_vprp(body: &[u8]) -> Option<VprpHeader> {
         frame_aspect_ratio: read_dword(20),
         frame_width_in_pixels: read_dword(24),
         frame_height_in_lines: read_dword(28),
-        nb_field_per_frame: read_dword(32),
+        nb_field_per_frame,
+        field_descs,
     })
 }
 
@@ -1734,15 +1833,51 @@ pub struct AviDemuxer {
     /// downstream consumers can detect that the file carries
     /// palette animation. Empty Vec means no `xxpc` was seen.
     palette_change_counts: Vec<u32>,
+    /// Per-stream parsed `vprp` Video Properties Header (round-9
+    /// candidate 1). Indexed by stream number; default-initialised
+    /// for streams that didn't carry a `vprp` chunk. Retained on the
+    /// demuxer struct so [`AviDemuxer::vprp_field_descs`] can hand
+    /// out `&[VprpFieldDesc]` slices without re-parsing.
+    vprps: Vec<VprpHeader>,
+    /// OpenDML 2.0 §5.0 `dmlh.dwTotalFrames` (round-9 candidate 3).
+    /// `None` when no `LIST odml dmlh` was seen. Surfaced via the
+    /// typed [`AviDemuxer::dmlh_total_frames`] accessor in addition
+    /// to the existing `avi:total_frames_all_segments` metadata key.
+    dmlh_total_frames: Option<u32>,
+}
+
+/// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
+/// candidate 4).
+///
+/// Captures the originally-requested PTS, the keyframe PTS the
+/// demuxer actually landed on (always at-or-before target), and the
+/// gap between them in stream ticks. A `gop_distance` of 0 means the
+/// requested PTS *is* a keyframe; a non-zero distance means the
+/// caller must decode-and-discard `gop_distance` ticks worth of
+/// frames before reaching the wanted PTS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyframeSeekResult {
+    /// The PTS the caller asked for.
+    pub target_pts: i64,
+    /// The PTS of the keyframe the demuxer actually landed on. Always
+    /// at-or-before `target_pts` (or the first keyframe in the file,
+    /// if the request fell before that).
+    pub landed_pts: i64,
+    /// `target_pts - landed_pts`, clamped to `>= 0`. The number of
+    /// stream ticks worth of frames a caller must walk past after the
+    /// seek to reach the originally-requested PTS.
+    pub gop_distance: i64,
 }
 
 /// Decoded `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
 ///
-/// The 9 fixed DWORDs at the start of a `vprp` body. The trailing
-/// `VIDEO_FIELD_DESC FieldInfo[nbFieldPerFrame]` array is not yet
-/// surfaced — only the global signal-shape descriptors are exposed
-/// via `Demuxer::metadata()` under the `avi:vprp.*` namespace.
-#[derive(Clone, Copy, Debug, Default)]
+/// The 9 fixed DWORDs at the start of a `vprp` body, plus the
+/// trailing `VIDEO_FIELD_DESC FieldInfo[nbFieldPerFrame]` array (one
+/// 8-DWORD record per field). Round-9 candidate 1: prior rounds
+/// dropped the per-field-rect tail; both are now exposed via
+/// `Demuxer::metadata()` under the `avi:vprp.*` namespace and via the
+/// typed [`AviDemuxer::vprp_field_descs`] accessor.
+#[derive(Clone, Debug, Default)]
 struct VprpHeader {
     /// `VideoFormatToken` — typically one of `FORMAT_PAL_SQUARE`,
     /// `FORMAT_NTSC_CCIR_601`, etc. `0` means `FORMAT_UNKNOWN` and the
@@ -1767,6 +1902,48 @@ struct VprpHeader {
     frame_height_in_lines: u32,
     /// `nbFieldPerFrame` — 1 (progressive) or 2 (interlaced).
     nb_field_per_frame: u32,
+    /// Trailing `VIDEO_FIELD_DESC` records (round-9 candidate 1). One
+    /// per field; capped at `nb_field_per_frame` and at the chunk's
+    /// remaining body length so a truncated tail produces a short
+    /// vector rather than an error.
+    field_descs: Vec<VprpFieldDesc>,
+}
+
+/// One `VIDEO_FIELD_DESC` record from a `vprp` chunk per OpenDML 2.0
+/// §5.0 (round-9 candidate 1). 8 DWORDs = 32 bytes describing one
+/// field's compressed extent + active rectangle within the frame.
+///
+/// Stamped on the typed [`AviDemuxer::vprp_field_descs`] accessor so
+/// callers wanting per-field rendering (interlaced PAL/NTSC, EDV-style
+/// half-height previews) don't have to re-parse the raw vprp body.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VprpFieldDesc {
+    /// `CompressedBMHeight` — height in lines of the compressed bitmap
+    /// for this field. For progressive (1 field/frame) this equals the
+    /// full frame height; for interlaced (2 fields/frame) it's
+    /// half-frame.
+    pub compressed_bm_height: u32,
+    /// `CompressedBMWidth` — compressed bitmap width in pixels.
+    pub compressed_bm_width: u32,
+    /// `ValidBMHeight` — height in lines of the *valid* (= visible)
+    /// portion of the compressed bitmap. May be less than
+    /// `compressed_bm_height` when the encoder pads.
+    pub valid_bm_height: u32,
+    /// `ValidBMWidth` — valid bitmap width in pixels.
+    pub valid_bm_width: u32,
+    /// `ValidBMXOffset` — x-offset of the valid rectangle's top-left
+    /// corner inside the compressed bitmap.
+    pub valid_bm_x_offset: u32,
+    /// `ValidBMYOffset` — y-offset of the valid rectangle's top-left
+    /// corner inside the compressed bitmap.
+    pub valid_bm_y_offset: u32,
+    /// `VideoXOffsetInT` — x-offset of the bitmap inside the video
+    /// signal's horizontal active region (in `T` units, see
+    /// `dwHTotalInT`).
+    pub video_x_offset_in_t: u32,
+    /// `VideoYValidStartLine` — first line of the field within the
+    /// total `dwVTotalInLines` count.
+    pub video_y_valid_start_line: u32,
 }
 
 /// One `AVISUPERINDEX_ENTRY` parsed from an `indx` chunk.
@@ -2262,6 +2439,88 @@ impl AviDemuxer {
         None
     }
 
+    /// OpenDML 2.0 §5.0 `dmlh.dwTotalFrames` (round-9 candidate 3).
+    ///
+    /// Returns `Some(total)` when the file declares a `LIST odml dmlh`
+    /// extended header — typical for OpenDML 2.0 multi-RIFF files
+    /// where `avih.dwTotalFrames` only carries the primary segment's
+    /// frame count and the cross-segment truth lives here. Returns
+    /// `None` for files without OpenDML extensions.
+    ///
+    /// Widened to `u64` because the dword value is unsigned and a
+    /// signed `i64` is what most callers want for arithmetic against
+    /// pts/duration fields (`u32::MAX` ≈ 47 days @ 30 fps which is
+    /// well past anything the spec contemplates but the wider type is
+    /// future-proof).
+    pub fn dmlh_total_frames(&self) -> Option<u64> {
+        self.dmlh_total_frames.map(|v| v as u64)
+    }
+
+    /// Per-stream `vprp` `VIDEO_FIELD_DESC` records (round-9
+    /// candidate 1).
+    ///
+    /// Returns the trailing per-field-rect array parsed from the
+    /// stream's `vprp` chunk, or an empty slice when the stream
+    /// didn't declare a `vprp` (or declared one with `nbFieldPerFrame
+    /// = 0` / a truncated tail). The slice length is at most
+    /// `nb_field_per_frame` (1 progressive, 2 interlaced) and capped
+    /// at the body's actual remaining bytes — see `parse_vprp`.
+    ///
+    /// Each [`VprpFieldDesc`] carries the 8 DWORDs of the spec's
+    /// per-field record: compressed bitmap dims, valid (visible)
+    /// rectangle dims + offset, and the signal-domain x-offset /
+    /// y-start-line. Callers wanting per-field rendering of an
+    /// interlaced stream can pull these out without re-parsing the
+    /// raw `vprp` body or walking metadata strings.
+    pub fn vprp_field_descs(&self, stream_index: u32) -> &[VprpFieldDesc] {
+        match self.vprps.get(stream_index as usize) {
+            Some(vp) => &vp.field_descs,
+            None => &[],
+        }
+    }
+
+    /// Backward-walking strict keyframe seek (round-9 candidate 4).
+    ///
+    /// Locates the last keyframe at-or-before `target_pts` in
+    /// `stream_index`'s seek table — the same landing point [`Demuxer::seek_to`]
+    /// would pick — but returns a structured [`KeyframeSeekResult`]
+    /// that exposes the gap between `target_pts` and the keyframe the
+    /// demuxer actually landed on. Callers can use the gap to:
+    ///
+    /// 1. Decide whether the file's GOP structure makes the seek
+    ///    practical (a 100-frame gap means decoding 100 P-frames to
+    ///    reach the wanted PTS),
+    /// 2. Plan a decode-and-discard loop after the seek to land at
+    ///    the originally-requested PTS,
+    /// 3. Detect mid-GOP requests vs. keyframe-aligned ones (gap == 0).
+    ///
+    /// Operates on the same indexes as `seek_to` (idx1 first, then
+    /// OpenDML std-indexes). Returns the same errors when neither
+    /// index is present or no keyframe ≤ target exists. Does *not*
+    /// mutate the demuxer state — the input is repositioned exactly
+    /// the same way `seek_to` does it, but you can call
+    /// [`Demuxer::seek_to`] separately afterwards if you only want
+    /// the side-effect.
+    pub fn seek_to_keyframe_strict(
+        &mut self,
+        stream_index: u32,
+        target_pts: i64,
+    ) -> Result<KeyframeSeekResult> {
+        let landed_pts = <Self as Demuxer>::seek_to(self, stream_index, target_pts)?;
+        // gop_distance is the number of stream ticks the caller would
+        // have to advance from the landed keyframe to reach the
+        // originally-requested target. Saturating keeps the math sane
+        // when `target_pts < landed_pts` (rare; only happens when the
+        // caller asks for a negative pts and the first keyframe is at
+        // pts >= 0).
+        let gop_distance = target_pts.saturating_sub(landed_pts).max(0);
+        Ok(KeyframeSeekResult {
+            target_pts,
+            landed_pts,
+            gop_distance,
+        })
+    }
+
     /// OpenDML 2.0 fallback for `seek_to` when no AVI 1.0 `idx1` table
     /// is present.
     ///
@@ -2529,6 +2788,89 @@ mod tests {
         assert_eq!(v.frame_width_in_pixels, 640);
         assert_eq!(v.frame_height_in_lines, 480);
         assert_eq!(v.nb_field_per_frame, 2);
+        // Round-9 candidate 1: tail-truncated body → no per-field
+        // descs, but the fixed preamble still parses.
+        assert!(
+            v.field_descs.is_empty(),
+            "no rect tail in the body → no field_descs"
+        );
+    }
+
+    #[test]
+    fn parse_vprp_extracts_two_field_rects() {
+        // Round-9 candidate 1: parse a vprp body with two
+        // VIDEO_FIELD_DESC records appended (interlaced PAL-ish: top
+        // field starts at line 23, bottom at line 335; both
+        // 720×288).
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes()); // VideoFormatToken = PAL_CCIR_601
+        body.extend_from_slice(&1u32.to_le_bytes()); // VideoStandard = STANDARD_PAL
+        body.extend_from_slice(&50u32.to_le_bytes()); // dwVerticalRefreshRate
+        body.extend_from_slice(&864u32.to_le_bytes()); // dwHTotalInT
+        body.extend_from_slice(&625u32.to_le_bytes()); // dwVTotalInLines
+        body.extend_from_slice(&((4u32 << 16) | 3u32).to_le_bytes()); // dwFrameAspectRatio
+        body.extend_from_slice(&720u32.to_le_bytes()); // dwFrameWidthInPixels
+        body.extend_from_slice(&576u32.to_le_bytes()); // dwFrameHeightInLines
+        body.extend_from_slice(&2u32.to_le_bytes()); // nbFieldPerFrame = 2
+                                                     // Field 0 (top).
+        body.extend_from_slice(&288u32.to_le_bytes()); // CompressedBMHeight
+        body.extend_from_slice(&720u32.to_le_bytes()); // CompressedBMWidth
+        body.extend_from_slice(&288u32.to_le_bytes()); // ValidBMHeight
+        body.extend_from_slice(&720u32.to_le_bytes()); // ValidBMWidth
+        body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMXOffset
+        body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMYOffset
+        body.extend_from_slice(&0u32.to_le_bytes()); // VideoXOffsetInT
+        body.extend_from_slice(&23u32.to_le_bytes()); // VideoYValidStartLine (top)
+                                                      // Field 1 (bottom).
+        body.extend_from_slice(&288u32.to_le_bytes());
+        body.extend_from_slice(&720u32.to_le_bytes());
+        body.extend_from_slice(&288u32.to_le_bytes());
+        body.extend_from_slice(&720u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&335u32.to_le_bytes()); // VideoYValidStartLine (bottom)
+
+        let v = parse_vprp(&body).expect("vprp must parse");
+        assert_eq!(v.field_descs.len(), 2);
+        assert_eq!(v.field_descs[0].compressed_bm_height, 288);
+        assert_eq!(v.field_descs[0].compressed_bm_width, 720);
+        assert_eq!(v.field_descs[0].valid_bm_height, 288);
+        assert_eq!(v.field_descs[0].valid_bm_width, 720);
+        assert_eq!(v.field_descs[0].video_y_valid_start_line, 23);
+        assert_eq!(v.field_descs[1].video_y_valid_start_line, 335);
+    }
+
+    #[test]
+    fn parse_vprp_truncated_tail_clamps_field_descs() {
+        // Round-9 candidate 1: nbFieldPerFrame=2 but only one rect's
+        // worth of bytes is appended → return one descriptor.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // VideoFormatToken
+        body.extend_from_slice(&0u32.to_le_bytes()); // VideoStandard
+        body.extend_from_slice(&50u32.to_le_bytes()); // dwVerticalRefreshRate
+        body.extend_from_slice(&864u32.to_le_bytes());
+        body.extend_from_slice(&625u32.to_le_bytes());
+        body.extend_from_slice(&((4u32 << 16) | 3u32).to_le_bytes());
+        body.extend_from_slice(&720u32.to_le_bytes());
+        body.extend_from_slice(&576u32.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes()); // nbFieldPerFrame = 2 …
+                                                     // … but only one rect follows.
+        body.extend_from_slice(&288u32.to_le_bytes());
+        body.extend_from_slice(&720u32.to_le_bytes());
+        body.extend_from_slice(&288u32.to_le_bytes());
+        body.extend_from_slice(&720u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&23u32.to_le_bytes());
+
+        let v = parse_vprp(&body).expect("vprp must parse");
+        assert_eq!(
+            v.field_descs.len(),
+            1,
+            "truncated tail → only the descs that fit"
+        );
     }
 
     #[test]

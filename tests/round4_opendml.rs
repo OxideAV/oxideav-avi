@@ -319,7 +319,10 @@ fn vprp_ntsc_preset_overrides_defaults() {
         if &bytes[i..i + 4] == b"vprp" {
             let sz = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
                 as usize;
-            assert_eq!(sz, 68);
+            // Round-9 candidate 1: muxer now emits one VIDEO_FIELD_DESC
+            // record per field instead of always emitting a single
+            // record. NTSC preset (nbFieldPerFrame=2) → 36 + 2*32 = 100.
+            assert_eq!(sz, 100);
             let body = &bytes[i + 8..i + 8 + sz];
             // VideoFormatToken = NTSC_CCIR_601 = 4.
             assert_eq!(u32::from_le_bytes([body[0], body[1], body[2], body[3]]), 4);

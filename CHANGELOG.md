@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`vprp` per-field `VIDEO_FIELD_DESC[]` round-trip (round 9 C1).**
+  Round 8 only surfaced the 9 fixed DWORDs of the OpenDML 2.0 §5.0
+  Video Properties Header and dropped the trailing
+  `VIDEO_FIELD_DESC FieldInfo[nbFieldPerFrame]` array (8 DWORDs per
+  field). Round 9 reads + surfaces them via the
+  `avi:vprp.<i>.field<j>.<key>` metadata namespace and the new typed
+  `AviDemuxer::vprp_field_descs(stream_index) -> &[VprpFieldDesc]`
+  accessor, with `VprpFieldDesc` exposing all 8 DWORDs (compressed
+  bitmap dims + valid-rect dims + offsets + signal-domain x/y). The
+  muxer is also fixed to emit one record per field instead of always
+  writing a single full-frame placeholder (a 2-field PAL/NTSC stream
+  was declaring `nbFieldPerFrame=2` but writing only one rect; round
+  9 emits half-height records with alternating
+  `VideoYValidStartLine` per field).
+- **`AviDemuxer::dmlh_total_frames() -> Option<u64>` (round 9 C3).**
+  Typed accessor for the OpenDML 2.0 §5.0 `dmlh.dwTotalFrames`
+  value. Returns `Some(total)` when a `LIST odml dmlh` extended
+  header was parsed (typical for OpenDML multi-segment files) and
+  `None` for AVI 1.0. Mirrors the existing
+  `avi:total_frames_all_segments` metadata key but in typed form
+  so callers can do arithmetic against pts/duration without parsing
+  string values out of `metadata()`.
+- **`AviDemuxer::seek_to_keyframe_strict(stream, pts) -> KeyframeSeekResult`
+  (round 9 C4).** Backward-walking strict keyframe seek. Returns a
+  `KeyframeSeekResult` carrying `target_pts`, `landed_pts`, and
+  `gop_distance = target_pts - landed_pts` (clamped to ≥ 0). The
+  underlying landing logic is identical to `Demuxer::seek_to` (last
+  keyframe at-or-before target; falls back to the first keyframe if
+  the request precedes it), but the structured result lets callers
+  detect mid-GOP requests, plan a decode-and-discard loop to reach
+  the originally-requested pts, or fail the seek when the gap is
+  larger than they're willing to walk.
 - **`AviDemuxer::info_for(id)` / `info_all_for(id)` (round 8 C2).**
   Public `LIST INFO` round-trip read accessors keyed by 4-byte
   FourCC. `info_for(*b"INAM")` returns the first value the muxer
