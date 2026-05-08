@@ -26,6 +26,33 @@
 //! present; OpenDML-driven seeking from the `indx` super-index is a
 //! follow-up — `seek_to` returns `Error::Unsupported` when no `idx1`
 //! was seen.
+//!
+//! ### Truncated-head tolerance
+//!
+//! Capture-card crash dumps and copy-aborted recordings often produce
+//! AVI 1.0 files whose RIFF / `LIST hdrl` / `LIST movi` size fields
+//! over-declare the bytes physically present (e.g. a 5 MiB head of
+//! what was meant to be a 20 MiB capture, with `LIST movi
+//! size=20353990`). The demuxer is **best-effort** for this case:
+//!
+//! 1. The actual file length is probed at `open()`; the top-level
+//!    `RIFF` body and every `LIST` body offset are clamped so a
+//!    declared size larger than the file becomes a logical end at
+//!    end-of-file rather than an out-of-range seek that surfaces
+//!    `read_exact` failures mid-walk.
+//! 2. `walk_riff_body` treats a truncated 8-byte chunk header read at
+//!    end-of-file as a clean stop (no more chunks) rather than
+//!    propagating an "AVI: truncated chunk header" error — there is
+//!    nothing more to parse, the file just ended early.
+//! 3. `next_packet` returns `Error::Eof` when a `read_exact` mid-body
+//!    short-reads (`UnexpectedEof`) instead of bubbling the I/O
+//!    error up. Any frames wholly inside the file are still
+//!    surfaced; the partial frame at the truncation boundary is
+//!    dropped silently.
+//!
+//! Genuinely malformed inputs — wrong RIFF FourCC, recursive `LIST`
+//! sizes inconsistent **before** the truncation point, missing
+//! `hdrl`, missing `movi`, etc. — still error cleanly.
 
 use std::io::{Seek, SeekFrom};
 
@@ -40,6 +67,13 @@ use crate::stream_format::{parse_bitmap_info_header, parse_waveformatex};
 
 /// Factory registered with the container registry.
 pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    // Probe the actual file length so we can clamp over-declared chunk sizes
+    // against it. Truncated-head AVI files (capture-card crash dumps,
+    // copy-aborted recordings) routinely declare RIFF / LIST sizes that
+    // exceed what's physically present; without this clamp the walker would
+    // hit `read_exact` UnexpectedEof mid-stream instead of stopping cleanly.
+    let file_len = probe_file_len(&mut *input)?;
+
     // Top-level RIFF chunk.
     let top = match read_chunk_header(&mut *input)? {
         Some(h) => h,
@@ -54,8 +88,9 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     }
     // End of the primary RIFF (exclusive). `top.size` does not include the
     // 8-byte RIFF header itself; its body starts right after the 4-byte
-    // form-type and ends at this offset.
-    let riff_end = 8u64 + top.size as u64;
+    // form-type and ends at this offset. Clamp against the actual file
+    // length so a truncated-head AVI doesn't surface an out-of-range walk.
+    let riff_end = (8u64 + top.size as u64).min(file_len);
 
     // Walk top-level nested chunks until we've processed both hdrl and movi.
     let mut streams: Vec<StreamInfo> = Vec::new();
@@ -70,6 +105,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     walk_riff_body(
         &mut *input,
         riff_end,
+        file_len,
         &mut streams,
         &mut packet_chunk_suffix,
         &mut movi_segments,
@@ -83,14 +119,16 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // OpenDML: additional `RIFF AVIX` extension segments may follow the
     // primary RIFF. Each holds more movi data.
     input.seek(SeekFrom::Start(riff_end))?;
-    while let Some(hdr) = read_chunk_header(&mut *input)? {
+    while let Some(hdr) = read_chunk_header_lenient(&mut *input)? {
         if hdr.id == RIFF {
             let form = read_form_type(&mut *input)?;
-            let ext_end = input.stream_position()? + hdr.size.saturating_sub(4) as u64;
+            let ext_end =
+                (input.stream_position()? + hdr.size.saturating_sub(4) as u64).min(file_len);
             if &form == b"AVIX" {
                 walk_riff_body(
                     &mut *input,
                     ext_end,
+                    file_len,
                     &mut streams,
                     &mut packet_chunk_suffix,
                     &mut movi_segments,
@@ -154,11 +192,13 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
 /// Walk the body of one RIFF (`AVI ` or `AVIX`). Collects `hdrl` metadata
 /// (only the primary RIFF carries it), records every `LIST movi` as a
 /// segment, and reads `idx1` if present. `end` is the exclusive end offset
-/// of this RIFF's body.
+/// of this RIFF's body; `file_len` is the underlying stream length used to
+/// clamp over-declared `LIST` body sizes (truncated-head tolerance).
 #[allow(clippy::too_many_arguments)]
 fn walk_riff_body(
     input: &mut dyn ReadSeek,
     end: u64,
+    file_len: u64,
     streams: &mut Vec<StreamInfo>,
     packet_chunk_suffix: &mut Vec<[u8; 2]>,
     movi_segments: &mut Vec<(u64, u64)>,
@@ -169,7 +209,7 @@ fn walk_riff_body(
     is_primary: bool,
 ) -> Result<()> {
     while input.stream_position()? < end {
-        let hdr = match read_chunk_header(input)? {
+        let hdr = match read_chunk_header_lenient(input)? {
             Some(h) => h,
             None => break,
         };
@@ -177,7 +217,12 @@ fn walk_riff_body(
             let list_type = read_form_type(input)?;
             let body_len = hdr.size.saturating_sub(4);
             let body_start = input.stream_position()?;
-            let body_end = body_start + body_len as u64;
+            // Clamp the declared body end to the enclosing RIFF and to the
+            // physical file length. AVI 1.0 capture dumps regularly
+            // over-declare `LIST movi` size when the recording was
+            // truncated; without clamping, downstream `read_exact` calls
+            // walk into UnexpectedEof.
+            let body_end = (body_start + body_len as u64).min(end).min(file_len);
             match &list_type {
                 b"hdrl" if is_primary => {
                     let (main, stream_infos, suffixes) = parse_hdrl(input, body_end, codecs)?;
@@ -189,8 +234,9 @@ fn walk_riff_body(
                     movi_segments.push((body_start, body_end));
                 }
                 b"INFO" if is_primary => {
-                    let mut buf = vec![0u8; body_len as usize];
-                    input.read_exact(&mut buf)?;
+                    let avail = body_end.saturating_sub(body_start) as usize;
+                    let mut buf = vec![0u8; avail];
+                    let _ = read_up_to(input, &mut buf)?;
                     parse_info_list(&buf, metadata);
                 }
                 _ => {}
@@ -198,8 +244,21 @@ fn walk_riff_body(
             input.seek(SeekFrom::Start(body_end))?;
             skip_pad(input, hdr.size)?;
         } else if &hdr.id == b"idx1" && is_primary {
-            let mut buf = vec![0u8; hdr.size as usize];
-            input.read_exact(&mut buf)?;
+            // Clamp idx1 size against remaining bytes so a truncation
+            // partway through the index doesn't fail open(); we just take
+            // whatever entries fit. Each entry is 16 B so a partial entry
+            // at the tail is dropped by build_idx_table's `n = raw.len() / 16`.
+            let pos = input.stream_position()?;
+            let avail = file_len.saturating_sub(pos);
+            let take = (hdr.size as u64).min(avail) as usize;
+            let mut buf = vec![0u8; take];
+            let read = read_up_to(input, &mut buf)?;
+            buf.truncate(read);
+            // Skip any remaining declared bytes (best-effort) + pad.
+            let remaining = hdr.size as u64 - read as u64;
+            if remaining > 0 {
+                let _ = input.seek(SeekFrom::Current(remaining as i64));
+            }
             skip_pad(input, hdr.size)?;
             *idx1_raw = Some(buf);
         } else {
@@ -207,6 +266,45 @@ fn walk_riff_body(
         }
     }
     Ok(())
+}
+
+/// Read a chunk header tolerantly: at end-of-file (or when fewer than
+/// 8 bytes remain), return `Ok(None)` rather than the strict error
+/// "AVI: truncated chunk header" used by `read_chunk_header`. Used by
+/// `walk_riff_body` so a RIFF whose declared size over-runs the
+/// physical file ends cleanly instead of bubbling up an error.
+fn read_chunk_header_lenient<R: std::io::Read + ?Sized>(
+    r: &mut R,
+) -> Result<Option<crate::riff::ChunkHeader>> {
+    let mut buf = [0u8; 8];
+    let mut got = 0;
+    while got < 8 {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => return Ok(None),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let id = [buf[0], buf[1], buf[2], buf[3]];
+    let size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    Ok(Some(crate::riff::ChunkHeader { id, size }))
+}
+
+/// Read up to `buf.len()` bytes; return how many were actually read
+/// (may be `0` at EOF, may be less than `buf.len()` on truncation).
+/// Unlike `read_exact`, never fails on short reads.
+fn read_up_to<R: std::io::Read + ?Sized>(r: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(got)
 }
 
 /// Parse a `LIST INFO` body (the 4-byte "INFO" form-type has already been
@@ -663,6 +761,23 @@ fn read_body_bounded<R: std::io::Read + ?Sized>(r: &mut R, size: u32) -> Result<
     Ok(buf)
 }
 
+/// Probe the underlying stream's total length by seeking to end and
+/// restoring the original position. Used for truncated-head clamping
+/// of declared `RIFF` / `LIST` sizes (see module-level
+/// "Truncated-head tolerance" doc).
+fn probe_file_len<R: ReadSeek + ?Sized>(r: &mut R) -> Result<u64> {
+    let cur = r.stream_position()?;
+    let end = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(cur))?;
+    Ok(end)
+}
+
+/// True if `e` is an `Error::Io` wrapping a `std::io::ErrorKind::UnexpectedEof`.
+/// Used to translate truncated-tail body reads into a clean `Error::Eof`.
+fn is_unexpected_eof(e: &Error) -> bool {
+    matches!(e, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
 /// Parse a raw `idx1` body, decide whether the recorded offsets are
 /// file-absolute or `movi`-relative (both are seen in the wild), and
 /// populate each entry with a synthesised per-stream pts.
@@ -875,7 +990,10 @@ impl Demuxer for AviDemuxer {
                 }
                 return Err(Error::Eof);
             }
-            let hdr = match read_chunk_header(&mut *self.input)? {
+            // Lenient header read: a short read at the segment tail
+            // (truncated-head AVI; segment_end = file_len) means "stop"
+            // rather than "I/O error".
+            let hdr = match read_chunk_header_lenient(&mut *self.input)? {
                 Some(h) => h,
                 None => return Err(Error::Eof),
             };
@@ -908,7 +1026,14 @@ impl Demuxer for AviDemuxer {
                         || suffix == *b"db"
                         || suffix == *b"wb";
                     if accept {
-                        let data = read_body_bounded(&mut *self.input, hdr.size)?;
+                        let data = match read_body_bounded(&mut *self.input, hdr.size) {
+                            Ok(d) => d,
+                            Err(e) if is_unexpected_eof(&e) => {
+                                // Truncated tail: drop the partial frame.
+                                return Err(Error::Eof);
+                            }
+                            Err(e) => return Err(e),
+                        };
                         skip_pad(&mut *self.input, hdr.size)?;
                         let stream = &self.streams[idx as usize];
                         let counter = self.per_stream_counter[idx as usize];

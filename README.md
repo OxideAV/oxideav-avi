@@ -33,6 +33,7 @@ oxideav-avi = "0.0"
 | Uncompressed `db` video chunks                   | yes   | yes  |
 | Variable stream interleave                       | yes   | yes  |
 | Palette-change (`pc`) chunks                     | skip  | no   |
+| Truncated-head tolerance (capture-card crash dumps) | yes | n/a |
 
 OpenDML 2.0 muxing is opt-in via `muxer::open_with_kind` with an
 `AviKind::OpenDml(RiffSegmentLimit::OneGiB)` (or `Bytes(n)` for

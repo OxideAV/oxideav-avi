@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Truncated-head AVI tolerance.** Demuxer now best-effort parses
+  AVI 1.0 files whose top-level `RIFF` / `LIST hdrl` / `LIST movi`
+  size fields over-declare the bytes physically present (capture-card
+  crash dumps, copy-aborted recordings). Frames wholly inside the
+  truncated body are surfaced; the partial frame at the truncation
+  boundary is dropped silently and `next_packet` returns
+  `Error::Eof`. Genuinely-malformed inputs (wrong RIFF FourCC,
+  empty file, non-AVI form-type, missing `movi`) still error
+  cleanly. Implementation: probe file length at `open()` and clamp
+  declared chunk-end offsets against it; lenient chunk-header read
+  (returns `Ok(None)` on partial-tail) inside `walk_riff_body` and
+  `next_packet`; translate `read_exact` UnexpectedEof on a packet
+  body to `Error::Eof`. New integration tests in
+  `tests/truncated_head.rs` (9 cases: 6 truncation fixtures + 3
+  negative). Origin: `oxideav-vfw` round-15 (commit `1214299c`)
+  hit this against `crashtest.avi` and added a parallel relaxation
+  in its codec-test helper; per `docs/IMPLEMENTOR_ROUND.md`
+  §"Crate-purpose discipline" the fix lives here so vfw can drop
+  the duplicate once this crate publishes.
+
 ### Changed
 
 - **Drop the `codec_map.rs` parallel codec table**; demuxer + muxer
