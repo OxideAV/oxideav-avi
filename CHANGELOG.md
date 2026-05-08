@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenDML 2.0 `LIST odml dmlh` extended header (round 3 P1).** The
+  muxer emits a `LIST odml` containing a `dmlh` chunk inside `hdrl`
+  whenever `AviKind::OpenDml` is selected; its single `dwTotalFrames`
+  DWORD is back-patched in `write_trailer` with the cross-segment
+  total (per OpenDML 2.0 §5.0 "Required Information / Extended AVI
+  Header"). The demuxer parses `LIST odml dmlh` when present and
+  surfaces the value as `avi:total_frames_all_segments` metadata so
+  callers can distinguish primary-segment-only `avih.dwTotalFrames`
+  from the OpenDML truth on multi-segment files.
+- **OpenDML 2.0 `vprp` Video Properties Header (round 3 P3).** The
+  muxer emits a 68-byte `vprp` chunk (9 fixed DWORDs + 1 default
+  `VIDEO_FIELD_DESC`) inside each video stream's `strl` for
+  `AviKind::OpenDml` files. Defaults: `FORMAT_UNKNOWN`,
+  `STANDARD_UNKNOWN`, refresh rate = fps, 4:3 aspect ratio,
+  `nbFieldPerFrame = 1`. The demuxer parses `vprp` when present and
+  surfaces every field under `avi:vprp.<index>.*` metadata keys
+  (`video_format_token`, `video_standard`, `vertical_refresh_rate`,
+  `frame_aspect_ratio` formatted as "X:Y", `frame_width_in_pixels`,
+  `frame_height_in_lines`, `nb_field_per_frame`, …).
+- **AVI_INDEX_2FIELD parse for interlaced `ix##` chunks (round 3
+  P2).** The demuxer's `parse_ix_chunk` now branches on
+  `bIndexSubType == AVI_INDEX_SUB_2FIELD` (per OpenDML 2.0 §3.0
+  "AVI Field Index Chunk"): when set, entries are 12 bytes
+  (`dwOffset`, `dwSize`, `dwOffsetField2`) with `wLongsPerEntry == 3`.
+  The decoded `dwOffsetField2` is held on `StdIndexEntry` and the
+  parent `StdIndex` carries the `b_index_sub_type` byte for callers
+  that need to distinguish progressive from interlaced indexes. The
+  muxer continues to emit single-field indexes (interlaced encoder
+  support is a round-4 candidate).
+- **Optional `LIST rec ` cluster grouping (round 3 P4).** New
+  `AviMuxOptions::with_rec_cluster_packets(n)` plus
+  `open_with_options` entry point: when set, the muxer groups every
+  `n` consecutive `movi` packets into a `LIST rec ` cluster
+  (per AVI RIFF §"Stream Data ('movi' List)" /
+  OpenDML 2.0 spec/06). Default OFF — every existing caller gets
+  the same byte output. Both the AVIX-segment closer and
+  `write_trailer` close any open cluster before flushing `ix##` or
+  `idx1` so the index chunks land at the tail of `movi`, not nested
+  inside a cluster.
 - **OpenDML 2.0 `ix##` standard-index emit + parse + seek.** Muxer
   flushes one `AVISTDINDEX` (`ix##`) chunk per stream at the tail
   of every `RIFF AVIX` segment's `movi` LIST (spec/06 §"Index

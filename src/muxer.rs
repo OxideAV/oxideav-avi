@@ -87,6 +87,36 @@ pub enum AviKind {
     OpenDml(RiffSegmentLimit),
 }
 
+/// Optional muxer features beyond the core envelope variant.
+///
+/// All fields default to off / disabled so existing callers (which
+/// pass nothing) get the same byte output they did pre-round-3.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AviMuxOptions {
+    /// When `Some(n)`, group every `n` consecutive packet chunks into
+    /// a `LIST rec ` cluster inside `movi`. Per OpenDML 2.0 spec/06
+    /// §"Stream Data ('movi' List)", `LIST rec ` clusters keep the
+    /// per-cluster size manageable for files that grow past 1 GiB.
+    /// Default `None` (no clustering — every packet sits as a direct
+    /// child of `movi`). The minimum useful value is 2; `Some(0)` and
+    /// `Some(1)` are treated as `None`.
+    pub rec_cluster_packets: Option<u32>,
+}
+
+impl AviMuxOptions {
+    /// Convenience: build a default configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builder helper: enable `LIST rec ` clustering with `n` packets
+    /// per cluster (`n` must be ≥ 2 to take effect).
+    pub fn with_rec_cluster_packets(mut self, n: u32) -> Self {
+        self.rec_cluster_packets = if n >= 2 { Some(n) } else { None };
+        self
+    }
+}
+
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
 #[derive(Clone, Copy, Debug)]
 struct IndexEntry {
@@ -158,6 +188,19 @@ pub fn open_with_kind(
     streams: &[StreamInfo],
     kind: AviKind,
 ) -> Result<Box<dyn Muxer>> {
+    open_with_options(output, streams, kind, AviMuxOptions::default())
+}
+
+/// Open an AVI muxer with full control over envelope variant and
+/// per-feature options. See [`open`] for the wire-tag resolution
+/// rules and [`AviMuxOptions`] for available toggles (currently
+/// `rec_cluster_packets` for OpenDML §"Stream Data" cluster grouping).
+pub fn open_with_options(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    kind: AviKind,
+    options: AviMuxOptions,
+) -> Result<Box<dyn Muxer>> {
     if streams.is_empty() {
         return Err(Error::invalid("avi muxer: need at least one stream"));
     }
@@ -186,6 +229,7 @@ pub fn open_with_kind(
         output,
         tracks,
         kind,
+        options,
         riff_size_off: 0,
         movi_size_off: 0,
         movi_start_off: 0,
@@ -193,8 +237,11 @@ pub fn open_with_kind(
         indx_entries_count_off: None,
         indx_entries_start_off: None,
         indx_entries_capacity: 0,
+        dmlh_total_frames_off: None,
         segments: Vec::new(),
         current_segment_packets: 0,
+        rec_open_size_off: None,
+        rec_packets_in_cluster: 0,
         header_written: false,
         trailer_written: false,
     }))
@@ -229,6 +276,7 @@ struct AviMuxer {
     output: Box<dyn WriteSeek>,
     tracks: Vec<TrackState>,
     kind: AviKind,
+    options: AviMuxOptions,
     /// Offset of the current RIFF chunk's size field.
     riff_size_off: u64,
     /// Offset of the current movi LIST size field.
@@ -253,6 +301,10 @@ struct AviMuxer {
     /// generous fixed capacity; back-patching only writes
     /// `min(actual_segments, capacity)` slots.
     indx_entries_capacity: usize,
+    /// File offset of the `dwTotalFrames` DWORD inside the
+    /// `LIST odml dmlh` chunk. Back-patched in `write_trailer` once
+    /// every packet has been written. `None` for `AviKind::Avi10`.
+    dmlh_total_frames_off: Option<u64>,
     /// All closed-out segments in OpenDML mode. The primary segment
     /// is appended to this list when it's closed (i.e. when the next
     /// `write_packet` would push past the limit, or in
@@ -261,6 +313,15 @@ struct AviMuxer {
     /// Number of packets written into the current open segment's
     /// `movi` LIST. Reset when a new segment is opened.
     current_segment_packets: u32,
+    /// File offset of the `LIST rec ` size field for the currently
+    /// open cluster (when [`AviMuxOptions::rec_cluster_packets`] is
+    /// `Some`). `None` between clusters.
+    rec_open_size_off: Option<u64>,
+    /// Number of packets written into the currently-open `LIST rec `
+    /// cluster. Reset to zero each time a new cluster is opened or
+    /// the previous one is closed. Unused when
+    /// `options.rec_cluster_packets` is `None`.
+    rec_packets_in_cluster: u32,
     header_written: bool,
     trailer_written: bool,
 }
@@ -293,15 +354,32 @@ impl Muxer for AviMuxer {
         // For OpenDML, embed the super-index in the FIRST stream's strl
         // (typically video). For Avi10, no super-index.
         let want_indx = matches!(self.kind, AviKind::OpenDml(_));
+        let want_vprp = want_indx; // emit `vprp` for video streams in OpenDML mode
         for (i, t) in self.tracks.iter().enumerate() {
             let with_indx = want_indx && i == 0;
+            let with_vprp = want_vprp && &t.entry.strh_type == b"vids";
             let (indx_count_off, indx_entries_off) =
-                write_strl(self.output.as_mut(), i as u32, t, with_indx)?;
+                write_strl(self.output.as_mut(), i as u32, t, with_indx, with_vprp)?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
                 self.indx_entries_start_off = indx_entries_off;
                 self.indx_entries_capacity = OPENDML_SUPER_INDEX_CAPACITY;
             }
+        }
+        // OpenDML 2.0 §5.0 "Source and Header Information Storage":
+        // emit `LIST odml` carrying the `dmlh` extended header inside
+        // `hdrl`. The single DWORD `dwTotalFrames` is back-patched in
+        // `write_trailer` once we know the cross-segment frame count.
+        if want_indx {
+            let odml_size_off = begin_list(self.output.as_mut(), &LIST, b"odml")?;
+            // dmlh body: a single DWORD dwTotalFrames (placeholder = 0;
+            // back-patched in write_trailer).
+            crate::riff::write_chunk_header(self.output.as_mut(), b"dmlh", 4)?;
+            let dmlh_off = self.output.stream_position()?;
+            self.output.write_all(&0u32.to_le_bytes())?;
+            // dmlh body length is even (4) so no pad byte required.
+            self.dmlh_total_frames_off = Some(dmlh_off);
+            finish_chunk(self.output.as_mut(), odml_size_off)?;
         }
         finish_chunk(self.output.as_mut(), hdrl_size_off)?;
 
@@ -316,6 +394,8 @@ impl Muxer for AviMuxer {
         // which — by convention, we make them relative to 'movi'.
         self.movi_start_off = self.movi_size_off + 4; // skip past size → 'movi' fourcc
         self.current_segment_packets = 0;
+        self.rec_open_size_off = None;
+        self.rec_packets_in_cluster = 0;
         self.header_written = true;
         Ok(())
     }
@@ -350,6 +430,19 @@ impl Muxer for AviMuxer {
             if self.current_segment_packets > 0 && segment_used > limit.bytes() {
                 self.close_current_segment()?;
                 self.open_avix_segment()?;
+            }
+        }
+
+        // Optional `LIST rec ` clustering (OpenDML 2.0 spec/06 §"Stream
+        // Data ('movi' List)"). Open a new cluster when we don't have
+        // one and close+reopen when the current one has reached its
+        // packet count cap.
+        if let Some(cluster_cap) = self.options.rec_cluster_packets {
+            if self.rec_open_size_off.is_none() {
+                self.open_rec_cluster()?;
+            } else if self.rec_packets_in_cluster >= cluster_cap {
+                self.close_rec_cluster()?;
+                self.open_rec_cluster()?;
             }
         }
 
@@ -404,6 +497,9 @@ impl Muxer for AviMuxer {
         t.sample_count += sample_count_of_packet(&t.stream, &t.entry, size);
 
         self.current_segment_packets += 1;
+        if self.options.rec_cluster_packets.is_some() {
+            self.rec_packets_in_cluster += 1;
+        }
 
         // idx1 entry — only meaningful for the primary segment in
         // OpenDML mode (idx1 offsets are 32-bit and relative to the
@@ -447,6 +543,12 @@ impl Muxer for AviMuxer {
 
         let in_primary_segment = self.segments.is_empty();
 
+        // Close any open `LIST rec ` cluster so ix## (OpenDML) and idx1
+        // (legacy) chunks land at the tail of `movi`, not nested inside
+        // a cluster.
+        if self.rec_open_size_off.is_some() {
+            self.close_rec_cluster()?;
+        }
         // OpenDML: flush `ix##` chunks at the tail of the current
         // segment's movi LIST before closing it. Mirrors the
         // close_current_segment path for the trailing partial segment.
@@ -571,7 +673,8 @@ impl AviMuxer {
 
             // Advance strl_off by the size of this strl LIST (8 header +
             // body). Body = 4 (form) + 64 (strh) + 8 + strf.len() + pad
-            // [+ 8 + indx_payload_padded if i == 0 and opendml].
+            // [+ 8 + indx_payload_padded if i == 0 and opendml]
+            // [+ 8 + vprp_payload_padded if video stream and opendml].
             let strf_padded = t.entry.strf.len() + (t.entry.strf.len() & 1);
             let mut strl_body = 4 + 64 + 8 + strf_padded;
             if opendml && i == 0 {
@@ -579,11 +682,28 @@ impl AviMuxer {
                 let indx_padded = indx_payload + (indx_payload & 1);
                 strl_body += 8 + indx_padded;
             }
+            // vprp emission matches `write_strl(.., with_vprp = opendml &&
+            // strh_type == "vids")`. Payload is fixed-size (68 B → even,
+            // no pad).
+            if opendml && &t.entry.strh_type == b"vids" {
+                strl_body += 8 + 68;
+            }
             strl_off += 8 + strl_body as u64;
         }
 
         // Restore writer position.
         self.output.seek(SeekFrom::Start(end_pos))?;
+
+        // OpenDML 2.0 §5.0: back-patch dmlh.dwTotalFrames with the
+        // cross-segment total (= total_video_frames; AVIX continuation
+        // frames are already summed into the primary video stream's
+        // packet_count via TrackState::packet_count by the time
+        // write_trailer runs).
+        if let Some(off) = self.dmlh_total_frames_off {
+            self.output.seek(SeekFrom::Start(off))?;
+            self.output.write_all(&total_video_frames.to_le_bytes())?;
+            self.output.seek(SeekFrom::Start(end_pos))?;
+        }
         Ok(())
     }
 
@@ -606,6 +726,11 @@ impl AviMuxer {
     /// `(offset, total_size, packet_count)`.
     fn close_current_segment(&mut self) -> Result<()> {
         let in_primary = self.segments.is_empty();
+        // Close any open `LIST rec ` cluster first so ix## lands at
+        // the tail of movi, not nested inside the cluster.
+        if self.rec_open_size_off.is_some() {
+            self.close_rec_cluster()?;
+        }
         // Flush `ix##` AVISTDINDEX chunks at the tail of the current
         // segment's movi LIST. One per track with at least one packet
         // recorded in this segment. Per OpenDML 2.0 §"Index Locations",
@@ -693,6 +818,29 @@ impl AviMuxer {
         self.movi_size_off = begin_list(self.output.as_mut(), &LIST, b"movi")?;
         self.movi_start_off = self.movi_size_off + 4;
         self.current_segment_packets = 0;
+        self.rec_open_size_off = None;
+        self.rec_packets_in_cluster = 0;
+        Ok(())
+    }
+
+    /// Open a new `LIST rec ` cluster inside the current `movi` LIST.
+    /// Writes the `LIST` header + `rec ` form-type and reserves a 4-byte
+    /// size placeholder; the size is patched in [`close_rec_cluster`]
+    /// when the cluster fills its packet quota or `movi` closes.
+    fn open_rec_cluster(&mut self) -> Result<()> {
+        let off = begin_list(self.output.as_mut(), &LIST, b"rec ")?;
+        self.rec_open_size_off = Some(off);
+        self.rec_packets_in_cluster = 0;
+        Ok(())
+    }
+
+    /// Close the open `LIST rec ` cluster (no-op if none is open). Patches
+    /// the cluster's size field so a later scan walks past it cleanly.
+    fn close_rec_cluster(&mut self) -> Result<()> {
+        if let Some(off) = self.rec_open_size_off.take() {
+            finish_chunk(self.output.as_mut(), off)?;
+            self.rec_packets_in_cluster = 0;
+        }
         Ok(())
     }
 
@@ -762,17 +910,25 @@ fn build_avih(tracks: &[TrackState]) -> Vec<u8> {
     body
 }
 
-/// Build and write a `strl` LIST (strh + strf [+ indx]).
+/// Build and write a `strl` LIST (strh + strf [+ indx] [+ vprp]).
 ///
 /// Returns `(indx_n_entries_off, indx_entries_start_off)` when
 /// `with_indx` is set, otherwise `(None, None)`. The two offsets let
 /// the muxer back-patch the OpenDML super-index in `write_trailer`
 /// once each segment's RIFF position is known.
+///
+/// When `with_vprp` is set, an OpenDML 2.0 §5.0 `vprp` chunk is
+/// appended to the `strl` after `strf` (and after `indx` if both are
+/// present). The default values match the spec's "FORMAT_UNKNOWN /
+/// STANDARD_UNKNOWN, single-field, 4:3 aspect" hint for callers that
+/// don't carry signal-shape metadata; the chunk lets a downstream
+/// tool detect the file as OpenDML 2.0-aware regardless.
 fn write_strl<W: Write + Seek + ?Sized>(
     w: &mut W,
     _index: u32,
     t: &TrackState,
     with_indx: bool,
+    with_vprp: bool,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -843,8 +999,59 @@ fn write_strl<W: Write + Seek + ?Sized>(
         indx_entries_start_off = Some(payload_off + 24);
     }
 
+    // OpenDML 2.0 §5.0 "Video Properties Header" — emit one `vprp`
+    // per video stream when requested. We use the spec's
+    // `FORMAT_UNKNOWN` / `STANDARD_UNKNOWN` defaults plus the muxer's
+    // own width/height + frame-rate so a re-mux's vprp doesn't lie
+    // about the resolution. nbFieldPerFrame=1 (progressive) — the
+    // muxer doesn't currently emit interlaced indexes, so single
+    // field is correct.
+    if with_vprp {
+        let body = build_vprp_body(t);
+        write_chunk(w, b"vprp", &body)?;
+    }
+
     finish_chunk(w, strl_off)?;
     Ok((indx_n_entries_off, indx_entries_start_off))
+}
+
+/// Build a `vprp` body for a video track. 9 fixed DWORDs followed by
+/// a single `VIDEO_FIELD_DESC` (8 DWORDs) describing the lone
+/// progressive field. Total length = 9*4 + 1*32 = 68 bytes.
+fn build_vprp_body(t: &TrackState) -> Vec<u8> {
+    let width = t.stream.params.width.unwrap_or(0);
+    let height = t.stream.params.height.unwrap_or(0);
+    // Vertical refresh rate in Hz: rate / scale (samples per second).
+    // For video this is conventionally fps (e.g. 25, 30000/1001).
+    // Round to nearest integer; a downstream tool that needs the
+    // exact ratio can still read strh's scale/rate.
+    let refresh_rate = if t.entry.scale > 0 {
+        ((t.entry.rate as u64 + (t.entry.scale as u64 / 2)) / t.entry.scale as u64) as u32
+    } else {
+        0
+    };
+    // 4:3 aspect ratio default, packed as (X << 16) | Y.
+    let frame_aspect_ratio: u32 = (4u32 << 16) | 3u32;
+    let mut body = Vec::with_capacity(68);
+    body.extend_from_slice(&0u32.to_le_bytes()); // VideoFormatToken = FORMAT_UNKNOWN
+    body.extend_from_slice(&0u32.to_le_bytes()); // VideoStandard = STANDARD_UNKNOWN
+    body.extend_from_slice(&refresh_rate.to_le_bytes()); // dwVerticalRefreshRate
+    body.extend_from_slice(&width.to_le_bytes()); // dwHTotalInT (unknown — fall back to width)
+    body.extend_from_slice(&height.to_le_bytes()); // dwVTotalInLines
+    body.extend_from_slice(&frame_aspect_ratio.to_le_bytes()); // dwFrameAspectRatio
+    body.extend_from_slice(&width.to_le_bytes()); // dwFrameWidthInPixels
+    body.extend_from_slice(&height.to_le_bytes()); // dwFrameHeightInLines
+    body.extend_from_slice(&1u32.to_le_bytes()); // nbFieldPerFrame = 1 (progressive)
+                                                 // VIDEO_FIELD_DESC[0]: full-frame valid bitmap.
+    body.extend_from_slice(&height.to_le_bytes()); // CompressedBMHeight
+    body.extend_from_slice(&width.to_le_bytes()); // CompressedBMWidth
+    body.extend_from_slice(&height.to_le_bytes()); // ValidBMHeight
+    body.extend_from_slice(&width.to_le_bytes()); // ValidBMWidth
+    body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMXOffset
+    body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMYOffset
+    body.extend_from_slice(&0u32.to_le_bytes()); // VideoXOffsetInT
+    body.extend_from_slice(&0u32.to_le_bytes()); // VideoYValidStartLine
+    body
 }
 
 fn sample_count_of_packet(stream: &StreamInfo, entry: &StrfEntry, size: u32) -> u64 {

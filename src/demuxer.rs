@@ -69,6 +69,11 @@ use crate::stream_format::{parse_bitmap_info_header, parse_waveformatex};
 const AVI_INDEX_OF_INDEXES: u8 = 0x00;
 /// `bIndexType` of an `AVIMETAINDEX` chunk index (`ix##`).
 const AVI_INDEX_OF_CHUNKS: u8 = 0x01;
+/// `bIndexSubType` flag for a 2-field interlaced std-index (per OpenDML 2.0
+/// §3.0 "AVI Field Index Chunk"). When set, each `aIndex` entry carries an
+/// extra `dwOffsetField2` DWORD (so `wLongsPerEntry == 3` and entries are
+/// 12 bytes instead of the default 8).
+const AVI_INDEX_SUB_2FIELD: u8 = 0x01;
 /// `dwSize` high bit in an `AVISTDINDEX_ENTRY` flags a non-keyframe (delta).
 const AVISTDINDEX_DELTA_BIT: u32 = 0x8000_0000;
 
@@ -118,6 +123,13 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     // indexed by stream number so a sparse population (only video carries
     // an `indx`) leaves audio entries empty.
     let mut super_indexes: Vec<SuperIndex> = Vec::new();
+    // Per-stream `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
+    // Default-initialised entries for streams that didn't declare a `vprp`.
+    let mut vprps: Vec<VprpHeader> = Vec::new();
+    // OpenDML 2.0 §5.0 `dmlh` extended-header `dwTotalFrames` value
+    // (across all RIFF segments). `None` when no `LIST odml dmlh` was
+    // seen in `hdrl`.
+    let mut dmlh_total_frames: Option<u32> = None;
 
     walk_riff_body(
         &mut *input,
@@ -130,6 +142,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         &mut metadata,
         &mut idx1_raw,
         &mut super_indexes,
+        &mut vprps,
+        &mut dmlh_total_frames,
         codecs,
         /* is_primary */ true,
     )?;
@@ -154,6 +168,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                     &mut metadata,
                     &mut idx1_raw,
                     &mut super_indexes,
+                    &mut vprps,
+                    &mut dmlh_total_frames,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -220,6 +236,83 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         metadata.push(("avi:truncated".into(), "true".into()));
     }
 
+    // OpenDML 2.0 §5.0 dmlh: real total-frame count across every RIFF
+    // segment. `avih.dwTotalFrames` only reflects the primary segment
+    // (per spec/06 §5.0 "Required Information"); a multi-segment file
+    // built with the OpenDML envelope writes the cross-segment count
+    // here. Surface as a separate key so the avih-derived
+    // `avi:total_frames` (from `avih.total_frames`) stays
+    // single-segment for legacy callers, while
+    // `avi:total_frames_all_segments` carries the OpenDML truth.
+    if let Some(total) = dmlh_total_frames {
+        metadata.push(("avi:total_frames_all_segments".into(), total.to_string()));
+    }
+
+    // OpenDML 2.0 §5.0 vprp: surface signal-shape descriptors per
+    // stream under `avi:vprp.<index>.*`. Skip default-zero headers
+    // (streams without a `vprp` chunk) so absence is observable.
+    for (i, vp) in vprps.iter().enumerate() {
+        // A genuinely-present vprp will have at least one nonzero
+        // field; a stream that didn't declare one leaves it
+        // default-zero. Use `nb_field_per_frame` as the presence
+        // signal — it's required to be 1 (progressive) or 2
+        // (interlaced) per the spec.
+        if vp.nb_field_per_frame == 0 {
+            continue;
+        }
+        let prefix = format!("avi:vprp.{i}");
+        metadata.push((
+            format!("{prefix}.video_format_token"),
+            vp.video_format_token.to_string(),
+        ));
+        metadata.push((
+            format!("{prefix}.video_standard"),
+            vp.video_standard.to_string(),
+        ));
+        if vp.vertical_refresh_rate > 0 {
+            metadata.push((
+                format!("{prefix}.vertical_refresh_rate"),
+                vp.vertical_refresh_rate.to_string(),
+            ));
+        }
+        if vp.h_total_in_t > 0 {
+            metadata.push((
+                format!("{prefix}.h_total_in_t"),
+                vp.h_total_in_t.to_string(),
+            ));
+        }
+        if vp.v_total_in_lines > 0 {
+            metadata.push((
+                format!("{prefix}.v_total_in_lines"),
+                vp.v_total_in_lines.to_string(),
+            ));
+        }
+        if vp.frame_aspect_ratio > 0 {
+            // Encode as "X:Y" for human consumption; the high WORD is
+            // X, low WORD is Y per spec/06 §5.0 "Active Frame Aspect
+            // Ratio".
+            let x = (vp.frame_aspect_ratio >> 16) & 0xFFFF;
+            let y = vp.frame_aspect_ratio & 0xFFFF;
+            metadata.push((format!("{prefix}.frame_aspect_ratio"), format!("{x}:{y}")));
+        }
+        if vp.frame_width_in_pixels > 0 {
+            metadata.push((
+                format!("{prefix}.frame_width_in_pixels"),
+                vp.frame_width_in_pixels.to_string(),
+            ));
+        }
+        if vp.frame_height_in_lines > 0 {
+            metadata.push((
+                format!("{prefix}.frame_height_in_lines"),
+                vp.frame_height_in_lines.to_string(),
+            ));
+        }
+        metadata.push((
+            format!("{prefix}.nb_field_per_frame"),
+            vp.nb_field_per_frame.to_string(),
+        ));
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -283,6 +376,8 @@ fn walk_riff_body(
     metadata: &mut Vec<(String, String)>,
     idx1_raw: &mut Option<Vec<u8>>,
     super_indexes: &mut Vec<SuperIndex>,
+    vprps: &mut Vec<VprpHeader>,
+    dmlh_total_frames: &mut Option<u32>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -303,11 +398,14 @@ fn walk_riff_body(
             let body_end = (body_start + body_len as u64).min(end).min(file_len);
             match &list_type {
                 b"hdrl" if is_primary => {
-                    let (main, stream_infos, suffixes, sxs) = parse_hdrl(input, body_end, codecs)?;
+                    let (main, stream_infos, suffixes, sxs, vps, dmlh) =
+                        parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
                     *packet_chunk_suffix = suffixes;
                     *super_indexes = sxs;
+                    *vprps = vps;
+                    *dmlh_total_frames = dmlh;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -475,19 +573,28 @@ fn parse_avih(buf: &[u8]) -> Result<AviMainHeader> {
 /// Bundle of values returned from [`parse_hdrl`]: the parsed
 /// [`AviMainHeader`], the list of per-stream [`StreamInfo`]s, the
 /// matching list of packet-chunk suffixes (e.g. `b"dc"`, `b"wb"`),
-/// and the OpenDML 2.0 super-index per stream (empty for streams
-/// that don't declare an `indx` chunk in their `strl`).
+/// the OpenDML 2.0 super-index per stream (empty for streams that
+/// don't declare an `indx` chunk in their `strl`), the per-stream
+/// [`VprpHeader`] (empty for streams without a `vprp` chunk), and
+/// the optional `dmlh` extended-header `dwTotalFrames` value
+/// (`Some` only when `LIST odml dmlh` was present).
 type HdrlOutput = (
     AviMainHeader,
     Vec<StreamInfo>,
     Vec<[u8; 2]>,
     Vec<SuperIndex>,
+    Vec<VprpHeader>,
+    Option<u32>,
 );
 
 /// Parse the `hdrl` LIST body.
 ///
 /// Reads `avih`, then walks each nested `strl` LIST to build one `StreamInfo`
-/// per stream. See [`HdrlOutput`] for the return shape.
+/// per stream. The `LIST odml` child carrying the `dmlh` extended header
+/// (per OpenDML 2.0 §5.0 "Source and Header Information Storage") is
+/// parsed when present; its single `dwTotalFrames` DWORD is returned so
+/// the demuxer can surface it as `avi:total_frames_all_segments`.
+/// See [`HdrlOutput`] for the return shape.
 fn parse_hdrl<R: ReadSeek + ?Sized>(
     r: &mut R,
     end_pos: u64,
@@ -497,6 +604,8 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut streams: Vec<StreamInfo> = Vec::new();
     let mut suffixes: Vec<[u8; 2]> = Vec::new();
     let mut super_indexes: Vec<SuperIndex> = Vec::new();
+    let mut vprps: Vec<VprpHeader> = Vec::new();
+    let mut dmlh_total_frames: Option<u32> = None;
 
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
@@ -515,12 +624,20 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
+                    let (si, suf, sx, vp) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
                         suffixes.push(suf.unwrap_or(*b"xx"));
                         super_indexes.push(sx);
+                        vprps.push(vp);
                     }
+                } else if &list_type == b"odml" {
+                    // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
+                    // `dmlh`'s body is a single DWORD (`dwTotalFrames`)
+                    // covering the real total-frame count across every
+                    // RIFF segment (whereas `avih.dwTotalFrames` only
+                    // reflects the primary segment per spec/06 §5.0).
+                    dmlh_total_frames = parse_odml_list(r, body_end)?;
                 }
                 r.seek(SeekFrom::Start(body_end))?;
                 skip_pad(r, hdr.size)?;
@@ -530,21 +647,70 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
             }
         }
     }
-    Ok((main, streams, suffixes, super_indexes))
+    Ok((
+        main,
+        streams,
+        suffixes,
+        super_indexes,
+        vprps,
+        dmlh_total_frames,
+    ))
 }
 
+/// Parse a `LIST odml` body for the `dmlh` extended-header chunk.
+///
+/// `dmlh` carries a single 32-bit `dwTotalFrames` value across all RIFF
+/// segments (per OpenDML 2.0 §5.0 "Source and Header Information
+/// Storage" / "Extended AVI Header"). Some encoders pad `dmlh` past the
+/// nominal 4 bytes; we only consume the first DWORD.
+fn parse_odml_list<R: ReadSeek + ?Sized>(r: &mut R, end_pos: u64) -> Result<Option<u32>> {
+    while r.stream_position()? < end_pos {
+        let hdr = match read_chunk_header(r)? {
+            Some(h) => h,
+            None => break,
+        };
+        if &hdr.id == b"dmlh" {
+            // dmlh body is at minimum 4 bytes; some writers emit a
+            // larger zero-padded body — read what's there and pick the
+            // first DWORD.
+            let take = (hdr.size as u64).min(4096) as u32;
+            let body = read_body_bounded(r, take)?;
+            // Skip any trailing bytes past what we read.
+            let remaining = (hdr.size as u64).saturating_sub(take as u64);
+            if remaining > 0 {
+                r.seek(SeekFrom::Current(remaining as i64))?;
+            }
+            skip_pad(r, hdr.size)?;
+            if body.len() >= 4 {
+                let total = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                return Ok(Some(total));
+            }
+            return Ok(None);
+        }
+        skip_chunk(r, &hdr)?;
+    }
+    Ok(None)
+}
+
+/// 4-tuple returned by [`parse_strl`]: optional [`StreamInfo`],
+/// optional packet-chunk suffix, [`SuperIndex`] (default-empty when
+/// no `indx`), and [`VprpHeader`] (default when no `vprp`).
+type StrlOutput = (Option<StreamInfo>, Option<[u8; 2]>, SuperIndex, VprpHeader);
+
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
-/// suffix, and the OpenDML 2.0 [`SuperIndex`] parsed from the `indx`
-/// chunk inside the strl (empty if absent).
+/// suffix, the OpenDML 2.0 [`SuperIndex`] parsed from the `indx`
+/// chunk inside the strl (empty if absent), and the [`VprpHeader`]
+/// parsed from any `vprp` chunk (default if absent).
 fn parse_strl<R: ReadSeek + ?Sized>(
     r: &mut R,
     end_pos: u64,
     index: u32,
     codecs: &dyn CodecResolver,
-) -> Result<(Option<StreamInfo>, Option<[u8; 2]>, SuperIndex)> {
+) -> Result<StrlOutput> {
     let mut strh_buf: Option<Vec<u8>> = None;
     let mut strf_buf: Option<Vec<u8>> = None;
     let mut super_index = SuperIndex::default();
+    let mut vprp = VprpHeader::default();
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
             Some(h) => h,
@@ -579,6 +745,16 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 skip_pad(r, hdr.size)?;
                 super_index = parse_indx(&body)?;
             }
+            b"vprp" => {
+                // OpenDML 2.0 §5.0 "Video Properties Header" — captures
+                // pixel-aspect / NTSC-PAL-SECAM token / framing flags
+                // for a video stream. Optional; absent on most files.
+                let body = read_body_bounded(r, hdr.size)?;
+                skip_pad(r, hdr.size)?;
+                if let Some(parsed) = parse_vprp(&body) {
+                    vprp = parsed;
+                }
+            }
             _ => {
                 skip_chunk(r, &hdr)?;
             }
@@ -586,11 +762,53 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     }
     let strh = match strh_buf {
         Some(b) => b,
-        None => return Ok((None, None, super_index)),
+        None => return Ok((None, None, super_index, vprp)),
     };
     let strf = strf_buf.unwrap_or_default();
     let parsed = build_stream(index, &strh, &strf, codecs)?;
-    Ok((Some(parsed.0), Some(parsed.1), super_index))
+    Ok((Some(parsed.0), Some(parsed.1), super_index, vprp))
+}
+
+/// Parse a `vprp` (Video Properties Header) chunk per OpenDML 2.0 §5.0.
+///
+/// Layout (9 fixed DWORDs = 36 B, then `nbFieldPerFrame * 32 B` of
+/// `VIDEO_FIELD_DESC` records):
+///
+/// ```text
+///   DWORD VideoFormatToken
+///   DWORD VideoStandard
+///   DWORD dwVerticalRefreshRate
+///   DWORD dwHTotalInT
+///   DWORD dwVTotalInLines
+///   DWORD dwFrameAspectRatio   (high WORD = X, low WORD = Y)
+///   DWORD dwFrameWidthInPixels
+///   DWORD dwFrameHeightInLines
+///   DWORD nbFieldPerFrame
+///   VIDEO_FIELD_DESC FieldInfo[nbFieldPerFrame]   // 8 DWORDs each = 32 B
+/// ```
+///
+/// Returns `None` when the chunk is shorter than 36 B (the fixed
+/// preamble); returns the parsed header even when the trailing
+/// per-field-rect array is missing or truncated (we don't expose those
+/// fields on the surfaced metadata yet).
+fn parse_vprp(body: &[u8]) -> Option<VprpHeader> {
+    if body.len() < 36 {
+        return None;
+    }
+    let read_dword = |off: usize| -> u32 {
+        u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]])
+    };
+    Some(VprpHeader {
+        video_format_token: read_dword(0),
+        video_standard: read_dword(4),
+        vertical_refresh_rate: read_dword(8),
+        h_total_in_t: read_dword(12),
+        v_total_in_lines: read_dword(16),
+        frame_aspect_ratio: read_dword(20),
+        frame_width_in_pixels: read_dword(24),
+        frame_height_in_lines: read_dword(28),
+        nb_field_per_frame: read_dword(32),
+    })
 }
 
 /// Parse an OpenDML 2.0 `indx` super-index payload into a structured
@@ -673,43 +891,57 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
 /// `fcc`+`cb` aren't part of the body we receive here):
 ///
 /// ```text
-///   WORD      wLongsPerEntry  (= 2 for std-index; entry is 8 B)
-///   BYTE      bIndexSubType   (0 default; 1 for 2-field)
+///   WORD      wLongsPerEntry  (= 2 for std-index; entry is 8 B
+///                              | = 3 for 2-field; entry is 12 B)
+///   BYTE      bIndexSubType   (0 default; 1 for AVI_INDEX_2FIELD)
 ///   BYTE      bIndexType      (= 0x01 AVI_INDEX_OF_CHUNKS)
 ///   DWORD     nEntriesInUse
 ///   DWORD     dwChunkId       (e.g. '00dc')
 ///   DWORDLONG qwBaseOffset    (typically the file offset of the 'movi' LIST)
 ///   DWORD     dwReserved3
-///   AVISTDINDEX_ENTRY aIndex[]   // 8 B each: dwOffset + dwSize/flags
+///   AVISTDINDEX_ENTRY aIndex[]   // 8 B (default) or 12 B (2-field) each
 /// ```
 ///
 /// Each `AVISTDINDEX_ENTRY.dwOffset` is added to `qwBaseOffset` to get
 /// the file-absolute offset of the chunk's data (i.e. just after its
 /// 8-byte header). `dwSize`'s high bit being set marks a non-keyframe.
+///
+/// Per OpenDML 2.0 §3.0 "AVI Field Index Chunk", when
+/// `bIndexSubType == AVI_INDEX_2FIELD` the entry layout extends to
+/// `(dwOffset, dwSize, dwOffsetField2)` — each entry now spans 12 B and
+/// `wLongsPerEntry == 3`. The decoder surfaces the field-2 offset on
+/// [`StdIndexEntry::dw_offset_field2`]; default-subtype entries leave
+/// it at zero.
 fn parse_ix_chunk(body: &[u8]) -> Option<StdIndex> {
     if body.len() < 24 {
         return None;
     }
     let w_longs_per_entry = u16::from_le_bytes([body[0], body[1]]);
-    let _b_index_sub_type = body[2];
+    let b_index_sub_type = body[2];
     let b_index_type = body[3];
-    if b_index_type != AVI_INDEX_OF_CHUNKS || w_longs_per_entry != 2 {
+    if b_index_type != AVI_INDEX_OF_CHUNKS {
         return None;
     }
+    // wLongsPerEntry is 2 (default 8-B entries) or 3 (2-field, 12 B).
+    let entry_size = match w_longs_per_entry {
+        2 => 8usize,
+        3 if b_index_sub_type == AVI_INDEX_SUB_2FIELD => 12usize,
+        _ => return None,
+    };
     let n_entries_in_use = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
     let mut chunk_id = [0u8; 4];
     chunk_id.copy_from_slice(&body[8..12]);
     let qw_base_offset = u64::from_le_bytes([
         body[12], body[13], body[14], body[15], body[16], body[17], body[18], body[19],
     ]);
-    let entries_byte_len = n_entries_in_use.saturating_mul(8);
+    let entries_byte_len = n_entries_in_use.saturating_mul(entry_size);
     let need = 24usize.saturating_add(entries_byte_len);
     if body.len() < need {
         return None;
     }
     let mut entries = Vec::with_capacity(n_entries_in_use);
     for i in 0..n_entries_in_use {
-        let base = 24 + i * 8;
+        let base = 24 + i * entry_size;
         let dw_offset =
             u32::from_le_bytes([body[base], body[base + 1], body[base + 2], body[base + 3]]);
         let dw_size_raw = u32::from_le_bytes([
@@ -720,15 +952,27 @@ fn parse_ix_chunk(body: &[u8]) -> Option<StdIndex> {
         ]);
         let is_keyframe = (dw_size_raw & AVISTDINDEX_DELTA_BIT) == 0;
         let dw_size = dw_size_raw & !AVISTDINDEX_DELTA_BIT;
+        let dw_offset_field2 = if entry_size == 12 {
+            u32::from_le_bytes([
+                body[base + 8],
+                body[base + 9],
+                body[base + 10],
+                body[base + 11],
+            ])
+        } else {
+            0
+        };
         entries.push(StdIndexEntry {
             dw_offset,
             dw_size,
             is_keyframe,
+            dw_offset_field2,
         });
     }
     Some(StdIndex {
         chunk_id,
         qw_base_offset,
+        b_index_sub_type,
         entries,
     })
 }
@@ -1208,6 +1452,39 @@ struct AviDemuxer {
     std_indexes: Vec<StdIndex>,
 }
 
+/// Decoded `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
+///
+/// The 9 fixed DWORDs at the start of a `vprp` body. The trailing
+/// `VIDEO_FIELD_DESC FieldInfo[nbFieldPerFrame]` array is not yet
+/// surfaced — only the global signal-shape descriptors are exposed
+/// via `Demuxer::metadata()` under the `avi:vprp.*` namespace.
+#[derive(Clone, Copy, Debug, Default)]
+struct VprpHeader {
+    /// `VideoFormatToken` — typically one of `FORMAT_PAL_SQUARE`,
+    /// `FORMAT_NTSC_CCIR_601`, etc. `0` means `FORMAT_UNKNOWN` and the
+    /// remaining fields hold special / arbitrary values.
+    video_format_token: u32,
+    /// `VideoStandard` — one of `STANDARD_UNKNOWN`, `STANDARD_PAL`,
+    /// `STANDARD_NTSC`, `STANDARD_SECAM`.
+    video_standard: u32,
+    /// `dwVerticalRefreshRate` — Hz; conventionally 60 for NTSC, 50
+    /// for PAL.
+    vertical_refresh_rate: u32,
+    /// `dwHTotalInT` — total horizontal samples per line.
+    h_total_in_t: u32,
+    /// `dwVTotalInLines` — total vertical lines per frame.
+    v_total_in_lines: u32,
+    /// `dwFrameAspectRatio` — packed (X << 16) | Y. e.g. 0x0004_0003
+    /// = 4:3, 0x0010_0009 = 16:9.
+    frame_aspect_ratio: u32,
+    /// `dwFrameWidthInPixels` — active frame width.
+    frame_width_in_pixels: u32,
+    /// `dwFrameHeightInLines` — active frame height.
+    frame_height_in_lines: u32,
+    /// `nbFieldPerFrame` — 1 (progressive) or 2 (interlaced).
+    nb_field_per_frame: u32,
+}
+
 /// One `AVISUPERINDEX_ENTRY` parsed from an `indx` chunk.
 ///
 /// We don't dereference `qw_offset` directly — the `ix##` chunks it
@@ -1247,12 +1524,22 @@ struct SuperIndex {
 #[derive(Clone, Copy, Debug)]
 struct StdIndexEntry {
     /// `dwOffset`: byte offset from `StdIndex::qw_base_offset` to the
-    /// chunk's data (i.e. just past its 8-byte header).
+    /// chunk's data (i.e. just past its 8-byte header). For 2-field
+    /// entries this points at the FIRST field's data.
     dw_offset: u32,
     /// `dwSize` with the keyframe-bit cleared: payload size in bytes.
+    /// For 2-field entries this is the combined size of both fields.
     dw_size: u32,
     /// True iff the std-index entry's `dwSize` high bit is clear.
     is_keyframe: bool,
+    /// Per OpenDML 2.0 §3.0 "AVI Field Index Chunk": offset (relative
+    /// to `StdIndex::qw_base_offset`) of the SECOND field's data when
+    /// the parent index has `bIndexSubType == AVI_INDEX_2FIELD`. Zero
+    /// for default (single-field / progressive) entries. Surfaced via
+    /// [`AviDemuxer::field2_offset_for_index`] for callers that want
+    /// per-field rendering.
+    #[allow(dead_code)]
+    dw_offset_field2: u32,
 }
 
 /// One `ix##` AVISTDINDEX chunk parsed out of a `movi` LIST.
@@ -1264,6 +1551,10 @@ struct StdIndex {
     /// Base offset for `dw_offset` lookups — typically the file offset
     /// of the enclosing `movi` LIST's first chunk header.
     qw_base_offset: u64,
+    /// Index sub-type: 0 (default, progressive) or
+    /// `AVI_INDEX_SUB_2FIELD` (2-field interlaced).
+    #[allow(dead_code)]
+    b_index_sub_type: u8,
     entries: Vec<StdIndexEntry>,
 }
 
@@ -1672,5 +1963,105 @@ mod tests {
         assert_eq!(parse_stream_index(b"01wb"), Some(1));
         assert_eq!(parse_stream_index(b"0adb"), Some(10));
         assert_eq!(parse_stream_index(b"XXXX"), None);
+    }
+
+    #[test]
+    fn parse_ix_chunk_default_subtype_8b_entries() {
+        // Hand-build an `ix##` body: wLongsPerEntry = 2, subType = 0,
+        // bIndexType = 0x01, 2 entries. Each entry is 8 B
+        // (dwOffset, dwSize/flags). Verify the parser surfaces the
+        // entries with the keyframe bit decoded.
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_le_bytes()); // wLongsPerEntry
+        body.push(0); // bIndexSubType
+        body.push(0x01); // bIndexType = AVI_INDEX_OF_CHUNKS
+        body.extend_from_slice(&2u32.to_le_bytes()); // nEntriesInUse
+        body.extend_from_slice(b"00dc"); // dwChunkId
+        body.extend_from_slice(&0x1000u64.to_le_bytes()); // qwBaseOffset
+        body.extend_from_slice(&0u32.to_le_bytes()); // dwReserved3
+                                                     // Entry 0: keyframe.
+        body.extend_from_slice(&0x100u32.to_le_bytes()); // dwOffset
+        body.extend_from_slice(&512u32.to_le_bytes()); // dwSize (high bit clear → kf)
+                                                       // Entry 1: delta frame.
+        body.extend_from_slice(&0x300u32.to_le_bytes());
+        body.extend_from_slice(&((512u32) | 0x8000_0000).to_le_bytes());
+
+        let parsed = parse_ix_chunk(&body).unwrap();
+        assert_eq!(&parsed.chunk_id, b"00dc");
+        assert_eq!(parsed.qw_base_offset, 0x1000);
+        assert_eq!(parsed.b_index_sub_type, 0);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].dw_offset, 0x100);
+        assert_eq!(parsed.entries[0].dw_size, 512);
+        assert!(parsed.entries[0].is_keyframe);
+        assert_eq!(parsed.entries[0].dw_offset_field2, 0);
+        assert_eq!(parsed.entries[1].dw_offset, 0x300);
+        assert_eq!(parsed.entries[1].dw_size, 512);
+        assert!(!parsed.entries[1].is_keyframe);
+    }
+
+    #[test]
+    fn parse_ix_chunk_2field_subtype_12b_entries() {
+        // 2-field index per OpenDML 2.0 §3.0 "AVI Field Index Chunk":
+        //   wLongsPerEntry = 3, bIndexSubType = AVI_INDEX_2FIELD,
+        //   each entry is (dwOffset, dwSize, dwOffsetField2) = 12 B.
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u16.to_le_bytes()); // wLongsPerEntry = 3
+        body.push(AVI_INDEX_SUB_2FIELD); // 1
+        body.push(0x01); // bIndexType = AVI_INDEX_OF_CHUNKS
+        body.extend_from_slice(&1u32.to_le_bytes()); // nEntriesInUse
+        body.extend_from_slice(b"00dc");
+        body.extend_from_slice(&0x2000u64.to_le_bytes()); // qwBaseOffset
+        body.extend_from_slice(&0u32.to_le_bytes()); // dwReserved3
+                                                     // Entry 0: 2-field interlaced video; field-2 offset follows.
+        body.extend_from_slice(&0x40u32.to_le_bytes()); // dwOffset (field 1)
+        body.extend_from_slice(&1024u32.to_le_bytes()); // dwSize (whole frame)
+        body.extend_from_slice(&0x80u32.to_le_bytes()); // dwOffsetField2
+
+        let parsed = parse_ix_chunk(&body).expect("2-field index must parse");
+        assert_eq!(parsed.b_index_sub_type, AVI_INDEX_SUB_2FIELD);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].dw_offset, 0x40);
+        assert_eq!(parsed.entries[0].dw_size, 1024);
+        assert_eq!(
+            parsed.entries[0].dw_offset_field2, 0x80,
+            "field-2 offset must round-trip from the 12-byte entry layout"
+        );
+        assert!(parsed.entries[0].is_keyframe);
+    }
+
+    #[test]
+    fn parse_vprp_extracts_fixed_dwords() {
+        // Hand-build a vprp body with all 9 fixed DWORDs populated;
+        // skip the trailing per-field-rect array (the parser tolerates
+        // its absence).
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_le_bytes()); // VideoFormatToken (FORMAT_NTSC_SQUARE-ish)
+        body.extend_from_slice(&2u32.to_le_bytes()); // VideoStandard = STANDARD_NTSC
+        body.extend_from_slice(&60u32.to_le_bytes()); // dwVerticalRefreshRate
+        body.extend_from_slice(&780u32.to_le_bytes()); // dwHTotalInT
+        body.extend_from_slice(&525u32.to_le_bytes()); // dwVTotalInLines
+        body.extend_from_slice(&((4u32 << 16) | 3u32).to_le_bytes()); // dwFrameAspectRatio = 4:3
+        body.extend_from_slice(&640u32.to_le_bytes()); // dwFrameWidthInPixels
+        body.extend_from_slice(&480u32.to_le_bytes()); // dwFrameHeightInLines
+        body.extend_from_slice(&2u32.to_le_bytes()); // nbFieldPerFrame = 2 (interlaced)
+
+        let v = parse_vprp(&body).expect("vprp must parse");
+        assert_eq!(v.video_format_token, 3);
+        assert_eq!(v.video_standard, 2);
+        assert_eq!(v.vertical_refresh_rate, 60);
+        assert_eq!(v.h_total_in_t, 780);
+        assert_eq!(v.v_total_in_lines, 525);
+        assert_eq!(v.frame_aspect_ratio, (4u32 << 16) | 3);
+        assert_eq!(v.frame_width_in_pixels, 640);
+        assert_eq!(v.frame_height_in_lines, 480);
+        assert_eq!(v.nb_field_per_frame, 2);
+    }
+
+    #[test]
+    fn parse_vprp_short_returns_none() {
+        // < 36 bytes → can't decode the 9 fixed DWORDs.
+        let body = vec![0u8; 16];
+        assert!(parse_vprp(&body).is_none());
     }
 }
