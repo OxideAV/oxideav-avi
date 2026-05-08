@@ -12,21 +12,25 @@
 //! works for any video codec the muxer can package.
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecRegistry, CodecTag, MediaType, Packet, Rational, ReadSeek,
-    StreamInfo, TimeBase, WriteSeek,
+    CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, MediaType, Packet, Rational,
+    ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
 use oxideav_avi::muxer::{open_with_kind, AviKind, RiffSegmentLimit};
 
-/// Build a CodecRegistry pre-populated with `oxideav-magicyuv`'s tag
-/// claims (the 17 native v7 FourCCs) so the demuxer's forward
-/// `resolve_tag(M8RG → "magicyuv")` direction works. The muxer no
+/// Build a CodecRegistry with a synthetic `M8RG` ↔ `"magicyuv"` tag
+/// claim so the demuxer's forward `resolve_tag` direction surfaces
+/// the codec_id. Avoids a producer-crate dev-dep — real MagicYUV
+/// decode coverage lives in `crates/oxideav-tests`. The muxer no
 /// longer asks the registry the inverse question — wire FourCCs
 /// flow through `CodecParameters::tag` set by the caller (or by
 /// the encoder's `output_params()`).
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
-    oxideav_magicyuv::register_codecs(&mut reg);
+    let info = CodecInfo::new(CodecId::new("magicyuv"))
+        .tag(CodecTag::fourcc(b"M8RG"))
+        .tag(CodecTag::fourcc(b"M8YA"));
+    reg.register(info);
     reg
 }
 

@@ -4,10 +4,36 @@
 use std::io::Read;
 
 use oxideav_core::{
-    CodecId, CodecParameters, MediaType, Packet, PixelFormat, Rational, SampleFormat, StreamInfo,
-    TimeBase,
+    CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, MediaType, Packet, PixelFormat,
+    Rational, SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{ReadSeek, WriteSeek};
+
+/// Register a synthetic video codec mapping (`codec_id` ↔ `FOURCC`)
+/// without pulling a producer crate into the dev-dep graph. The AVI
+/// container only needs the registry to translate FourCCs both ways;
+/// no real decoder/encoder factory is wired.
+fn register_fake_video(reg: &mut CodecRegistry, codec_id: &str, fourcc: &[u8; 4]) {
+    let info = CodecInfo::new(CodecId::new(codec_id)).tag(CodecTag::fourcc(fourcc));
+    reg.register(info);
+}
+
+/// Register a synthetic audio codec mapping (`codec_id` ↔ `wFormatTag`).
+fn register_fake_audio(reg: &mut CodecRegistry, codec_id: &str, wave_tag: u16) {
+    let info = CodecInfo::new(CodecId::new(codec_id)).tag(CodecTag::wave_format(wave_tag));
+    reg.register(info);
+}
+
+/// Build a JPEG-shaped synthetic byte stream — `FF D8` SOI ... `FF D9`
+/// EOI — for tests that only need to round-trip "MJPG"-tagged opaque
+/// bytes through the AVI container, not actually decode them.
+fn synthetic_jpeg_bytes(payload_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload_len + 4);
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    out.extend((0..payload_len).map(|i| (i.wrapping_mul(37) & 0xFF) as u8));
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
 
 fn pcm_stream() -> StreamInfo {
     let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
@@ -83,52 +109,26 @@ fn pcm_roundtrip_byte_exact() {
 
 #[test]
 fn mjpeg_roundtrip_via_avi() {
-    use oxideav_core::{Frame, VideoFrame, VideoPlane};
-
-    // Build a synthetic 64x64 Yuv420P frame.
+    // The container only cares that opaque "MJPG"-tagged bytes
+    // round-trip byte-exactly. Real MJPEG encoder/decoder coverage
+    // lives in `crates/oxideav-tests`; this test stays in oxideav-avi
+    // so it must avoid producer-crate dev-deps. Use JPEG-shaped
+    // synthetic bytes (`FF D8` ... `FF D9` envelope so any codec
+    // sniffer that *did* peek would see a plausible SOI marker).
     let w = 64u32;
     let h = 64u32;
-    let chroma_w = (w / 2) as usize;
-    let chroma_h = (h / 2) as usize;
-    let y_plane: Vec<u8> = (0..(w * h) as usize).map(|i| (i % 256) as u8).collect();
-    let cb_plane: Vec<u8> = vec![128u8; chroma_w * chroma_h];
-    let cr_plane: Vec<u8> = vec![128u8; chroma_w * chroma_h];
-
     let time_base = TimeBase::new(1, 25);
-    let _ = (time_base, PixelFormat::Yuv420P, h);
-    let frame = Frame::Video(VideoFrame {
-        pts: Some(0),
-        planes: vec![
-            VideoPlane {
-                stride: w as usize,
-                data: y_plane,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: cb_plane,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: cr_plane,
-            },
-        ],
-    });
+    let jpeg_bytes = synthetic_jpeg_bytes(2048);
+    assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8]);
+    assert_eq!(&jpeg_bytes[jpeg_bytes.len() - 2..], &[0xFF, 0xD9]);
 
-    let mut enc_params = CodecParameters::video(CodecId::new("mjpeg"))
-        .with_tag(oxideav_core::CodecTag::fourcc(b"MJPG"));
+    let mut enc_params =
+        CodecParameters::video(CodecId::new("mjpeg")).with_tag(CodecTag::fourcc(b"MJPG"));
     enc_params.media_type = MediaType::Video;
     enc_params.width = Some(w);
     enc_params.height = Some(h);
     enc_params.pixel_format = Some(PixelFormat::Yuv420P);
     enc_params.frame_rate = Some(Rational::new(25, 1));
-
-    let mut enc = oxideav_mjpeg::encoder::make_encoder(&enc_params).unwrap();
-    enc.send_frame(&frame).unwrap();
-    let jpeg_bytes = match enc.receive_packet() {
-        Ok(p) => p.data,
-        Err(e) => panic!("mjpeg encoder produced no packet: {e:?}"),
-    };
-    assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8]);
 
     let stream = StreamInfo {
         index: 0,
@@ -140,8 +140,8 @@ fn mjpeg_roundtrip_via_avi() {
 
     // Forward registry for the demuxer's `resolve_tag(MJPG → mjpeg)`
     // direction. The muxer reads `stream.params.tag` directly.
-    let mut reg = oxideav_core::CodecRegistry::new();
-    oxideav_mjpeg::register_codecs(&mut reg);
+    let mut reg = CodecRegistry::new();
+    register_fake_video(&mut reg, "mjpeg", b"MJPG");
 
     let tmp = std::env::temp_dir().join("oxideav-avi-mjpeg-roundtrip.avi");
     {
@@ -253,14 +253,16 @@ fn alaw_mulaw_roundtrip() {
     // The wire wFormatTag (0x0006 / 0x0007) is set on `params.tag`
     // by the caller (would be the encoder's `output_params()` in
     // production); the demuxer's forward `resolve_tag` direction is
-    // populated from oxideav-g711's `register_codecs` for the
-    // codec_id round-trip.
-    let mut reg = oxideav_core::CodecRegistry::new();
-    oxideav_g711::register_codecs(&mut reg);
+    // populated from synthetic registry entries for the codec_id
+    // round-trip. Real G.711 encode/decode coverage lives in
+    // `crates/oxideav-tests`.
+    let mut reg = CodecRegistry::new();
+    register_fake_audio(&mut reg, "pcm_alaw", 0x0006);
+    register_fake_audio(&mut reg, "pcm_mulaw", 0x0007);
 
     for (codec, wave_tag) in &[("pcm_alaw", 0x0006u16), ("pcm_mulaw", 0x0007u16)] {
-        let mut params = CodecParameters::audio(CodecId::new(*codec))
-            .with_tag(oxideav_core::CodecTag::wave_format(*wave_tag));
+        let mut params =
+            CodecParameters::audio(CodecId::new(*codec)).with_tag(CodecTag::wave_format(*wave_tag));
         params.channels = Some(2);
         params.sample_rate = Some(8_000);
         let stream = StreamInfo {

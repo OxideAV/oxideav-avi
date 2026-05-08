@@ -7,17 +7,19 @@
 use std::io::Cursor;
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecRegistry, CodecTag, Error, MediaType, Packet, PixelFormat,
-    Rational, SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Error, MediaType, Packet,
+    PixelFormat, Rational, SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{ReadSeek, WriteSeek};
 
-/// Build a CodecRegistry pre-populated with `oxideav-mjpeg`'s tag
-/// claims so the muxer can resolve `codec_id="mjpeg"` to
-/// `CodecTag::Fourcc(b"MJPG")` via the registry.
+/// Build a CodecRegistry with a synthetic `MJPG` ↔ `"mjpeg"` tag
+/// claim so the muxer / demuxer can resolve in both directions.
+/// Avoids a producer-crate dev-dep — real MJPEG decode coverage
+/// lives in `crates/oxideav-tests`.
 fn registry_with_mjpeg() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
-    oxideav_mjpeg::register_codecs(&mut reg);
+    let info = CodecInfo::new(CodecId::new("mjpeg")).tag(CodecTag::fourcc(b"MJPG"));
+    reg.register(info);
     reg
 }
 

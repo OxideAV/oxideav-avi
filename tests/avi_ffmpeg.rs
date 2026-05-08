@@ -5,16 +5,18 @@
 use std::path::Path;
 use std::process::Command;
 
-use oxideav_core::{CodecRegistry, ReadSeek};
+use oxideav_core::{CodecId, CodecInfo, CodecRegistry, CodecTag, ReadSeek};
 
-/// Build a registry populated with mjpeg's tag claims so the
-/// resolver surfaces `mjpeg` for `MJPG`. ffv1's claims are
-/// declared by `oxideav-ffv1` (not a dev-dep here); the
-/// `avi:FFV1` synthetic fallback is the test-correct expectation
-/// when ffv1 isn't registered.
+/// Build a registry with a synthetic `MJPG` ↔ `"mjpeg"` tag claim
+/// so the resolver surfaces `mjpeg` for the FOURCC. Avoids a
+/// producer-crate dev-dep — real MJPEG decode coverage lives in
+/// `crates/oxideav-tests`. ffv1 is intentionally not registered;
+/// the `avi:FFV1` synthetic fallback is the test-correct
+/// expectation in that case.
 fn registry_with_mjpeg() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
-    oxideav_mjpeg::register_codecs(&mut reg);
+    let info = CodecInfo::new(CodecId::new("mjpeg")).tag(CodecTag::fourcc(b"MJPG"));
+    reg.register(info);
     reg
 }
 

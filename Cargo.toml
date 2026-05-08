@@ -16,7 +16,9 @@ categories = ["multimedia::video", "parser-implementations"]
 [dependencies]
 oxideav-core = "0.1"
 
+# No cross-crate dev-dependencies. Cross-package tests (real codec
+# encode → AVI mux → demux → real decode round-trips) live in
+# `crates/oxideav-tests`. The crate-local tests register synthetic
+# codec_id ↔ tag mappings + use random/JPEG-shaped synthetic payloads
+# to exercise the AVI muxer + demuxer in isolation.
 [dev-dependencies]
-oxideav-mjpeg = "0.1.2"
-oxideav-magicyuv = "0.0"
-oxideav-g711 = "0.0"

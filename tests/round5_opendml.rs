@@ -20,16 +20,22 @@
 use std::io::Read;
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecRegistry, CodecTag, Demuxer, MediaType, Muxer, Packet, Rational,
-    ReadSeek, StreamInfo, TimeBase, WriteSeek,
+    CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Demuxer, MediaType, Muxer,
+    Packet, Rational, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
 use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit};
 
+/// Synthetic registry entry for the FOURCC ↔ codec_id mapping the
+/// tests below need. Avoids a producer-crate dev-dep — real
+/// MagicYUV decode coverage lives in `crates/oxideav-tests`.
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
-    oxideav_magicyuv::register_codecs(&mut reg);
+    let info = CodecInfo::new(CodecId::new("magicyuv"))
+        .tag(CodecTag::fourcc(b"M8RG"))
+        .tag(CodecTag::fourcc(b"M8YA"));
+    reg.register(info);
     reg
 }
 
