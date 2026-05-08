@@ -175,16 +175,24 @@ pub struct AviMuxOptions {
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
-/// Properties Header (round-4 P2). All fields are optional; a zero
-/// value falls back to the round-3 default the muxer already emits
-/// for that field.
+/// Properties Header (round-4 P2 / round-10 candidate 2). All fields
+/// are optional; a zero value falls back to the round-3 default the
+/// muxer already emits for that field.
 ///
 /// Per OpenDML 2.0 §5.0 the spec defines four well-known
 /// `(VideoFormatToken, VideoStandard)` pairs — the helpers
 /// [`VprpConfig::ntsc`] / [`VprpConfig::pal`] / [`VprpConfig::secam`]
 /// fill in the well-known refresh rates so callers don't have to
 /// remember the table.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// Round-10 C2: the trailing per-field `VIDEO_FIELD_DESC[]` array
+/// (whose first-line `VideoYValidStartLine` differs between PAL
+/// 23 / 335 vs NTSC 23 / 285 — the round-9 muxer hard-coded a
+/// PAL-flavoured `half_height + 23`) can now be supplied verbatim
+/// by a caller via [`VprpConfig::with_field_descs`]. Empty `Vec` →
+/// the muxer synthesises the rect array from `nbFieldPerFrame` /
+/// frame dimensions exactly like round-9 (back-compat).
+#[derive(Clone, Debug, Default)]
 pub struct VprpConfig {
     /// `VideoFormatToken` per OpenDML §5.0 enum. 0 = FORMAT_UNKNOWN.
     pub video_format_token: u32,
@@ -196,6 +204,50 @@ pub struct VprpConfig {
     pub frame_aspect_ratio: u32,
     /// `nbFieldPerFrame` — 1 progressive, 2 interlaced. 0 = 1.
     pub nb_field_per_frame: u32,
+    /// Optional caller-supplied `VIDEO_FIELD_DESC[]` records (round-10
+    /// C2). When non-empty, the muxer emits these verbatim instead of
+    /// synthesising the per-field rects from frame dimensions. Length
+    /// must be `>= nb_field_per_frame.max(1)` for the override to
+    /// take effect (the muxer slices to the active field count); a
+    /// shorter Vec is ignored and the synthesised default is used so
+    /// a partial override doesn't silently truncate the array.
+    pub field_descs: Vec<VprpFieldDescOverride>,
+}
+
+/// Caller-supplied per-field rectangle for a `vprp` chunk's trailing
+/// `VIDEO_FIELD_DESC[]` array (round-10 candidate 2). 8 DWORDs / 32 B
+/// per OpenDML 2.0 §5.0.
+///
+/// Use this struct when the muxer's synthesised per-field rects
+/// (PAL-flavoured `half_height + 23` second-line) don't match the
+/// signal-shape conventions of the file's broadcast standard — most
+/// notably NTSC, where the bottom field starts at line 285 (= 263 + 22),
+/// not at PAL's 335 (= 312 + 23). The shape mirrors
+/// [`oxideav_avi::demuxer::VprpFieldDesc`] field-for-field so a
+/// re-mux of a parsed file can round-trip the signal-domain offsets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VprpFieldDescOverride {
+    /// `CompressedBMHeight` in lines.
+    pub compressed_bm_height: u32,
+    /// `CompressedBMWidth` in pixels.
+    pub compressed_bm_width: u32,
+    /// `ValidBMHeight` in lines (visible height).
+    pub valid_bm_height: u32,
+    /// `ValidBMWidth` in pixels (visible width).
+    pub valid_bm_width: u32,
+    /// `ValidBMXOffset` — x-offset of the visible rect inside the
+    /// compressed bitmap.
+    pub valid_bm_x_offset: u32,
+    /// `ValidBMYOffset` — y-offset of the visible rect inside the
+    /// compressed bitmap.
+    pub valid_bm_y_offset: u32,
+    /// `VideoXOffsetInT` — x-offset of the bitmap inside the video
+    /// signal's horizontal active region (in `T` units).
+    pub video_x_offset_in_t: u32,
+    /// `VideoYValidStartLine` — first signal line of this field
+    /// within the total `dwVTotalInLines` count. PAL: 23 / 335.
+    /// NTSC: 23 / 285. Progressive: 0.
+    pub video_y_valid_start_line: u32,
 }
 
 /// OpenDML 2.0 §5.0 video-format token: `FORMAT_UNKNOWN`.
@@ -227,6 +279,7 @@ impl VprpConfig {
             vertical_refresh_rate: 60,
             frame_aspect_ratio: (4u32 << 16) | 3,
             nb_field_per_frame: 2,
+            field_descs: Vec::new(),
         }
     }
     /// PAL CCIR-601 preset: 50 Hz, interlaced, 4:3.
@@ -237,6 +290,7 @@ impl VprpConfig {
             vertical_refresh_rate: 50,
             frame_aspect_ratio: (4u32 << 16) | 3,
             nb_field_per_frame: 2,
+            field_descs: Vec::new(),
         }
     }
     /// SECAM preset: 50 Hz, interlaced, 4:3 (no SECAM token in §5.0).
@@ -247,6 +301,7 @@ impl VprpConfig {
             vertical_refresh_rate: 50,
             frame_aspect_ratio: (4u32 << 16) | 3,
             nb_field_per_frame: 2,
+            field_descs: Vec::new(),
         }
     }
     /// Builder: pin `nbFieldPerFrame`.
@@ -262,6 +317,37 @@ impl VprpConfig {
     /// Builder: pin `dwFrameAspectRatio` from `(X, Y)`.
     pub fn with_aspect(mut self, x: u32, y: u32) -> Self {
         self.frame_aspect_ratio = ((x & 0xFFFF) << 16) | (y & 0xFFFF);
+        self
+    }
+    /// Builder: pin the trailing `VIDEO_FIELD_DESC[]` array verbatim
+    /// (round-10 candidate 2). Use this when the synthesised PAL-
+    /// flavoured `half_height + 23` second-line default doesn't match
+    /// the file's broadcast standard — most notably NTSC, where the
+    /// bottom field starts at line 285. The muxer slices the override
+    /// to the active `nbFieldPerFrame.max(1)` count; supply at least
+    /// that many records or the override is ignored (back-compat with
+    /// pre-round-10 callers that never supplied any).
+    ///
+    /// ```ignore
+    /// // NTSC 720x480 with spec-correct first-line offsets:
+    /// VprpConfig::ntsc()
+    ///     .with_field_descs(vec![
+    ///         VprpFieldDescOverride {
+    ///             compressed_bm_height: 240, compressed_bm_width: 720,
+    ///             valid_bm_height: 240, valid_bm_width: 720,
+    ///             video_y_valid_start_line: 23,
+    ///             ..Default::default()
+    ///         },
+    ///         VprpFieldDescOverride {
+    ///             compressed_bm_height: 240, compressed_bm_width: 720,
+    ///             valid_bm_height: 240, valid_bm_width: 720,
+    ///             video_y_valid_start_line: 285,
+    ///             ..Default::default()
+    ///         },
+    ///     ])
+    /// ```
+    pub fn with_field_descs(mut self, descs: Vec<VprpFieldDescOverride>) -> Self {
+        self.field_descs = descs;
         self
     }
 }
@@ -667,7 +753,7 @@ impl Muxer for AviMuxer {
                 .vprp_overrides
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
-                .map(|(_, c)| *c);
+                .map(|(_, c)| c.clone());
             let indx_2field_here = indx_is_2field && with_indx;
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
@@ -1591,11 +1677,29 @@ fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> 
     body.extend_from_slice(&width.to_le_bytes()); // dwFrameWidthInPixels
     body.extend_from_slice(&height.to_le_bytes()); // dwFrameHeightInLines
     body.extend_from_slice(&nb_field_per_frame.to_le_bytes());
+
     // VIDEO_FIELD_DESC[0..nbFieldPerFrame]: spec-mandated per-field
-    // rect array. For interlaced (2 fields), each field's compressed
-    // bitmap is half-height and starts at the alternating signal
-    // line. Progressive (1 field) gets a single full-frame record.
-    if nb_field_per_frame >= 2 {
+    // rect array. Round-10 C2 honours a caller-supplied
+    // `field_descs` override verbatim — required for NTSC and any
+    // other standard whose first-line conventions don't match the
+    // synthesised PAL-flavoured default. The override only takes
+    // effect when the supplied Vec covers every active field; a
+    // shorter Vec falls through to the synthesised default so a
+    // partial override doesn't silently truncate the array.
+    let active_fields = nb_field_per_frame.max(1) as usize;
+    let use_override = !cfg.field_descs.is_empty() && cfg.field_descs.len() >= active_fields;
+    if use_override {
+        for d in cfg.field_descs.iter().take(active_fields) {
+            body.extend_from_slice(&d.compressed_bm_height.to_le_bytes());
+            body.extend_from_slice(&d.compressed_bm_width.to_le_bytes());
+            body.extend_from_slice(&d.valid_bm_height.to_le_bytes());
+            body.extend_from_slice(&d.valid_bm_width.to_le_bytes());
+            body.extend_from_slice(&d.valid_bm_x_offset.to_le_bytes());
+            body.extend_from_slice(&d.valid_bm_y_offset.to_le_bytes());
+            body.extend_from_slice(&d.video_x_offset_in_t.to_le_bytes());
+            body.extend_from_slice(&d.video_y_valid_start_line.to_le_bytes());
+        }
+    } else if nb_field_per_frame >= 2 {
         let half_height = height / 2;
         // PAL/NTSC CCIR-601 first-line conventions per OpenDML §5.0
         // table: top field starts at line 23, bottom at line 285+
@@ -1603,7 +1707,9 @@ fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> 
         // 23` is a reasonable cross-standard default that matches
         // the PAL convention; consumers needing exact first-line
         // values for a specific standard read them via
-        // `vprp_field_descs` and substitute their own.
+        // `vprp_field_descs` and substitute their own (round-10 C2
+        // adds [`VprpConfig::with_field_descs`] for muxers that want
+        // standard-correct first-line offsets).
         for field_index in 0..nb_field_per_frame.min(2) {
             let video_y_valid_start_line = if field_index == 0 {
                 23u32

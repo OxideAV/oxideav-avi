@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`xxtx` text/subtitle chunk recognition (round 10 C1).** Mirror of
+  round 8 C3 (`xxpc` palette-change handling) for the text-stream
+  FourCC family per `mmsystem.h`'s `ckidAVITextSF`. `xxtx` chunks are
+  skipped from the regular packet stream the same way `xxpc` chunks
+  are; the demuxer counts them per stream via both the static idx1
+  scan and the runtime `next_packet` walk and surfaces the count via
+  `avi:text_chunk.<n>` metadata + the new typed
+  `AviDemuxer::text_chunk_count(stream_index) -> u32` accessor. Same
+  shape as `palette_change_count`, including zero-suppression of the
+  metadata key when no `xxtx` chunks were seen.
+- **`VprpConfig::with_field_descs([..])` muxer override (round 10 C2).**
+  Round 9 C1 always synthesised the trailing `VIDEO_FIELD_DESC[]`
+  records from frame dimensions + a hard-coded PAL-flavoured
+  `half_height + 23` second-line. That's wrong for NTSC (line 285)
+  and any other broadcast standard with non-PAL first-line
+  conventions. Round 10 lets callers supply each field's eight DWORDs
+  verbatim via the new `VprpFieldDescOverride` struct so a re-mux
+  doesn't lie about the signal-domain offsets. The override only
+  takes effect when the supplied `Vec` covers every active field
+  (`>= nb_field_per_frame.max(1)`) — a shorter Vec falls through to
+  the synthesised default so a partial override doesn't silently
+  truncate the array. `VprpConfig` switches from `Copy` to `Clone` to
+  carry the `Vec`.
+- **`AvihFlags` typed accessor for `AVIMAINHEADER.dwFlags` (round 10 C3).**
+  `AviDemuxer::avih_flags() -> AvihFlags` decodes each documented
+  `AVIF_*` bit per Microsoft's `vfw.h` (`AVIF_HASINDEX` /
+  `AVIF_MUSTUSEINDEX` / `AVIF_ISINTERLEAVED` / `AVIF_TRUSTCKTYPE` /
+  `AVIF_WASCAPTUREFILE` / `AVIF_COPYRIGHTED`) into per-bit `bool`s,
+  with the raw u32 retained on the struct so callers wanting to
+  inspect undocumented vendor-extension bits don't lose information.
+  Same source as the existing `avi:flags` hex-string metadata key but
+  in typed form so callers can branch on individual bits without
+  string parsing.
 - **`vprp` per-field `VIDEO_FIELD_DESC[]` round-trip (round 9 C1).**
   Round 8 only surfaced the 9 fixed DWORDs of the OpenDML 2.0 §5.0
   Video Properties Header and dropped the trailing

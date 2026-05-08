@@ -421,9 +421,19 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
     // see `aviriff.h`'s `cktypePALchange = "PC"`). idx1 is the
     // canonical static list of every chunk in movi so this is the
     // cheapest place to count them — no second movi pass.
+    //
+    // Round-10 candidate 1: same trick for `xxtx` text/subtitle
+    // chunks (FourCC ending in `tx` — `mmsystem.h`'s text-stream
+    // FourCC family `ckidAVITextSF`). They're not video data so the
+    // packet stream still skips them, but we expose a per-stream
+    // count both via metadata (`avi:text_chunk.<n>`) and a typed
+    // [`AviDemuxer::text_chunk_count`] accessor for parallel use
+    // with [`AviDemuxer::palette_change_count`].
     let mut palette_change_counts: Vec<u32> = vec![0u32; streams.len()];
+    let mut text_chunk_counts: Vec<u32> = vec![0u32; streams.len()];
     let idx_table = if let Some(raw) = idx1_raw {
-        scan_idx1_for_palette_changes(&raw, &streams, &mut palette_change_counts);
+        scan_idx1_for_suffix(&raw, &streams, *b"pc", &mut palette_change_counts);
+        scan_idx1_for_suffix(&raw, &streams, *b"tx", &mut text_chunk_counts);
         build_idx_table(&mut *input, &raw, movi_start, &streams)?
     } else {
         Vec::new()
@@ -434,6 +444,12 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
     for (s, &count) in palette_change_counts.iter().enumerate() {
         if count > 0 {
             metadata.push((format!("avi:palette_change.{s}"), count.to_string()));
+        }
+    }
+    // Round-10 C1: same shape for `xxtx` text/subtitle chunks.
+    for (s, &count) in text_chunk_counts.iter().enumerate() {
+        if count > 0 {
+            metadata.push((format!("avi:text_chunk.{s}"), count.to_string()));
         }
     }
 
@@ -611,6 +627,8 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
         std_indexes,
         idx1_flags_per_stream,
         palette_change_counts,
+        text_chunk_counts,
+        avih_flags: avih.as_ref().map(|h| h.flags).unwrap_or(0),
         vprps,
         dmlh_total_frames,
     })
@@ -1613,19 +1631,21 @@ fn is_unexpected_eof(e: &Error) -> bool {
 /// `file_start + offset` and `movi_start - 4 + offset` (the "- 4" puts us
 /// at the `movi` FourCC byte) and picking whichever yields the matching
 /// `ckid`. Default to movi-relative if the file is too small to probe.
-/// Scan raw idx1 bytes for `xxpc` palette-change chunks per stream
-/// (round-8 candidate 3).
+/// Scan raw idx1 bytes for chunks whose ckid ends with the given
+/// 2-byte suffix and bump per-stream counts (round-8 C3 / round-10 C1).
 ///
 /// Each idx1 entry is a 16-byte `AVIINDEXENTRY`: ckid(4) + flags(4) +
-/// offset(4) + size(4). We treat any ckid whose final two bytes are
-/// `b"pc"` (per `aviriff.h`'s `cktypePALchange = "PC"`) as a
-/// palette-change chunk and bump the per-stream count. The first two
-/// bytes of ckid are ASCII digits encoding the stream index.
+/// offset(4) + size(4). We treat any ckid whose final two bytes match
+/// `suffix` (e.g. `b"pc"` per `aviriff.h`'s `cktypePALchange = "PC"`,
+/// or `b"tx"` for text/subtitle chunks per `mmsystem.h`'s text-stream
+/// FourCC family) as belonging to that family and bump the per-stream
+/// count. The first two bytes of ckid are ASCII digits encoding the
+/// stream index.
 ///
 /// Counts beyond `u32::MAX - 1` saturate; that's a single-frame
-/// palette-update file with ~4G palette changes per stream, well
-/// outside any real-world capture pattern.
-fn scan_idx1_for_palette_changes(raw: &[u8], streams: &[StreamInfo], counts: &mut [u32]) {
+/// chunk-soup file with ~4G of one suffix per stream, well outside
+/// any real-world capture pattern.
+fn scan_idx1_for_suffix(raw: &[u8], streams: &[StreamInfo], suffix: [u8; 2], counts: &mut [u32]) {
     if raw.len() < 16 || counts.len() < streams.len() {
         return;
     }
@@ -1633,8 +1653,7 @@ fn scan_idx1_for_palette_changes(raw: &[u8], streams: &[StreamInfo], counts: &mu
     for i in 0..n {
         let base = i * 16;
         let ckid = [raw[base], raw[base + 1], raw[base + 2], raw[base + 3]];
-        // Match suffix `pc` per VfW palette-change FourCC convention.
-        if ckid[2] != b'p' || ckid[3] != b'c' {
+        if ckid[2] != suffix[0] || ckid[3] != suffix[1] {
             continue;
         }
         if let Some(stream) = parse_stream_index(&ckid) {
@@ -1833,6 +1852,21 @@ pub struct AviDemuxer {
     /// downstream consumers can detect that the file carries
     /// palette animation. Empty Vec means no `xxpc` was seen.
     palette_change_counts: Vec<u32>,
+    /// Per-stream `xxtx` text/subtitle chunk count (round-10
+    /// candidate 1). Mirror of [`Self::palette_change_counts`] for
+    /// the text-stream FourCC family per `mmsystem.h` —
+    /// `ckidAVITextSF`. Like palette-change chunks, text chunks are
+    /// not video data and are excluded from the regular packet
+    /// stream; the count surfaces via `avi:text_chunk.<stream>`
+    /// metadata and the [`AviDemuxer::text_chunk_count`] accessor.
+    text_chunk_counts: Vec<u32>,
+    /// Raw `dwFlags` from `AVIMAINHEADER` (round-10 candidate 3).
+    /// Retained on the demuxer struct so [`AviDemuxer::avih_flags`]
+    /// can return a typed [`AvihFlags`] decode without re-parsing
+    /// the metadata Vec's hex string. Zero when no `avih` chunk was
+    /// seen — typed-flag accessors then return their `false` /
+    /// "no flag set" defaults.
+    avih_flags: u32,
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -1867,6 +1901,77 @@ pub struct KeyframeSeekResult {
     /// stream ticks worth of frames a caller must walk past after the
     /// seek to reach the originally-requested PTS.
     pub gop_distance: i64,
+}
+
+/// `AVIF_HASINDEX` per Microsoft's `vfw.h` — the file has an `idx1`.
+pub const AVIF_HASINDEX: u32 = 0x0000_0010;
+/// `AVIF_MUSTUSEINDEX` per `vfw.h` — players must use the index to
+/// determine the order of the presentation, not the order of chunks
+/// in `movi`.
+pub const AVIF_MUSTUSEINDEX: u32 = 0x0000_0020;
+/// `AVIF_ISINTERLEAVED` per `vfw.h` — file is interleaved (audio +
+/// video chunks alternate within `movi`).
+pub const AVIF_ISINTERLEAVED: u32 = 0x0000_0100;
+/// `AVIF_TRUSTCKTYPE` per `vfw.h` — players can trust the keyframe
+/// flag in the per-chunk index entries.
+pub const AVIF_TRUSTCKTYPE: u32 = 0x0000_0800;
+/// `AVIF_WASCAPTUREFILE` per `vfw.h` — file was created by a capture
+/// application (specially allocated for streaming-capture write).
+pub const AVIF_WASCAPTUREFILE: u32 = 0x0001_0000;
+/// `AVIF_COPYRIGHTED` per `vfw.h` — file contains copyrighted data.
+pub const AVIF_COPYRIGHTED: u32 = 0x0002_0000;
+
+/// Typed decode of `AVIMAINHEADER.dwFlags` (round-10 candidate 3).
+///
+/// Each documented `AVIF_*` bit per Microsoft's `vfw.h` (see this
+/// crate's `AVIF_HASINDEX` / `AVIF_MUSTUSEINDEX` / `AVIF_ISINTERLEAVED`
+/// / `AVIF_TRUSTCKTYPE` / `AVIF_WASCAPTUREFILE` / `AVIF_COPYRIGHTED`
+/// constants) decodes to its own `bool`. The raw `bits` field carries
+/// the original DWORD so callers wanting to inspect undocumented or
+/// vendor-extension bits don't lose information.
+///
+/// Returned by [`AviDemuxer::avih_flags`]; same source as the
+/// `avi:flags` hex-string metadata key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AvihFlags {
+    /// File has an `idx1` chunk. Set to true by every conformant
+    /// AVI 1.0 writer that emits an idx1; absent in OpenDML-only
+    /// files that only carry `ix##` standard indexes.
+    pub has_index: bool,
+    /// Index *must* drive playback order (chunks in `movi` aren't
+    /// guaranteed to be in presentation order). Rare; usually paired
+    /// with `has_index`.
+    pub must_use_index: bool,
+    /// Streams are interleaved. The conventional flag any writer
+    /// targeting general-purpose AVI players should set.
+    pub is_interleaved: bool,
+    /// Keyframe bits in idx1 entries can be trusted (no decoder-side
+    /// re-derivation needed).
+    pub trust_ck_type: bool,
+    /// File was specially allocated for capture; some players
+    /// optimise read-ahead based on this hint.
+    pub was_capture_file: bool,
+    /// File is marked copyrighted.
+    pub copyrighted: bool,
+    /// Raw `dwFlags` DWORD as parsed from `avih`. Non-zero bits
+    /// outside the documented set are vendor-extension / future-spec
+    /// bits and are exposed verbatim.
+    pub bits: u32,
+}
+
+impl AvihFlags {
+    /// Decode a raw `dwFlags` u32 into a structured [`AvihFlags`].
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            has_index: bits & AVIF_HASINDEX != 0,
+            must_use_index: bits & AVIF_MUSTUSEINDEX != 0,
+            is_interleaved: bits & AVIF_ISINTERLEAVED != 0,
+            trust_ck_type: bits & AVIF_TRUSTCKTYPE != 0,
+            was_capture_file: bits & AVIF_WASCAPTUREFILE != 0,
+            copyrighted: bits & AVIF_COPYRIGHTED != 0,
+            bits,
+        }
+    }
 }
 
 /// Decoded `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
@@ -2118,6 +2223,24 @@ impl Demuxer for AviDemuxer {
                         }
                         self.palette_change_counts[s] =
                             self.palette_change_counts[s].saturating_add(1);
+                        skip_chunk(&mut *self.input, &hdr)?;
+                        continue;
+                    }
+                    // Round-10 C1: explicitly recognise `xxtx`
+                    // text/subtitle chunks per `mmsystem.h`'s
+                    // text-stream FourCC family. Same handling shape
+                    // as `xxpc` — skip from the packet stream, bump
+                    // the per-stream counter so the metadata key
+                    // `avi:text_chunk.<stream>` and the typed
+                    // [`AviDemuxer::text_chunk_count`] accessor stay
+                    // in sync with what the static idx1 scan
+                    // produced for files that have an idx1.
+                    if suffix == *b"tx" {
+                        let s = idx as usize;
+                        if self.text_chunk_counts.len() <= s {
+                            self.text_chunk_counts.resize(s + 1, 0);
+                        }
+                        self.text_chunk_counts[s] = self.text_chunk_counts[s].saturating_add(1);
                         skip_chunk(&mut *self.input, &hdr)?;
                         continue;
                     }
@@ -2387,6 +2510,39 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Per-stream count of `xxtx` text/subtitle chunks (round-10
+    /// candidate 1).
+    ///
+    /// Text chunks (`NNtx` per `mmsystem.h`'s text-stream FourCC
+    /// family) carry caption / subtitle / cuepoint payloads attached
+    /// to a stream. Like palette-change chunks they're skipped from
+    /// the regular packet stream; this accessor mirrors
+    /// [`Self::palette_change_count`] for the text family. Same data
+    /// also surfaces under `avi:text_chunk.<stream>` metadata.
+    ///
+    /// Returns `0` when no `xxtx` chunks were seen for that stream
+    /// or `stream_index` is out of range.
+    pub fn text_chunk_count(&self, stream_index: u32) -> u32 {
+        self.text_chunk_counts
+            .get(stream_index as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Typed [`AvihFlags`] decode of `AVIMAINHEADER.dwFlags` (round-10
+    /// candidate 3).
+    ///
+    /// Returns the per-bit booleans for the documented `AVIF_*`
+    /// flags from Microsoft's `vfw.h`:
+    /// `AVIF_HASINDEX` / `AVIF_MUSTUSEINDEX` / `AVIF_ISINTERLEAVED` /
+    /// `AVIF_TRUSTCKTYPE` / `AVIF_WASCAPTUREFILE` / `AVIF_COPYRIGHTED`
+    /// plus the raw u32 `bits` for callers wanting to inspect
+    /// undocumented vendor-extension bits. Same data also surfaces as
+    /// the `avi:flags` hex-string metadata key.
+    pub fn avih_flags(&self) -> AvihFlags {
+        AvihFlags::from_bits(self.avih_flags)
     }
 
     /// Per-packet idx1 flags accessor (round-6 candidate 1).
