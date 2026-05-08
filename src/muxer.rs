@@ -38,6 +38,24 @@ use crate::riff::{
     begin_list, finish_chunk, write_chunk, write_chunk_header, AVI_FORM, LIST, RIFF,
 };
 
+/// `AVIIF_KEYFRAME` per vfw.h — set on idx1 entries that point at a
+/// self-contained keyframe.
+pub const AVIIF_KEYFRAME: u32 = 0x0000_0010;
+
+/// `AVIIF_FIRSTPART` per vfw.h — set on idx1 entries that contain the
+/// first part of a multi-part frame. Round-6 candidate 1: the AVI
+/// muxer sets `AVIIF_FIRSTPART | AVIIF_LASTPART` (= 0x60) on every
+/// idx1 entry for a 2-field interlaced stream, so readers walking
+/// idx1 alone can detect the 2-field carriage even without an `ix##`
+/// AVISTDINDEX. Both bits together mean "this entry is the only
+/// part of the frame", which is exactly how the muxer carries
+/// 2-field video (one packet per frame, fields concatenated).
+pub const AVIIF_FIRSTPART: u32 = 0x0000_0020;
+
+/// `AVIIF_LASTPART` per vfw.h — set on idx1 entries that contain the
+/// last part of a multi-part frame. See [`AVIIF_FIRSTPART`].
+pub const AVIIF_LASTPART: u32 = 0x0000_0040;
+
 /// Per-RIFF-segment byte ceiling for [`AviKind::OpenDml`] output.
 ///
 /// AVI 1.0 conventionally caps each RIFF at 1 GiB to leave headroom
@@ -119,6 +137,24 @@ pub struct AviMuxOptions {
     /// [`AviMuxer::set_field2_offset`] before each `write_packet`
     /// for an interlaced stream.
     pub field2_streams: Vec<u32>,
+    /// Optional override for the OpenDML super-index slot reservation
+    /// (round-6 candidate 3). `None` keeps the default
+    /// [`OPENDML_SUPER_INDEX_DEFAULT_CAPACITY`] (256 slots = 4 KiB
+    /// payload, indexing up to 256 GiB at 1 GiB/segment). `Some(n)`
+    /// raises the reserve to `n` slots so very long files can index
+    /// every continuation. Clamped to a minimum of 16 slots; values
+    /// below that fall back to the default.
+    pub super_index_capacity: Option<usize>,
+    /// Optional `LIST INFO` metadata payload (round-6 candidate 2).
+    /// Each entry is `(chunk_id, value)` where `chunk_id` is a
+    /// 4-byte `INFO` sub-chunk FourCC such as `*b"INAM"` (title),
+    /// `*b"IART"` (artist), `*b"ICMT"` (comment), `*b"ICRD"` (date),
+    /// `*b"IPRD"` (album), `*b"ICOP"` (copyright), `*b"ISFT"`
+    /// (encoder), etc. The muxer NUL-terminates each value and
+    /// emits a top-level `LIST INFO` chunk between `LIST hdrl` and
+    /// `LIST movi` per the AVI 1.0 spec's `INFO` sibling layout.
+    /// Empty list = no `LIST INFO` is written.
+    pub info_entries: Vec<([u8; 4], String)>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -252,6 +288,36 @@ impl AviMuxOptions {
     pub fn with_field2_stream(mut self, stream_index: u32) -> Self {
         if !self.field2_streams.contains(&stream_index) {
             self.field2_streams.push(stream_index);
+        }
+        self
+    }
+
+    /// Builder helper: raise the OpenDML super-index slot reserve
+    /// past the default 256 slots (round-6 candidate 3). Values
+    /// below the [`OPENDML_SUPER_INDEX_MIN_CAPACITY`] floor are
+    /// dropped (the default 256 stays in effect). Only meaningful
+    /// for [`AviKind::OpenDml`]; ignored for `AviKind::Avi10`.
+    pub fn with_super_index_capacity(mut self, n: usize) -> Self {
+        self.super_index_capacity = if n >= OPENDML_SUPER_INDEX_MIN_CAPACITY {
+            Some(n)
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Builder helper: append a single `LIST INFO` sub-chunk
+    /// `(id, value)` (round-6 candidate 2). `id` is a 4-byte
+    /// `INFO` FourCC (e.g. `*b"INAM"` for title) per the AVI 1.0
+    /// spec's `LIST INFO` registry. `value` is stored verbatim and
+    /// NUL-terminated on the wire. Calling the builder multiple
+    /// times with the same `id` appends both — `LIST INFO`'s
+    /// shape is a flat list, not a map. An empty `value` skips
+    /// the entry.
+    pub fn with_info(mut self, id: [u8; 4], value: impl Into<String>) -> Self {
+        let v = value.into();
+        if !v.is_empty() {
+            self.info_entries.push((id, v));
         }
         self
     }
@@ -505,14 +571,23 @@ pub struct AviMuxer {
     trailer_written: bool,
 }
 
-/// Reserved slots in the OpenDML `indx` super-index. 256 slots is
-/// 4 KiB of payload and lets a 1-GiB-segment OpenDML file index up
-/// to 256 GiB, which covers everything users need without forcing
-/// up-front segment-count knowledge. Files with more than 256
-/// segments still mux correctly — the trailing entries simply don't
-/// land in the super-index (the demuxer falls back to walking
-/// `RIFF AVIX` continuations).
-const OPENDML_SUPER_INDEX_CAPACITY: usize = 256;
+/// Default reserved slots in the OpenDML `indx` super-index. 256
+/// slots is 4 KiB of payload and lets a 1-GiB-segment OpenDML file
+/// index up to 256 GiB, which covers everything users need without
+/// forcing up-front segment-count knowledge. Files with more than
+/// the configured capacity still mux correctly — the trailing
+/// entries simply don't land in the super-index (the demuxer falls
+/// back to walking `RIFF AVIX` continuations).
+///
+/// To raise the reserve past the default, see
+/// [`AviMuxOptions::with_super_index_capacity`] (round-6 candidate
+/// 3). Round-4 / round-5 fixtures and tests assume this default.
+pub const OPENDML_SUPER_INDEX_DEFAULT_CAPACITY: usize = 256;
+
+/// Floor for [`AviMuxOptions::with_super_index_capacity`]. Below
+/// this the default applies. 16 slots = 256 B payload, which is a
+/// reasonable lower bound for tiny OpenDML test fixtures.
+pub const OPENDML_SUPER_INDEX_MIN_CAPACITY: usize = 16;
 
 impl Muxer for AviMuxer {
     fn format_name(&self) -> &str {
@@ -539,6 +614,11 @@ impl Muxer for AviMuxer {
                                    // `bIndexSubType = AVI_INDEX_2FIELD` per OpenDML 2.0 §3.0.
         let indx_is_2field = want_indx && self.options.field2_streams.contains(&0);
         self.indx_for_2field = indx_is_2field;
+        let indx_capacity = self
+            .options
+            .super_index_capacity
+            .filter(|n| *n >= OPENDML_SUPER_INDEX_MIN_CAPACITY)
+            .unwrap_or(OPENDML_SUPER_INDEX_DEFAULT_CAPACITY);
         for (i, t) in self.tracks.iter().enumerate() {
             let with_indx = want_indx && i == 0;
             let with_vprp = want_vprp && &t.entry.strh_type == b"vids";
@@ -557,11 +637,12 @@ impl Muxer for AviMuxer {
                 with_vprp,
                 vprp_override,
                 indx_2field_here,
+                indx_capacity,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
                 self.indx_entries_start_off = indx_entries_off;
-                self.indx_entries_capacity = OPENDML_SUPER_INDEX_CAPACITY;
+                self.indx_entries_capacity = indx_capacity;
             }
         }
         // OpenDML 2.0 §5.0 "Source and Header Information Storage":
@@ -578,6 +659,25 @@ impl Muxer for AviMuxer {
             // dmlh body length is even (4) so no pad byte required.
             self.dmlh_total_frames_off = Some(dmlh_off);
             finish_chunk(self.output.as_mut(), odml_size_off)?;
+        }
+        // Round-6 candidate 2: emit `LIST INFO` inside `hdrl` when
+        // the caller registered any [`AviMuxOptions::with_info`]
+        // entries. Placed after the strls (and after `LIST odml`
+        // when present) so strl offsets stay stable for
+        // `patch_post_counts`. Each child is a 4-CC chunk whose
+        // payload is a NUL-terminated string per the AVI 1.0
+        // `LIST INFO` registry — see `parse_info_list` in the
+        // demuxer.
+        if !self.options.info_entries.is_empty() {
+            let info_size_off = begin_list(self.output.as_mut(), &LIST, b"INFO")?;
+            for (id, value) in &self.options.info_entries {
+                // NUL-terminate per the AVI 1.0 `LIST INFO` convention
+                // and pad odd lengths with the implicit RIFF pad byte.
+                let mut body = value.as_bytes().to_vec();
+                body.push(0);
+                write_chunk(self.output.as_mut(), id, &body)?;
+            }
+            finish_chunk(self.output.as_mut(), info_size_off)?;
         }
         finish_chunk(self.output.as_mut(), hdrl_size_off)?;
 
@@ -670,17 +770,33 @@ impl Muxer for AviMuxer {
         let chunk_off = self.output.stream_position()?;
         let rel_off_opt = chunk_off.checked_sub(self.movi_start_off);
         let size = packet.data.len() as u32;
-        let flags = if packet.flags.keyframe {
-            0x10 // AVIIF_KEYFRAME
-        } else {
-            0
-        };
 
         // Round-4 P1/P3: consume any pending field-2 offset signalled
         // by `set_field2_offset`. Always consume so a stray hook on a
         // non-2-field stream can't leak onto the next packet.
         let pending_field2 = self.pending_field2_offset.take();
         let stream_is_2field = self.options.field2_streams.contains(&(idx as u32));
+
+        // idx1 flags. Per vfw.h `AVIIF_*`:
+        //   AVIIF_KEYFRAME  = 0x0010
+        //   AVIIF_FIRSTPART = 0x0020
+        //   AVIIF_LASTPART  = 0x0040
+        // Round-6 candidate 1: 2-field streams carry one chunk per
+        // frame containing both fields back-to-back, i.e. the chunk
+        // is BOTH the first and the last part of the frame. Setting
+        // both bits (= 0x60) lets readers walking idx1 alone (no
+        // ix## available) detect 2-field carriage from the index
+        // entry's flags rather than parsing the OpenDML
+        // super-index. The bits are additive with AVIIF_KEYFRAME
+        // when the packet is a keyframe.
+        let mut flags = if packet.flags.keyframe {
+            AVIIF_KEYFRAME
+        } else {
+            0
+        };
+        if stream_is_2field {
+            flags |= AVIIF_FIRSTPART | AVIIF_LASTPART;
+        }
 
         // Stamp an `AVISTDINDEX_ENTRY`-shaped record for this packet
         // before the chunk is actually written: `dw_offset` is from the
@@ -903,7 +1019,7 @@ impl AviMuxer {
         // = 88.  However for the OpenDML envelope the first stream's
         // strl ALSO contains an indx chunk after strf, so the second
         // stream's strl starts an extra
-        //   (8 + 24 + 16*OPENDML_SUPER_INDEX_CAPACITY) bytes later.
+        //   (8 + 24 + 16*indx_entries_capacity) bytes later.
         let mut strl_off: u64 = 88;
         let opendml = matches!(self.kind, AviKind::OpenDml(_));
         for (i, t) in self.tracks.iter().enumerate() {
@@ -931,7 +1047,7 @@ impl AviMuxer {
             let strf_padded = t.entry.strf.len() + (t.entry.strf.len() & 1);
             let mut strl_body = 4 + 64 + 8 + strf_padded;
             if opendml && i == 0 {
-                let indx_payload = 24 + 16 * OPENDML_SUPER_INDEX_CAPACITY;
+                let indx_payload = 24 + 16 * self.indx_entries_capacity;
                 let indx_padded = indx_payload + (indx_payload & 1);
                 strl_body += 8 + indx_padded;
             }
@@ -1126,8 +1242,11 @@ impl AviMuxer {
     }
 
     /// Number of OpenDML segments that overflowed the
-    /// `OPENDML_SUPER_INDEX_CAPACITY` (256) reserve in the `indx`
-    /// super-index (round-5 candidate 4).
+    /// configured super-index reserve (round-5 candidate 4).
+    /// Default reserve is
+    /// [`OPENDML_SUPER_INDEX_DEFAULT_CAPACITY`] (256); callers may
+    /// raise it via [`AviMuxOptions::with_super_index_capacity`]
+    /// (round-6 candidate 3).
     ///
     /// Returns `0` when every segment lands in the super-index, or
     /// when `kind` is `AviKind::Avi10` (the legacy envelope has no
@@ -1240,6 +1359,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     with_vprp: bool,
     vprp_override: Option<VprpConfig>,
     indx_2field: bool,
+    indx_capacity: usize,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -1285,11 +1405,11 @@ fn write_strl<W: Write + Seek + ?Sized>(
         //   DWORD nEntriesInUse   (back-patched)
         //   DWORD dwChunkId       (e.g. b"00dc")
         //   DWORD dwReserved[3]
-        //   <16-byte entries> × OPENDML_SUPER_INDEX_CAPACITY
+        //   <16-byte entries> × indx_capacity
         // Entries are zero-initialised so a partial back-patch leaves
         // a clean tail of zeros that demuxers tolerate.
         let chunk_id = packet_fourcc_for(0, t.entry.chunk_suffix);
-        let entries_bytes = OPENDML_SUPER_INDEX_CAPACITY * 16;
+        let entries_bytes = indx_capacity * 16;
         let payload_len = 24 + entries_bytes;
         // Write chunk header by hand so we can compute file offsets.
         write_chunk_header(w, b"indx", payload_len as u32)?;

@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **2-field idx1 entry-flag emission (round 6 C1).** The muxer now
+  stamps `AVIIF_FIRSTPART | AVIIF_LASTPART` (= 0x60 per vfw.h) on
+  every idx1 entry for streams registered via
+  `AviMuxOptions::with_field2_stream`, in addition to the existing
+  `AVIIF_KEYFRAME` bit. Demuxer adds
+  `AviDemuxer::idx1_flags_for_packet(stream, pkt_seq) -> Option<u32>`
+  surfacing the raw flags per entry, plus an `avi:idx1.<n>.is_2field`
+  hint derived from the bits alone so AVI-1.0-only readers (no
+  `ix##` super-index) can detect 2-field carriage from idx1 alone.
+  Public flag constants `AVIIF_KEYFRAME` / `AVIIF_FIRSTPART` /
+  `AVIIF_LASTPART` re-exported from `muxer`.
+- **`LIST INFO` muxer-side emit (round 6 C2).** New
+  `AviMuxOptions::with_info(id: [u8; 4], value: impl Into<String>)`
+  builder accumulates `(FourCC, value)` pairs (e.g. `*b"INAM"` ->
+  title, `*b"IART"` -> artist, `*b"IPRD"` -> album, `*b"ICMT"` ->
+  comment, `*b"ICRD"` -> date, `*b"ISFT"` -> encoder). On
+  `write_header`, a `LIST INFO` chunk is emitted inside `hdrl`
+  carrying NUL-terminated values per the AVI 1.0 spec. Demuxer's
+  `parse_hdrl` recurses into the nested `LIST INFO` so both
+  hdrl-nested and top-level placements round-trip via
+  `Demuxer::metadata()` under the standard key names.
+- **OpenDML super-index capacity opt-in (round 6 C3).** New
+  `AviMuxOptions::with_super_index_capacity(n)` builder raises the
+  reserved `indx` slot count past the default 256. Public
+  constants `OPENDML_SUPER_INDEX_DEFAULT_CAPACITY` (256) and
+  `OPENDML_SUPER_INDEX_MIN_CAPACITY` (16) document the bounds.
+  Files muxed with a raised capacity round-trip through the
+  unmodified demuxer (zero-padded tail entries are skipped on
+  parse). Per-segment fidelity scales linearly: 1024 slots = 1 TiB
+  at 1 GiB / segment.
 - **2-field-aware per-packet accessor (round 5 C1).** New
   `AviDemuxer::field2_offset_for_packet(stream, pkt_id) -> Option<u32>`
   surfaces the per-packet `dwOffsetField2` directly, parallel to

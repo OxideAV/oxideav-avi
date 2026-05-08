@@ -454,6 +454,39 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
         }
     }
 
+    // Round-6 candidate 1: detect 2-field carriage from the idx1
+    // flag bits themselves. The muxer sets
+    // `AVIIF_FIRSTPART | AVIIF_LASTPART` (= 0x60) on every idx1
+    // entry for a 2-field stream so AVI-1.0-only readers (no ix##
+    // available) can still detect interlaced carriage by looking
+    // at the index alone. We surface the per-stream hint when
+    // EVERY idx1 entry for that stream carries both bits — a
+    // partial pattern would indicate genuine multi-part-frame
+    // carriage (very rare; legacy capture cards) rather than
+    // 2-field interlace.
+    if !idx_table.is_empty() {
+        const PART_BOTH: u32 = 0x0020 | 0x0040; // AVIIF_FIRSTPART | AVIIF_LASTPART
+        for s in 0..(streams.len() as u32) {
+            // Skip streams that already produced an `avi:idx1.<n>.is_2field`
+            // hint via the ix##-driven path above.
+            if field2_streams_seen.contains(&s) {
+                continue;
+            }
+            let mut entries = 0usize;
+            let mut all_part_both = true;
+            for e in idx_table.iter().filter(|e| e.stream == s) {
+                entries += 1;
+                if (e.flags & PART_BOTH) != PART_BOTH {
+                    all_part_both = false;
+                    break;
+                }
+            }
+            if entries > 0 && all_part_both {
+                metadata.push((format!("avi:idx1.{s}.is_2field"), "true".into()));
+            }
+        }
+    }
+
     // Pad super_indexes to streams.len() so per-stream lookup is always
     // safe even if some strl LISTs didn't declare an indx.
     while super_indexes.len() < streams.len() {
@@ -518,7 +551,7 @@ fn walk_riff_body(
             let body_end = (body_start + body_len as u64).min(end).min(file_len);
             match &list_type {
                 b"hdrl" if is_primary => {
-                    let (main, stream_infos, suffixes, sxs, vps, dmlh) =
+                    let (main, stream_infos, suffixes, sxs, vps, dmlh, info_md) =
                         parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
@@ -526,6 +559,7 @@ fn walk_riff_body(
                     *super_indexes = sxs;
                     *vprps = vps;
                     *dmlh_total_frames = dmlh;
+                    metadata.extend(info_md);
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -695,9 +729,11 @@ fn parse_avih(buf: &[u8]) -> Result<AviMainHeader> {
 /// matching list of packet-chunk suffixes (e.g. `b"dc"`, `b"wb"`),
 /// the OpenDML 2.0 super-index per stream (empty for streams that
 /// don't declare an `indx` chunk in their `strl`), the per-stream
-/// [`VprpHeader`] (empty for streams without a `vprp` chunk), and
-/// the optional `dmlh` extended-header `dwTotalFrames` value
-/// (`Some` only when `LIST odml dmlh` was present).
+/// [`VprpHeader`] (empty for streams without a `vprp` chunk), the
+/// optional `dmlh` extended-header `dwTotalFrames` value (`Some`
+/// only when `LIST odml dmlh` was present), and the metadata pairs
+/// parsed from any hdrl-nested `LIST INFO` (round-6 candidate 2;
+/// empty when no nested `LIST INFO` is present).
 type HdrlOutput = (
     AviMainHeader,
     Vec<StreamInfo>,
@@ -705,6 +741,7 @@ type HdrlOutput = (
     Vec<SuperIndex>,
     Vec<VprpHeader>,
     Option<u32>,
+    Vec<(String, String)>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -726,6 +763,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut super_indexes: Vec<SuperIndex> = Vec::new();
     let mut vprps: Vec<VprpHeader> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
+    let mut info_metadata: Vec<(String, String)> = Vec::new();
 
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
@@ -758,6 +796,18 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                     // RIFF segment (whereas `avih.dwTotalFrames` only
                     // reflects the primary segment per spec/06 §5.0).
                     dmlh_total_frames = parse_odml_list(r, body_end)?;
+                } else if &list_type == b"INFO" {
+                    // Round-6 candidate 2: AVI 1.0 spec permits
+                    // `LIST INFO` either as a top-level RIFF child or
+                    // as a child of `hdrl`. The top-level placement is
+                    // already handled in `walk_riff_body`; this branch
+                    // covers the hdrl-nested form (which the round-6
+                    // muxer emits to keep INFO close to the per-stream
+                    // metadata it documents).
+                    let avail = body_end.saturating_sub(body_start) as usize;
+                    let mut buf = vec![0u8; avail];
+                    let _ = read_up_to(r, &mut buf)?;
+                    parse_info_list(&buf, &mut info_metadata);
                 }
                 r.seek(SeekFrom::Start(body_end))?;
                 skip_pad(r, hdr.size)?;
@@ -774,6 +824,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         super_indexes,
         vprps,
         dmlh_total_frames,
+        info_metadata,
     ))
 }
 
@@ -1941,6 +1992,27 @@ impl AviDemuxer {
     ///
     /// Returns `None` for non-2-field streams, out-of-range
     /// `packet_seq`, or unknown `stream_index`.
+    /// Per-packet idx1 flags accessor (round-6 candidate 1).
+    ///
+    /// Returns `Some(flags)` for the `packet_seq`-th idx1 entry (zero-
+    /// based, in idx1 file order) belonging to `stream_index`, or
+    /// `None` for an out-of-range index or unknown stream. Flags
+    /// follow vfw.h conventions: `AVIIF_KEYFRAME` (0x10),
+    /// `AVIIF_FIRSTPART` (0x20), `AVIIF_LASTPART` (0x40). The muxer
+    /// sets `AVIIF_FIRSTPART | AVIIF_LASTPART` (0x60) on every idx1
+    /// entry for a 2-field interlaced stream, so a reader that only
+    /// has idx1 (no `ix##`) can still detect 2-field carriage by
+    /// checking these bits.
+    pub fn idx1_flags_for_packet(&self, stream_index: u32, packet_seq: usize) -> Option<u32> {
+        // Walk idx_table in file order, filtering on `stream_index`,
+        // and pick the `packet_seq`-th match.
+        self.idx_table
+            .iter()
+            .filter(|e| e.stream == stream_index)
+            .nth(packet_seq)
+            .map(|e| e.flags)
+    }
+
     pub fn field2_offset_for_packet(&self, stream_index: u32, packet_seq: usize) -> Option<u32> {
         // Walk std_indexes in file order and pick the per-stream
         // `packet_seq`-th entry whose parent index carries
