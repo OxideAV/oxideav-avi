@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mid-`movi` `ix##` index emit (round 7 C1).** New
+  `AviMuxOptions::with_mid_movi_index(stream_index, packets_per_flush)`
+  builder enables periodic inline standard-index flushes for the
+  named stream while the `movi` LIST is still open. Per OpenDML 2.0
+  §"Index Locations in RIFF File", inline `ix##` chunks (e.g. `02ix`
+  for stream 2) are spec-blessed for streams whose consumers
+  benefit from sub-segment random-access (timecode, sparse
+  subtitles). When the stream's pending entry count hits the
+  cadence the muxer flushes a single-stream `ix##` chunk inside
+  `movi` (closing any open `LIST rec ` cluster first so the chunk
+  lands at the body level). Entries flushed inline are removed from
+  the per-track buffer so the segment-tail `flush_ix_chunks` only
+  emits the residual tail. `packets_per_flush == 0` clears any
+  prior cadence; only meaningful for `AviKind::OpenDml`. The
+  demuxer's `scan_ix_in_movi` already walks `movi` segments for
+  `ix##` chunks regardless of position, so inline indexes round-trip
+  unchanged.
+- **Multi-value INFO parsing — unknown FourCCs (round 7 C2).**
+  `parse_info_list` now surfaces `LIST INFO` sub-chunks whose
+  FourCC isn't in the well-known map under `avi:info.<fourcc>`
+  rather than dropping them. Mirrors the `avi:tag_<hex>` fallback
+  for unrecognised codec tags. Callers wanting full INFO fidelity
+  (e.g. video editors round-tripping capture-card metadata) can now
+  read every entry via `Demuxer::metadata()`. Duplicate FourCCs
+  (spec-legal — `LIST INFO` is a flat list, not a map) surface as
+  multiple ordered metadata entries with the same key.
 - **2-field idx1 entry-flag emission (round 6 C1).** The muxer now
   stamps `AVIIF_FIRSTPART | AVIIF_LASTPART` (= 0x60 per vfw.h) on
   every idx1 entry for streams registered via

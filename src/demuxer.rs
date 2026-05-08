@@ -640,7 +640,10 @@ fn read_up_to<R: std::io::Read + ?Sized>(r: &mut R, buf: &mut [u8]) -> Result<us
 
 /// Parse a `LIST INFO` body (the 4-byte "INFO" form-type has already been
 /// consumed). Each child is a 4-CC chunk whose payload is a NUL-terminated
-/// string. Maps to standard metadata keys.
+/// string. Maps known FourCCs to standard metadata keys; round-7 candidate
+/// 2 surfaces every other FourCC under `avi:info.<fourcc>` so callers
+/// wanting full fidelity (no metadata loss) can still read entries the
+/// well-known map doesn't recognise.
 fn parse_info_list(buf: &[u8], out: &mut Vec<(String, String)>) {
     let mut i = 0usize;
     while i + 8 <= buf.len() {
@@ -653,10 +656,28 @@ fn parse_info_list(buf: &[u8], out: &mut Vec<(String, String)>) {
         let raw = &buf[i..i + size];
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         let value = String::from_utf8_lossy(&raw[..end]).trim().to_string();
-        let key = info_id_to_key(&id);
         if !value.is_empty() {
-            if let Some(k) = key {
-                out.push((k.to_string(), value));
+            match info_id_to_key(&id) {
+                Some(k) => out.push((k.to_string(), value)),
+                None => {
+                    // Round-7 candidate 2: surface unknown FourCCs
+                    // under `avi:info.<fourcc>` rather than dropping
+                    // them silently. The FourCC is preserved verbatim
+                    // when it's printable ASCII; otherwise we encode
+                    // the raw bytes as `tag_<hex>` so the key stays
+                    // legal UTF-8 (mirrors the demuxer's
+                    // `avi:tag_<hex>` fallback for unrecognised
+                    // codec tags).
+                    let key = if id.iter().all(|b| b.is_ascii_graphic()) {
+                        format!("avi:info.{}", std::str::from_utf8(&id).unwrap_or("____"))
+                    } else {
+                        format!(
+                            "avi:info.tag_{:02x}{:02x}{:02x}{:02x}",
+                            id[0], id[1], id[2], id[3]
+                        )
+                    };
+                    out.push((key, value));
+                }
             }
         }
         i += size;

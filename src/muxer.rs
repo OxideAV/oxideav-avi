@@ -155,6 +155,23 @@ pub struct AviMuxOptions {
     /// `LIST movi` per the AVI 1.0 spec's `INFO` sibling layout.
     /// Empty list = no `LIST INFO` is written.
     pub info_entries: Vec<([u8; 4], String)>,
+    /// Per-stream mid-`movi` `ix##` index emit (round-7 candidate 1).
+    /// Each entry is `(stream_index, packets_per_flush)`: when the
+    /// stream's accumulated `ix_entries` count reaches
+    /// `packets_per_flush`, the muxer flushes an inline `ix##` chunk
+    /// (e.g. `02ix` for stream 2) right after the current packet,
+    /// inside the open `movi` LIST. Per OpenDML 2.0 §"Index Locations
+    /// in RIFF File": "the corresponding index chunks are marked with
+    /// 'ix##' in the 'movi' data" — the spec's RIFFWALK example shows
+    /// a timecode stream's `02ix` mid-`movi` rather than only at
+    /// segment tail. Entries already flushed inline are cleared from
+    /// the per-track buffer, so the remaining tail (if any) still
+    /// flushes via [`AviMuxer::flush_ix_chunks`] at segment close.
+    /// `packets_per_flush` < 1 disables the periodic flush
+    /// (entries land at segment close like every other stream).
+    /// Only meaningful for [`AviKind::OpenDml`]; ignored for
+    /// `AviKind::Avi10`.
+    pub mid_movi_index_streams: Vec<(u32, u32)>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -318,6 +335,29 @@ impl AviMuxOptions {
         let v = value.into();
         if !v.is_empty() {
             self.info_entries.push((id, v));
+        }
+        self
+    }
+
+    /// Builder helper: enable mid-`movi` `ix##` index emit for
+    /// `stream_index` (round-7 candidate 1). The muxer flushes an
+    /// inline standard-index chunk (`ix##`) every `packets_per_flush`
+    /// packets while writing into the open `movi` LIST, in addition
+    /// to the segment-tail flush. Per OpenDML 2.0 §"Index Locations
+    /// in RIFF File", inline `ix##` chunks are spec-blessed for
+    /// timecode streams and any stream where consumers benefit from
+    /// scrubbing the index without first walking to the segment end.
+    /// `packets_per_flush == 0` disables the periodic flush;
+    /// `packets_per_flush == 1` flushes after every packet (one entry
+    /// per `ix##`, i.e. an inline index per chunk). Calling the
+    /// builder twice for the same `stream_index` replaces the prior
+    /// cadence. Only meaningful for [`AviKind::OpenDml`].
+    pub fn with_mid_movi_index(mut self, stream_index: u32, packets_per_flush: u32) -> Self {
+        self.mid_movi_index_streams
+            .retain(|(i, _)| *i != stream_index);
+        if packets_per_flush > 0 {
+            self.mid_movi_index_streams
+                .push((stream_index, packets_per_flush));
         }
         self
     }
@@ -888,6 +928,43 @@ impl Muxer for AviMuxer {
             }
         }
 
+        // Round-7 candidate 1: mid-`movi` `ix##` periodic flush. When
+        // the current stream is registered via
+        // [`AviMuxOptions::with_mid_movi_index`] and the per-stream
+        // pending entry count has reached the configured cadence,
+        // emit an inline standard-index chunk right here (still
+        // inside the open `movi` LIST). Per OpenDML 2.0 §"Index
+        // Locations in RIFF File", inline `ix##` chunks are blessed
+        // for streams whose consumers benefit from sub-segment
+        // random access (timecode, sparse subtitles, ...). The
+        // entries flushed inline are removed from the per-track
+        // buffer so the segment-tail [`Self::flush_ix_chunks`] only
+        // emits the residual tail (or nothing, if the cadence
+        // divides the stream cleanly).
+        if matches!(self.kind, AviKind::OpenDml(_)) {
+            let cadence = self
+                .options
+                .mid_movi_index_streams
+                .iter()
+                .find(|(i, _)| *i == idx as u32)
+                .map(|(_, n)| *n);
+            if let Some(n) = cadence {
+                if n > 0 && self.tracks[idx].ix_entries.len() as u32 >= n {
+                    // If a `LIST rec ` cluster is open, close it first
+                    // so the `ix##` chunk lands at the `movi` body
+                    // level rather than nested inside the cluster.
+                    // The next `write_packet` will open a fresh
+                    // cluster on demand (the existing
+                    // `rec_open_size_off.is_none()` check fires
+                    // naturally).
+                    if self.rec_open_size_off.is_some() {
+                        self.close_rec_cluster()?;
+                    }
+                    self.flush_ix_for_track(idx)?;
+                }
+            }
+        }
+
         // Enforce the 2 GiB ceiling for AVI 1.0 mode only — OpenDML
         // can grow arbitrarily large because it segments.
         if matches!(self.kind, AviKind::Avi10) {
@@ -1134,55 +1211,59 @@ impl AviMuxer {
     /// segment's movi LIST, which matches what the demuxer's
     /// `parse_ix_chunk` uses as the base for `dw_offset` resolution.
     fn flush_ix_chunks(&mut self) -> Result<()> {
-        let qw_base = self.movi_start_off + 4;
-        // Take ownership so we can mutate per-track state and then
-        // borrow `self.output` mutably alongside.
-        let ix_entries_per_track: Vec<Vec<IxStdEntry>> = self
-            .tracks
-            .iter_mut()
-            .map(|t| std::mem::take(&mut t.ix_entries))
-            .collect();
-        for (track_idx, entries) in ix_entries_per_track.iter().enumerate() {
-            if entries.is_empty() {
-                continue;
-            }
-            let stream_is_2field = self.options.field2_streams.contains(&(track_idx as u32));
-            // FourCC is "ix" + the two-ASCII-decimal-digit stream index
-            // — per OpenDML 2.0 §"Index Locations": "the corresponding
-            // index chunks are marked with 'ix##' in the 'movi' data."
-            let stream_digits = packet_fourcc_for(track_idx as u32, *b"xx");
-            let ix_id = [b'i', b'x', stream_digits[0], stream_digits[1]];
-            // wLongsPerEntry: 2 = default 8-B entries; 3 = AVI Field
-            // Index Chunk (round-4 P1) with 12-B entries that carry
-            // dwOffsetField2 per OpenDML 2.0 §3.0.
-            let (w_longs, sub_type, entry_size) = if stream_is_2field {
-                (3u16, 0x01u8, 12usize)
-            } else {
-                (2u16, 0u8, 8usize)
-            };
-            let mut payload = Vec::with_capacity(32 + entries.len() * entry_size);
-            payload.extend_from_slice(&w_longs.to_le_bytes());
-            payload.push(sub_type);
-            // bIndexType = AVI_INDEX_OF_CHUNKS (0x01).
-            payload.push(0x01);
-            // nEntriesInUse.
-            payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-            // dwChunkId.
-            payload.extend_from_slice(&self.tracks[track_idx].packet_fourcc);
-            // qwBaseOffset.
-            payload.extend_from_slice(&qw_base.to_le_bytes());
-            // dwReserved3.
-            payload.extend_from_slice(&0u32.to_le_bytes());
-            // Entries.
-            for e in entries.iter() {
-                payload.extend_from_slice(&e.dw_offset.to_le_bytes());
-                payload.extend_from_slice(&e.dw_size_with_flag.to_le_bytes());
-                if stream_is_2field {
-                    payload.extend_from_slice(&e.dw_offset_field2.to_le_bytes());
-                }
-            }
-            write_chunk(self.output.as_mut(), &ix_id, &payload)?;
+        for track_idx in 0..self.tracks.len() {
+            self.flush_ix_for_track(track_idx)?;
         }
+        Ok(())
+    }
+
+    /// Flush the accumulated `ix_entries` for a single track as one
+    /// `ix##` AVISTDINDEX chunk, then clear them. Shared by
+    /// [`Self::flush_ix_chunks`] (segment-tail flush) and the round-7
+    /// mid-`movi` periodic flush. No-op if the track has no pending
+    /// entries.
+    fn flush_ix_for_track(&mut self, track_idx: usize) -> Result<()> {
+        if self.tracks[track_idx].ix_entries.is_empty() {
+            return Ok(());
+        }
+        let qw_base = self.movi_start_off + 4;
+        let entries = std::mem::take(&mut self.tracks[track_idx].ix_entries);
+        let stream_is_2field = self.options.field2_streams.contains(&(track_idx as u32));
+        // FourCC is "ix" + the two-ASCII-decimal-digit stream index
+        // — per OpenDML 2.0 §"Index Locations": "the corresponding
+        // index chunks are marked with 'ix##' in the 'movi' data."
+        let stream_digits = packet_fourcc_for(track_idx as u32, *b"xx");
+        let ix_id = [b'i', b'x', stream_digits[0], stream_digits[1]];
+        // wLongsPerEntry: 2 = default 8-B entries; 3 = AVI Field
+        // Index Chunk (round-4 P1) with 12-B entries that carry
+        // dwOffsetField2 per OpenDML 2.0 §3.0.
+        let (w_longs, sub_type, entry_size) = if stream_is_2field {
+            (3u16, 0x01u8, 12usize)
+        } else {
+            (2u16, 0u8, 8usize)
+        };
+        let mut payload = Vec::with_capacity(32 + entries.len() * entry_size);
+        payload.extend_from_slice(&w_longs.to_le_bytes());
+        payload.push(sub_type);
+        // bIndexType = AVI_INDEX_OF_CHUNKS (0x01).
+        payload.push(0x01);
+        // nEntriesInUse.
+        payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        // dwChunkId.
+        payload.extend_from_slice(&self.tracks[track_idx].packet_fourcc);
+        // qwBaseOffset.
+        payload.extend_from_slice(&qw_base.to_le_bytes());
+        // dwReserved3.
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        // Entries.
+        for e in entries.iter() {
+            payload.extend_from_slice(&e.dw_offset.to_le_bytes());
+            payload.extend_from_slice(&e.dw_size_with_flag.to_le_bytes());
+            if stream_is_2field {
+                payload.extend_from_slice(&e.dw_offset_field2.to_le_bytes());
+            }
+        }
+        write_chunk(self.output.as_mut(), &ix_id, &payload)?;
         Ok(())
     }
 
