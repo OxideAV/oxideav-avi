@@ -344,11 +344,27 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
+    //
+    // Round-8 candidate 3: while we have raw idx1 in hand, also scan
+    // it for `xxpc` palette-change chunks (FourCC ending in `pc` —
+    // see `aviriff.h`'s `cktypePALchange = "PC"`). idx1 is the
+    // canonical static list of every chunk in movi so this is the
+    // cheapest place to count them — no second movi pass.
+    let mut palette_change_counts: Vec<u32> = vec![0u32; streams.len()];
     let idx_table = if let Some(raw) = idx1_raw {
+        scan_idx1_for_palette_changes(&raw, &streams, &mut palette_change_counts);
         build_idx_table(&mut *input, &raw, movi_start, &streams)?
     } else {
         Vec::new()
     };
+    // Surface non-zero palette-change counts as metadata so callers
+    // walking `Demuxer::metadata()` can detect palette animation
+    // without calling the typed accessor.
+    for (s, &count) in palette_change_counts.iter().enumerate() {
+        if count > 0 {
+            metadata.push((format!("avi:palette_change.{s}"), count.to_string()));
+        }
+    }
 
     // OpenDML 2.0 standard-index scan: walk every `movi` segment looking
     // for `ix##` chunks. Each maps back to one stream via the two ASCII
@@ -493,6 +509,19 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
         super_indexes.push(SuperIndex::default());
     }
 
+    // Round-8 candidate 1: pre-compute the per-stream idx1-flags
+    // lookup table once so [`AviDemuxer::idx1_flags_for_packet`] is
+    // O(1) instead of O(N). idx_table is in file order so a single
+    // pass populates each stream's per-packet flags Vec in
+    // packet_seq order.
+    let mut idx1_flags_per_stream: Vec<Vec<u32>> = vec![Vec::new(); streams.len()];
+    for e in &idx_table {
+        let s = e.stream as usize;
+        if s < idx1_flags_per_stream.len() {
+            idx1_flags_per_stream[s].push(e.flags);
+        }
+    }
+
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
@@ -509,6 +538,8 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
         idx_table,
         super_indexes,
         std_indexes,
+        idx1_flags_per_stream,
+        palette_change_counts,
     })
 }
 
@@ -1483,6 +1514,39 @@ fn is_unexpected_eof(e: &Error) -> bool {
 /// `file_start + offset` and `movi_start - 4 + offset` (the "- 4" puts us
 /// at the `movi` FourCC byte) and picking whichever yields the matching
 /// `ckid`. Default to movi-relative if the file is too small to probe.
+/// Scan raw idx1 bytes for `xxpc` palette-change chunks per stream
+/// (round-8 candidate 3).
+///
+/// Each idx1 entry is a 16-byte `AVIINDEXENTRY`: ckid(4) + flags(4) +
+/// offset(4) + size(4). We treat any ckid whose final two bytes are
+/// `b"pc"` (per `aviriff.h`'s `cktypePALchange = "PC"`) as a
+/// palette-change chunk and bump the per-stream count. The first two
+/// bytes of ckid are ASCII digits encoding the stream index.
+///
+/// Counts beyond `u32::MAX - 1` saturate; that's a single-frame
+/// palette-update file with ~4G palette changes per stream, well
+/// outside any real-world capture pattern.
+fn scan_idx1_for_palette_changes(raw: &[u8], streams: &[StreamInfo], counts: &mut [u32]) {
+    if raw.len() < 16 || counts.len() < streams.len() {
+        return;
+    }
+    let n = raw.len() / 16;
+    for i in 0..n {
+        let base = i * 16;
+        let ckid = [raw[base], raw[base + 1], raw[base + 2], raw[base + 3]];
+        // Match suffix `pc` per VfW palette-change FourCC convention.
+        if ckid[2] != b'p' || ckid[3] != b'c' {
+            continue;
+        }
+        if let Some(stream) = parse_stream_index(&ckid) {
+            let s = stream as usize;
+            if s < counts.len() && s < streams.len() {
+                counts[s] = counts[s].saturating_add(1);
+            }
+        }
+    }
+}
+
 fn build_idx_table<R: ReadSeek + ?Sized>(
     r: &mut R,
     raw: &[u8],
@@ -1647,6 +1711,29 @@ pub struct AviDemuxer {
     /// present. Combined with `super_indexes` to drive seek for
     /// OpenDML files with no `idx1`.
     std_indexes: Vec<StdIndex>,
+    /// Per-stream idx1-flags lookup table (round-8 candidate 1).
+    ///
+    /// Built once at `open()` from `idx_table`: outer index is
+    /// `stream_index`, inner index is the per-stream `packet_seq`
+    /// (zero-based file-order ordinal). Replaces the prior
+    /// O(N)-per-call linear scan in
+    /// [`AviDemuxer::idx1_flags_for_packet`] with an O(1) lookup so
+    /// callers walking every packet (e.g. extracting a per-frame
+    /// keyframe map) don't pay quadratic time. Empty when no `idx1`
+    /// was parsed.
+    idx1_flags_per_stream: Vec<Vec<u32>>,
+    /// Per-stream `xxpc` palette-change packet count (round-8 candidate 3).
+    ///
+    /// VfW palette-change chunks (`NNpc` per `aviriff.h` —
+    /// `cktypePALchange = "PC"`) carry `BITMAPINFO`-style palette
+    /// updates that retroactively rewrite the indexed-colour palette
+    /// for subsequent video chunks. They're separate from regular
+    /// video data chunks (`NNdc`/`NNdb`), so the demuxer skips them
+    /// from the packet stream but counts them per stream and surfaces
+    /// the count via `avi:palette_change.<stream>` metadata so
+    /// downstream consumers can detect that the file carries
+    /// palette animation. Empty Vec means no `xxpc` was seen.
+    palette_change_counts: Vec<u32>,
 }
 
 /// Decoded `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
@@ -1837,7 +1924,26 @@ impl Demuxer for AviDemuxer {
                 if (idx as usize) < self.streams.len() {
                     let expected = self.packet_chunk_suffix[idx as usize];
                     let suffix = [hdr.id[2], hdr.id[3]];
-                    // Accept expected suffix; skip "pc" (palette change) and others.
+                    // Round-8 candidate 3: explicitly recognise `xxpc`
+                    // VfW palette-change chunks. They're not regular
+                    // video data so we still skip them from the packet
+                    // stream, but we bump the per-stream counter
+                    // (lazily — the static idx1 scan in `open()`
+                    // already covers files with idx1; this catches
+                    // idx1-less files where the runtime walk is the
+                    // only path that sees these chunks). The cap
+                    // doubles as a guard against malformed files
+                    // declaring billions of palette changes.
+                    if suffix == *b"pc" {
+                        let s = idx as usize;
+                        if self.palette_change_counts.len() <= s {
+                            self.palette_change_counts.resize(s + 1, 0);
+                        }
+                        self.palette_change_counts[s] =
+                            self.palette_change_counts[s].saturating_add(1);
+                        skip_chunk(&mut *self.input, &hdr)?;
+                        continue;
+                    }
                     let accept = suffix == expected
                         || suffix == *b"dc"
                         || suffix == *b"db"
@@ -2013,6 +2119,99 @@ impl AviDemuxer {
     ///
     /// Returns `None` for non-2-field streams, out-of-range
     /// `packet_seq`, or unknown `stream_index`.
+    /// `LIST INFO` round-trip read accessor (round-8 candidate 2).
+    ///
+    /// Returns the FIRST string value associated with the `LIST INFO`
+    /// FourCC `id` (e.g. `*b"INAM"` for title, `*b"IART"` for artist),
+    /// or `None` when no matching entry was parsed. Mirrors the lookup
+    /// shape of [`AviMuxOptions::with_info`] so a muxer→demuxer
+    /// round-trip can verify INFO entries written via the builder API
+    /// without re-parsing the raw `metadata()` slice.
+    ///
+    /// Both well-known FourCCs (mapped to canonical keys like
+    /// `"title"`, `"artist"`, etc — see `info_id_to_key`) and unknown
+    /// FourCCs (surfaced as `"avi:info.<fourcc>"`) are matched
+    /// transparently. Use [`AviDemuxer::info_all_for`] to enumerate
+    /// every value when a FourCC appears multiple times (the
+    /// `LIST INFO` registry permits duplicates and our parser
+    /// preserves order).
+    pub fn info_for(&self, id: [u8; 4]) -> Option<&str> {
+        let canonical = info_id_to_key(&id);
+        let avi_namespaced = if id.iter().all(|b| b.is_ascii_graphic()) {
+            std::str::from_utf8(&id)
+                .ok()
+                .map(|s| format!("avi:info.{s}"))
+        } else {
+            Some(format!(
+                "avi:info.tag_{:02x}{:02x}{:02x}{:02x}",
+                id[0], id[1], id[2], id[3]
+            ))
+        };
+        for (k, v) in &self.metadata {
+            if let Some(canon) = canonical {
+                if k == canon {
+                    return Some(v.as_str());
+                }
+            }
+            if let Some(ns) = avi_namespaced.as_deref() {
+                if k == ns {
+                    return Some(v.as_str());
+                }
+            }
+        }
+        None
+    }
+
+    /// `LIST INFO` round-trip read accessor for repeating FourCCs
+    /// (round-8 candidate 2). The `LIST INFO` registry is a flat
+    /// list, so a single `id` may appear multiple times (e.g. two
+    /// `IART` entries for "Artist 1" / "Artist 2"). This accessor
+    /// returns ALL values in file order; the empty Vec means no
+    /// matching entry was parsed.
+    pub fn info_all_for(&self, id: [u8; 4]) -> Vec<&str> {
+        let canonical = info_id_to_key(&id);
+        let avi_namespaced = if id.iter().all(|b| b.is_ascii_graphic()) {
+            std::str::from_utf8(&id)
+                .ok()
+                .map(|s| format!("avi:info.{s}"))
+        } else {
+            Some(format!(
+                "avi:info.tag_{:02x}{:02x}{:02x}{:02x}",
+                id[0], id[1], id[2], id[3]
+            ))
+        };
+        let mut out: Vec<&str> = Vec::new();
+        for (k, v) in &self.metadata {
+            let matches_canonical = canonical.is_some_and(|c| k == c);
+            let matches_ns = avi_namespaced.as_deref().is_some_and(|ns| k == ns);
+            if matches_canonical || matches_ns {
+                out.push(v.as_str());
+            }
+        }
+        out
+    }
+
+    /// Per-stream count of `xxpc` palette-change chunks seen during
+    /// the `movi` walk (round-8 candidate 3).
+    ///
+    /// VfW palette-change chunks (`NNpc` per `aviriff.h`'s
+    /// `cktypePALchange` constant) carry retroactive `BITMAPINFO`-
+    /// style palette updates for indexed-colour video streams. The
+    /// demuxer skips them from the regular packet stream (they're
+    /// not video data per se) but counts them per stream. A non-zero
+    /// count indicates the file carries palette animation. The same
+    /// data also surfaces under the `avi:palette_change.<stream>`
+    /// metadata key.
+    ///
+    /// Returns `0` when no `xxpc` chunks were seen for that stream
+    /// or `stream_index` is out of range.
+    pub fn palette_change_count(&self, stream_index: u32) -> u32 {
+        self.palette_change_counts
+            .get(stream_index as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Per-packet idx1 flags accessor (round-6 candidate 1).
     ///
     /// Returns `Some(flags)` for the `packet_seq`-th idx1 entry (zero-
@@ -2025,13 +2224,14 @@ impl AviDemuxer {
     /// has idx1 (no `ix##`) can still detect 2-field carriage by
     /// checking these bits.
     pub fn idx1_flags_for_packet(&self, stream_index: u32, packet_seq: usize) -> Option<u32> {
-        // Walk idx_table in file order, filtering on `stream_index`,
-        // and pick the `packet_seq`-th match.
-        self.idx_table
-            .iter()
-            .filter(|e| e.stream == stream_index)
-            .nth(packet_seq)
-            .map(|e| e.flags)
+        // Round-8 candidate 1: O(1) lookup via the pre-computed
+        // per-stream flags table. The legacy O(N) walk over
+        // `idx_table` is gone; the cache is built once at `open()`
+        // (see `idx1_flags_per_stream`).
+        self.idx1_flags_per_stream
+            .get(stream_index as usize)?
+            .get(packet_seq)
+            .copied()
     }
 
     pub fn field2_offset_for_packet(&self, stream_index: u32, packet_seq: usize) -> Option<u32> {

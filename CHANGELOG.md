@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`AviDemuxer::info_for(id)` / `info_all_for(id)` (round 8 C2).**
+  Public `LIST INFO` round-trip read accessors keyed by 4-byte
+  FourCC. `info_for(*b"INAM")` returns the first value the muxer
+  wrote via `with_info` regardless of whether it landed under a
+  canonical key (`"title"`) or the namespaced fallback
+  (`"avi:info.<fourcc>"`); `info_all_for` returns every value in
+  file order for FourCCs that occur multiple times (`LIST INFO` is
+  a flat list, not a map). Closes the muxer→demuxer round-trip gap
+  for the round-7 `with_info` builder so callers can verify INFO
+  metadata without re-parsing `metadata()`.
+- **`xxpc` palette-change recognition (round 8 C3).** The demuxer
+  now explicitly counts VfW `NNpc` palette-change chunks per stream
+  (per `aviriff.h`'s `cktypePALchange = "PC"`) instead of silently
+  skipping them. Two paths feed the counter: a fast static scan of
+  raw idx1 at `open()` time (covers AVI 1.0 files with idx1) and a
+  runtime increment in `next_packet` for files lacking an index.
+  New `AviDemuxer::palette_change_count(stream) -> u32` accessor +
+  `avi:palette_change.<stream>` metadata key (omitted when zero,
+  to keep the namespace tidy). Palette-change chunks are still
+  excluded from the regular packet stream — they're not video data.
+
+### Changed
+
+- **`idx1_flags_for_packet` is now O(1).** The round-6 accessor
+  previously walked the entire `idx_table` linearly per call,
+  giving callers walking every packet O(N²) cost. `open()` now
+  builds a per-stream `Vec<Vec<u32>>` lookup table once, indexed
+  by `(stream_index, packet_seq)`. Behaviour identical to the
+  prior implementation; only the access cost changes.
+
 - **Mid-`movi` `ix##` index emit (round 7 C1).** New
   `AviMuxOptions::with_mid_movi_index(stream_index, packets_per_flush)`
   builder enables periodic inline standard-index flushes for the
