@@ -22,8 +22,9 @@ oxideav-avi = "0.0"
 |--------------------------------------------------|:-----:|:----:|
 | RIFF/AVI 1.0 (hdrl/strl/movi/idx1)               | yes   | yes  |
 | Multi-stream (video + audio + ...)               | yes   | yes  |
-| `LIST INFO` metadata (title/artist/album/...)    | yes (known FourCCs + `avi:info.<fourcc>` for unknowns; nested-in-hdrl + sibling-of-hdrl placements) | yes (`AviMuxOptions::with_info` + `with_top_level_info` for sibling layout) |
+| `LIST INFO` metadata (title/artist/album/...)    | yes (known FourCCs + `avi:info.<fourcc>` for unknowns; nested-in-hdrl + sibling-of-hdrl placements; `info_for` / `info_all_for` byte-keyed + `all_info_for` string-keyed accessors) | yes (`AviMuxOptions::with_info` + `with_top_level_info` for sibling layout) |
 | Duration from `avih` (microseconds-per-frame)    | yes   | n/a  |
+| `avih.dwFlags` (`AVIF_*` bits)                   | yes (typed `avih_flags()` decode + raw `avi:flags` metadata) | yes (`AviMuxOptions::with_avih_flags` / `with_avih_flag_bit`) |
 | `idx1` legacy index — parse for keyframe seek    | yes   | yes  |
 | `idx1` offsets — file-absolute + movi-relative   | yes   | yes  |
 | `LIST rec ` packet grouping inside `movi`        | yes   | yes (packet-cap or byte-budget) |
@@ -38,8 +39,8 @@ oxideav-avi = "0.0"
 | OpenDML-driven seeking (`ix##` std-index)        | yes (no-idx1 fallback + explicit `seek_to_keyframe_strict_via_std_index` returning `KeyframeSeekResult`) | n/a |
 | Uncompressed `db` video chunks                   | yes   | yes  |
 | Variable stream interleave                       | yes   | yes  |
-| Palette-change (`xxpc`) chunks                   | skip + per-stream `palette_change_count(stream)` accessor + `avi:palette_change.<n>` metadata | yes (`AviMuxer::write_palette_change`) |
-| Text/subtitle (`xxtx`) chunks                    | skip + per-stream `text_chunk_count(stream)` accessor + `avi:text_chunk.<n>` metadata | yes (`AviMuxer::write_text_chunk`) |
+| Palette-change (`xxpc`) chunks                   | skip + per-stream `palette_change_count(stream)` + `palette_change_data(stream)` body accessors + `avi:palette_change.<n>` metadata | yes (`AviMuxer::write_palette_change`) |
+| Text/subtitle (`xxtx`) chunks                    | skip + per-stream `text_chunk_count(stream)` + `text_chunk_data(stream)` body accessors + `avi:text_chunk.<n>` metadata | yes (`AviMuxer::write_text_chunk`) |
 | Truncated-head tolerance (capture-card crash dumps) | yes | n/a |
 
 OpenDML 2.0 muxing is opt-in via `muxer::open_with_kind` with an
