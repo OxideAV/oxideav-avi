@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Strict idx1↔ix## cross-validator (round 18 C3).** New
+  `oxideav_avi::demuxer::open_avi_strict(read, codecs)` entry point:
+  when both an `idx1` table (AVI 1.0 §3.4) and per-segment `ix##`
+  standard indexes (OpenDML 2.0) are present and they disagree on a
+  packet's `(file-offset, payload-size)`, fails fast with
+  `Error::InvalidData` carrying `"idx1↔ix## offset divergence at
+  seq=N on stream <s>: idx1=offset_<a>_size_<sa>
+  ix##=offset_<b>_size_<sb>"` instead of the round-17 lenient
+  `avi:idx1.<n>.divergent_offsets` metadata key. Existing
+  `open_avi` (lenient) preserves the metadata-only behaviour;
+  `open_avi_lenient` still skips the round-14 audio sample-size
+  validator. Pairs with the canonical "OpenDML ix## is more
+  reliable than idx1" handoff for callers wanting fail-fast
+  (validate-then-ship pipelines, strict players refusing
+  recovered captures whose stale idx1 disagrees with reality).
+- **`Idx1Flags`-aware first-non-`AVIIF_NO_TIME` keyframe seek
+  (round 18 C4).** New
+  `AviDemuxer::seek_to_first_video_keyframe_after(stream, target)
+  -> Result<KeyframeSeekResult>` walks idx1 entries where BOTH
+  `is_keyframe` is set AND `is_no_time` is NOT set, picks the first
+  one with `pts >= target_pts`, and seeks the input there.
+  Returns the same [`KeyframeSeekResult`] shape as the existing
+  round-9 C4 `seek_to_keyframe_strict` so callers get
+  `(target_pts, landed_pts, gop_distance)` symmetric to the prior
+  helper. Falls back to the LAST non-NO_TIME keyframe when
+  nothing at-or-after target qualifies (caller asked past EOF).
+  Closes a seek-correctness gap where `seek_to_keyframe_strict`
+  could land the cursor on a `xxpc` palette-change /
+  `xxtx` text-subtitle / custom NO_TIME-tagged side-band
+  keyframe instead of a real video frame the decoder can decode
+  standalone — per Microsoft `vfw.h`, `AVIIF_NO_TIME` (0x0100) is
+  set on entries whose presentation is gated by the next "real"
+  video chunk's PTS rather than carrying their own time.
+- **Per-stream `dwMaxBytesPerSec` cap helper (round 18 C1).** New
+  `AviMuxOptions::with_per_stream_max_bytes_per_sec(stream_index,
+  bytes_per_sec)` builder + `AviMuxer::over_budget_streams() ->
+  &[(u32, u64, u32)]` accessor. After
+  [`oxideav_core::Muxer::write_trailer`] the muxer compares each
+  registered stream's observed `total_bytes * 1_000_000 /
+  duration_micros` against the configured per-track cap and
+  surfaces every breach as `(stream_idx, observed_bps, cap_bps)`.
+  Pair with `with_strict_per_stream_budget(true)` to promote the
+  first breach into a hard `Error::InvalidData` from
+  `write_trailer`. Closes the per-track-budget hole left by the
+  round-14 file-wide `with_max_bytes_per_sec` builder: VBR streams
+  with strict per-track playback budgets (an AC-3 stream that
+  must stay under 384 kbit/s for a downstream hardware decoder; a
+  Motion-JPEG video stream stamped with a per-track recording
+  allowance) need to know which track exceeded its cap, not just
+  that the file-wide sum is too large. Builder calls for the same
+  `stream_index` replace the prior cap; `bytes_per_sec == 0`
+  removes any prior cap for that stream. Skipped silently when
+  the file's `duration_micros` is zero (no video stream / zero
+  per-frame timing — the muxer can't compute a meaningful
+  per-stream rate without it).
 - **Typed `Idx1Flags` decode + public `AVIIF_*` constants (round 17 C3).**
   New public newtype `oxideav_avi::demuxer::Idx1Flags { is_list,
   is_keyframe, is_first_part, is_last_part, is_no_time, bits }` plus

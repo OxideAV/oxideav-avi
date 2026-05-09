@@ -247,6 +247,40 @@ pub struct AviMuxOptions {
     /// [`AviKind::Avi10`] files this option is a no-op (Avi10 has
     /// no `ix##` chunks to walk).
     pub synthesise_idx1_from_ix: bool,
+    /// Per-stream `dwMaxBytesPerSec` cap (round-18 candidate 1). Each
+    /// `(stream_index, bytes_per_sec)` entry sets a per-track ceiling
+    /// the muxer compares against the observed
+    /// `total_bytes / file_duration_seconds` per stream at
+    /// `write_trailer` time. Streams not listed have no per-stream
+    /// cap (the file-wide [`Self::max_bytes_per_sec_override`] still
+    /// applies). The first entry per `stream_index` wins; later
+    /// builder calls for the same index replace the prior cap.
+    ///
+    /// Per AVI 1.0 §3.1 the file-wide `avih.dwMaxBytesPerSec` is the
+    /// approximate maximum data rate the FILE requires. For VBR
+    /// streams with strict per-track playback budgets (an AC-3
+    /// stream that must stay under 384 kbit/s for a downstream
+    /// hardware decoder; a Motion-JPEG video stream stamped with a
+    /// per-track recording allowance) the file-wide value is
+    /// insufficient — a player needs to know which track exceeded
+    /// its cap, not just that the sum is too large. The muxer
+    /// surfaces every breach via [`AviMuxer::over_budget_streams`]
+    /// (a `(stream_idx, observed_bps, cap)` triple) so callers can
+    /// log / display / re-encode the offending track. With
+    /// [`Self::strict_per_stream_budget`] set the breach instead
+    /// fails [`AviMuxer::write_trailer`] with [`Error::InvalidData`].
+    pub per_stream_max_bytes_per_sec: Vec<(u32, u32)>,
+    /// Promote per-stream budget breaches to a hard error in
+    /// [`AviMuxer::write_trailer`] (round-18 candidate 1). Default
+    /// `false` keeps the lenient behaviour:
+    /// [`AviMuxer::over_budget_streams`] surfaces the breaches as
+    /// metadata. `true` makes the trailer fail with
+    /// [`Error::InvalidData`] on the first breach (other breaches
+    /// still land in `over_budget_streams` so a caller catching the
+    /// error can still inspect the full set). Only meaningful when
+    /// at least one [`Self::per_stream_max_bytes_per_sec`] entry was
+    /// registered.
+    pub strict_per_stream_budget: bool,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -658,6 +692,47 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: set a per-stream `dwMaxBytesPerSec`-style cap
+    /// (round-18 candidate 1). `stream_index` is the 0-based stream
+    /// ordinal; `bytes_per_sec` is the ceiling
+    /// [`AviMuxer::write_trailer`] compares the stream's observed
+    /// `total_bytes / file_duration_seconds` against. Streams not
+    /// passed to this builder have no per-track cap (the file-wide
+    /// [`Self::with_max_bytes_per_sec`] still applies). Repeated
+    /// calls for the same `stream_index` replace the prior cap.
+    /// `bytes_per_sec == 0` removes any prior cap for that stream.
+    ///
+    /// On breach, the muxer surfaces every offending track via
+    /// [`AviMuxer::over_budget_streams`] (a `(stream_idx,
+    /// observed_bps, cap)` triple). Pair with
+    /// [`Self::with_strict_per_stream_budget`] to promote the breach
+    /// into a hard `write_trailer` error instead.
+    pub fn with_per_stream_max_bytes_per_sec(
+        mut self,
+        stream_index: u32,
+        bytes_per_sec: u32,
+    ) -> Self {
+        self.per_stream_max_bytes_per_sec
+            .retain(|(idx, _)| *idx != stream_index);
+        if bytes_per_sec > 0 {
+            self.per_stream_max_bytes_per_sec
+                .push((stream_index, bytes_per_sec));
+        }
+        self
+    }
+
+    /// Builder helper: promote per-stream budget breaches to a hard
+    /// `Error::InvalidData` in [`AviMuxer::write_trailer`] (round-18
+    /// candidate 1). Pass `true` to opt in; default is `false`
+    /// (lenient surfacing via [`AviMuxer::over_budget_streams`]).
+    /// Only meaningful when at least one
+    /// [`Self::with_per_stream_max_bytes_per_sec`] entry was
+    /// registered.
+    pub fn with_strict_per_stream_budget(mut self, on: bool) -> Self {
+        self.strict_per_stream_budget = on;
+        self
+    }
+
     /// Builder helper: rebuild `idx1` from the primary segment's
     /// `ix##` entries instead of from the running per-packet
     /// `IndexEntry` collection (round-16 candidate 1). See
@@ -865,6 +940,7 @@ pub fn open_avi(
         rec_bytes_in_cluster: 0,
         pending_field2_offset: None,
         primary_ix_snapshot: Vec::new(),
+        over_budget_streams: Vec::new(),
         header_written: false,
         trailer_written: false,
     })
@@ -970,6 +1046,17 @@ pub struct AviMuxer {
     /// the option is off (we don't pay the per-packet clone) or
     /// when the file is `AviKind::Avi10`.
     primary_ix_snapshot: Vec<PrimaryIxSnapshot>,
+    /// Per-stream `dwMaxBytesPerSec` cap breaches detected at
+    /// `write_trailer` time (round-18 candidate 1). Each entry is
+    /// `(stream_index, observed_bps, cap_bps)` where `observed_bps`
+    /// is the stream's `total_bytes * 1_000_000 / duration_micros`
+    /// and `cap_bps` is the value passed to
+    /// [`AviMuxOptions::with_per_stream_max_bytes_per_sec`].
+    /// Populated regardless of `strict_per_stream_budget`; the
+    /// strict flag only controls whether `write_trailer` ALSO
+    /// returns an error on the first breach. Surfaced via
+    /// [`AviMuxer::over_budget_streams`].
+    over_budget_streams: Vec<(u32, u64, u32)>,
     header_written: bool,
     trailer_written: bool,
 }
@@ -1436,6 +1523,31 @@ impl Muxer for AviMuxer {
         // segment's qwOffset / dwSize / dwDuration.
         if matches!(self.kind, AviKind::OpenDml(_)) {
             self.patch_super_index()?;
+        }
+
+        // Round-18 candidate 1: per-stream `dwMaxBytesPerSec` cap
+        // enforcement. Run AFTER `patch_post_counts` so the
+        // duration-derivation source of truth (the first video
+        // stream's micro_per_frame × packet_count) matches what we
+        // stamped into `avih.dwMaxBytesPerSec`. Only fires when the
+        // caller registered any
+        // [`AviMuxOptions::with_per_stream_max_bytes_per_sec`]
+        // entries; otherwise the per-track budget map is empty and
+        // the loop is a no-op. With
+        // `strict_per_stream_budget` set, the first breach fails the
+        // trailer with `Error::InvalidData` (other breaches still
+        // populate `over_budget_streams` so a caller catching the
+        // error can still inspect the full set).
+        if !self.options.per_stream_max_bytes_per_sec.is_empty() {
+            self.compute_per_stream_budget_breaches();
+            if self.options.strict_per_stream_budget {
+                if let Some(&(idx, observed, cap)) = self.over_budget_streams.first() {
+                    return Err(Error::invalid(format!(
+                        "AVI: stream {idx} exceeded per-stream dwMaxBytesPerSec cap: \
+                         observed={observed} cap={cap}"
+                    )));
+                }
+            }
         }
 
         self.output.flush()?;
@@ -2096,6 +2208,83 @@ impl AviMuxer {
         self.segments
             .len()
             .saturating_sub(self.indx_entries_capacity)
+    }
+
+    /// Per-stream `dwMaxBytesPerSec` cap breaches (round-18
+    /// candidate 1). Each entry is `(stream_index, observed_bps,
+    /// cap_bps)`:
+    /// - `stream_index` is the 0-based stream ordinal whose actual
+    ///   bytes-per-sec exceeded the cap registered via
+    ///   [`AviMuxOptions::with_per_stream_max_bytes_per_sec`],
+    /// - `observed_bps` is `total_bytes * 1_000_000 /
+    ///   duration_micros` for the stream (clamped to `u64::MAX`
+    ///   when duration is zero — see below),
+    /// - `cap_bps` is the value the caller registered.
+    ///
+    /// Empty when no caps were registered, when none of the
+    /// registered streams breached, or when the file's
+    /// `duration_micros` is zero (no usable per-frame timing — the
+    /// muxer can't compute a meaningful per-stream rate without it,
+    /// so it conservatively skips the comparison rather than
+    /// false-positive every track).
+    ///
+    /// Meaningful only after [`oxideav_core::Muxer::write_trailer`]
+    /// returns successfully OR returns
+    /// `Err(Error::InvalidData)` from
+    /// [`AviMuxOptions::with_strict_per_stream_budget`] — until
+    /// then the breach detection hasn't run.
+    pub fn over_budget_streams(&self) -> &[(u32, u64, u32)] {
+        &self.over_budget_streams
+    }
+
+    /// Compute every per-stream `dwMaxBytesPerSec` cap breach and
+    /// store the `(stream_index, observed_bps, cap_bps)` tuples in
+    /// `self.over_budget_streams`. Called from `write_trailer` after
+    /// `patch_post_counts` so the duration source matches what the
+    /// avih stamp uses.
+    fn compute_per_stream_budget_breaches(&mut self) {
+        self.over_budget_streams.clear();
+        // Same duration source as `patch_post_counts`'s
+        // `max_bytes_per_sec` computation: first video stream's
+        // micro_per_frame × packet_count. Audio-only files have no
+        // video stream and thus no per-frame timing — skip the
+        // per-stream budget check rather than emit false-positives
+        // (the avih populator's audio-only fallback uses
+        // `nAvgBytesPerSec` for the file-wide value, which doesn't
+        // give us a per-second timeline either).
+        let micro_per_frame: u64 = self
+            .tracks
+            .iter()
+            .find(|t| &t.entry.strh_type == b"vids")
+            .map(|t| {
+                let scale = t.entry.scale.max(1) as u64;
+                let rate = t.entry.rate.max(1) as u64;
+                1_000_000u64 * scale / rate
+            })
+            .unwrap_or(0);
+        let video_packet_count: u64 = self
+            .tracks
+            .iter()
+            .find(|t| &t.entry.strh_type == b"vids")
+            .map(|t| t.packet_count as u64)
+            .unwrap_or(0);
+        let micros: u64 = video_packet_count.saturating_mul(micro_per_frame);
+        if micros == 0 {
+            return;
+        }
+        for &(idx, cap) in &self.options.per_stream_max_bytes_per_sec {
+            let s = idx as usize;
+            let track = match self.tracks.get(s) {
+                Some(t) => t,
+                None => continue,
+            };
+            // observed_bps = total_bytes * 1_000_000 / micros.
+            let big = (track.total_bytes as u128) * 1_000_000u128;
+            let observed = (big / (micros as u128)).min(u64::MAX as u128) as u64;
+            if observed > cap as u64 {
+                self.over_budget_streams.push((idx, observed, cap));
+            }
+        }
     }
 
     /// Back-patch the OpenDML `indx` super-index entries with each

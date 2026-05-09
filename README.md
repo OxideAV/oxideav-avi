@@ -28,7 +28,7 @@ oxideav-avi = "0.0"
 | `idx1` legacy index — parse for keyframe seek    | yes   | yes  |
 | `idx1` offsets — file-absolute + movi-relative   | yes   | yes  |
 | `idx1` entry `dwFlags` (`AVIIF_*` bits)          | yes (typed `idx1_typed_flags_for_packet` decode + raw `idx1_flags_for_packet` + public `AVIIF_LIST` / `AVIIF_KEYFRAME` / `AVIIF_FIRSTPART` / `AVIIF_LASTPART` / `AVIIF_NO_TIME` / `AVIIF_COMPRESSOR` constants) | yes (`AVIIF_KEYFRAME` on every keyframe; `AVIIF_FIRSTPART | AVIIF_LASTPART` stamp on 2-field interlaced) |
-| `idx1` ↔ `ix##` cross-validator                  | yes (multi-segment OpenDML files surface `avi:idx1.<n>.divergent_offsets` when the two index views disagree on a packet's offset/size) | n/a |
+| `idx1` ↔ `ix##` cross-validator                  | yes (lenient: multi-segment OpenDML files surface `avi:idx1.<n>.divergent_offsets`; strict: `open_avi_strict` returns `Error::InvalidData`) | n/a |
 | `LIST rec ` packet grouping inside `movi`        | yes   | yes (packet-cap or byte-budget) |
 | OpenDML 2.0 multi-`RIFF AVIX` continuation       | yes   | yes  |
 | OpenDML 2.0 `indx` super-index in `strl`         | yes (parse) | yes (emit) |
@@ -40,6 +40,8 @@ oxideav-avi = "0.0"
 | OpenDML 2.0 super-index overflow signalling      | yes (`avi:indx.<n>.overflow_entries`) | yes (`AviMuxer::truncated_super_index_segments()`) |
 | VBR audio framing via `Packet.duration`          | n/a   | yes (drives `strh.dwLength` for non-PCM) |
 | OpenDML-driven seeking (`ix##` std-index)        | yes (no-idx1 fallback + explicit `seek_to_keyframe_strict_via_std_index` returning `KeyframeSeekResult`) | n/a |
+| Idx1Flags-aware non-`AVIIF_NO_TIME` keyframe seek | yes (`seek_to_first_video_keyframe_after` skips palette/text/data side-band entries that carry `AVIIF_NO_TIME`) | n/a |
+| Per-stream `dwMaxBytesPerSec` cap                | n/a   | yes (`AviMuxOptions::with_per_stream_max_bytes_per_sec` + `AviMuxer::over_budget_streams` + `with_strict_per_stream_budget` for hard `write_trailer` error) |
 | Uncompressed `db` video chunks                   | yes   | yes  |
 | Variable stream interleave                       | yes   | yes  |
 | Palette-change (`xxpc`) chunks                   | skip + per-stream `palette_change_count(stream)` + `palette_change_data(stream)` body accessors + `avi:palette_change.<n>` metadata | yes (`AviMuxer::write_palette_change`) |

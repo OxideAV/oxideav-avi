@@ -114,7 +114,9 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<
 /// A mismatch surfaces as [`Error::Validation`]. Use [`open_avi_lenient`]
 /// to skip this check (e.g. when re-muxing a malformed legacy file).
 pub fn open_avi(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<AviDemuxer> {
-    open_avi_inner(input, codecs, /* lenient */ false)
+    open_avi_inner(
+        input, codecs, /* lenient */ false, /* strict_cross_validate */ false,
+    )
 }
 
 /// Open an AVI demuxer skipping the round-14 C2 audio sample-size
@@ -126,13 +128,38 @@ pub fn open_avi_lenient(
     input: Box<dyn ReadSeek>,
     codecs: &dyn CodecResolver,
 ) -> Result<AviDemuxer> {
-    open_avi_inner(input, codecs, /* lenient */ true)
+    open_avi_inner(
+        input, codecs, /* lenient */ true, /* strict_cross_validate */ false,
+    )
+}
+
+/// Open an AVI demuxer with strict idx1 ↔ ix## cross-validation
+/// (round-18 candidate 3).
+///
+/// Behaves like [`open_avi`] except: when both an `idx1` table and
+/// per-segment `ix##` standard indexes are present and they disagree
+/// on a packet's `(file-offset, payload-size)`, the demuxer fails
+/// fast with [`Error::InvalidData`] carrying the divergent sequence
+/// number and both candidate offsets — rather than surfacing the
+/// disagreement as the lenient `avi:idx1.<n>.divergent_offsets`
+/// metadata key. Use this when the caller wants the canonical
+/// "OpenDML ix## is more reliable than idx1" handoff to abort on a
+/// mismatch (e.g. validating a freshly muxed file before shipping
+/// it, or refusing to play a recovered capture whose stale idx1
+/// disagrees with reality). All other open-time checks still run —
+/// the round-14 C2 audio sample-size VBR/CBR validator stays armed
+/// and surfaces its own [`Error::Validation`] on violation.
+pub fn open_avi_strict(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<AviDemuxer> {
+    open_avi_inner(
+        input, codecs, /* lenient */ false, /* strict_cross_validate */ true,
+    )
 }
 
 fn open_avi_inner(
     mut input: Box<dyn ReadSeek>,
     codecs: &dyn CodecResolver,
     lenient: bool,
+    strict_cross_validate: bool,
 ) -> Result<AviDemuxer> {
     // Probe the actual file length so we can clamp over-declared chunk sizes
     // against it. Truncated-head AVI files (capture-card crash dumps,
@@ -790,6 +817,22 @@ fn open_avi_inner(
                     .get(seq)
                     .copied()
                     .unwrap_or((u64::MAX, u32::MAX));
+                // Round-18 candidate 3: strict mode promotes the
+                // lenient `avi:idx1.<n>.divergent_offsets` metadata
+                // key into a hard `Error::InvalidData` so callers
+                // wanting fail-fast (validate-then-ship pipelines,
+                // strict players) abort instead of surfacing the
+                // metadata. The lenient `open_avi` path still pushes
+                // metadata as before; only `open_avi_strict` flips
+                // this flag.
+                if strict_cross_validate {
+                    return Err(Error::invalid(format!(
+                        "AVI: idx1↔ix## offset divergence at seq={seq} \
+                         on stream {stream_id}: \
+                         idx1=offset_{a_off}_size_{a_size} \
+                         ix##=offset_{b_off}_size_{b_size}"
+                    )));
+                }
                 metadata.push((
                     format!("avi:idx1.{stream_id}.divergent_offsets"),
                     format!(
@@ -3853,6 +3896,147 @@ impl AviDemuxer {
         // caller asks for a negative pts and the first keyframe is at
         // pts >= 0).
         let gop_distance = target_pts.saturating_sub(landed_pts).max(0);
+        Ok(KeyframeSeekResult {
+            target_pts,
+            landed_pts,
+            gop_distance,
+        })
+    }
+
+    /// `Idx1Flags`-aware seek to the first non-`AVIIF_NO_TIME`
+    /// keyframe at-or-after `target_pts` (round-18 candidate 4).
+    ///
+    /// [`Self::seek_to_keyframe_strict`] (and the underlying
+    /// [`Demuxer::seek_to`]) walk every idx1 entry whose
+    /// `AVIIF_KEYFRAME` bit is set and pick the LAST one with
+    /// `pts <= target` — which is the correct behaviour for
+    /// presentation-clock-aligned playback: land on a real frame the
+    /// decoder can decode standalone.
+    ///
+    /// But `idx1` also indexes side-band chunks (`xxpc`
+    /// palette-change, `xxtx` text/subtitle, custom data) that the
+    /// muxer flags with `AVIIF_NO_TIME` per Microsoft `vfw.h`: those
+    /// entries do NOT increment the per-stream presentation clock.
+    /// The legacy keyframe-only seek doesn't distinguish them from
+    /// real video keyframes — a file whose primary video stream
+    /// interleaves a palette-change chunk in front of every keyframe
+    /// can land the cursor on the palette chunk instead of the
+    /// frame, and a player has to walk forward to find a frame the
+    /// decoder can actually decode.
+    ///
+    /// This helper closes that gap: it walks idx1 entries belonging
+    /// to `stream_index` where BOTH `is_keyframe` is set AND
+    /// `is_no_time` is NOT set, picks the first one with
+    /// `pts >= target_pts`, and seeks the input there. The returned
+    /// [`KeyframeSeekResult`] holds the originally-requested target,
+    /// the landed pts (always at-or-after target — the first
+    /// non-NO_TIME keyframe AT or AFTER the request), and the gap
+    /// `landed_pts - target_pts` clamped to `>= 0` as
+    /// `gop_distance`.
+    ///
+    /// Falls back to the LAST non-NO_TIME keyframe in the stream when
+    /// no entry at-or-after target qualifies (e.g. caller asked for a
+    /// pts past the last keyframe). Returns
+    /// [`Error::Unsupported`] when the file has no `idx1` (use
+    /// [`Self::seek_to_keyframe_strict_via_std_index`] for OpenDML-
+    /// only files) or when the stream has no non-NO_TIME keyframe at
+    /// all (e.g. an audio-only or palette-only stream).
+    pub fn seek_to_first_video_keyframe_after(
+        &mut self,
+        stream_index: u32,
+        target_pts: i64,
+    ) -> Result<KeyframeSeekResult> {
+        if (stream_index as usize) >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "AVI: stream index {stream_index} out of range"
+            )));
+        }
+        if self.idx_table.is_empty() {
+            return Err(Error::unsupported(
+                "AVI: seek_to_first_video_keyframe_after requires idx1 \
+                 (OpenDML ix## not yet supported in this helper)",
+            ));
+        }
+        // First non-NO_TIME keyframe with pts >= target.
+        let mut best: Option<&IdxEntry> = None;
+        for e in &self.idx_table {
+            if e.stream != stream_index {
+                continue;
+            }
+            if (e.flags & AVIIF_KEYFRAME) == 0 {
+                continue;
+            }
+            if (e.flags & AVIIF_NO_TIME) != 0 {
+                // Side-band keyframe (palette/text/data marked
+                // NO_TIME) — skip.
+                continue;
+            }
+            if e.pts >= target_pts {
+                best = match best {
+                    Some(b) if b.pts <= e.pts => Some(b),
+                    _ => Some(e),
+                };
+            }
+        }
+        // Fall back to the LAST non-NO_TIME keyframe in the stream
+        // when nothing at-or-after target qualifies (caller asked
+        // past EOF / past the last keyframe).
+        if best.is_none() {
+            for e in &self.idx_table {
+                if e.stream != stream_index
+                    || (e.flags & AVIIF_KEYFRAME) == 0
+                    || (e.flags & AVIIF_NO_TIME) != 0
+                {
+                    continue;
+                }
+                best = match best {
+                    Some(b) if b.pts >= e.pts => Some(b),
+                    _ => Some(e),
+                };
+            }
+        }
+        let landed = best.ok_or_else(|| {
+            Error::unsupported(format!(
+                "AVI: no non-NO_TIME keyframes in idx1 for stream {stream_index}"
+            ))
+        })?;
+
+        // Mirror seek_to's input-positioning + per-stream pts reset.
+        let mut target_off = landed.offset;
+        if target_off < self.movi_start {
+            target_off = self.movi_start;
+        }
+        let seg = self
+            .movi_segments
+            .iter()
+            .position(|&(s, e)| target_off >= s && target_off < e)
+            .ok_or_else(|| Error::invalid("AVI: idx1 entry points past end of movi segments"))?;
+        self.current_segment = seg;
+        self.input.seek(SeekFrom::Start(target_off))?;
+        if self.per_stream_counter.len() != self.streams.len() {
+            self.per_stream_counter = vec![0u64; self.streams.len()];
+        } else {
+            for c in self.per_stream_counter.iter_mut() {
+                *c = 0;
+            }
+        }
+        for e in &self.idx_table {
+            if e.offset > target_off {
+                break;
+            }
+            let s = e.stream as usize;
+            if s < self.per_stream_counter.len() {
+                self.per_stream_counter[s] = e.pts.max(0) as u64;
+            }
+        }
+
+        let landed_pts = landed.pts;
+        // gop_distance is the gap from target to the landed frame —
+        // always >= 0 because we picked the first frame at-or-after
+        // target. When the fallback path fired (no frame at-or-after
+        // target), landed_pts < target and we clamp to 0 so callers
+        // don't get a negative distance.
+        let gop_distance = landed_pts.saturating_sub(target_pts).max(0);
         Ok(KeyframeSeekResult {
             target_pts,
             landed_pts,
