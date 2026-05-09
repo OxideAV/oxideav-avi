@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `Idx1Flags` decode + public `AVIIF_*` constants (round 17 C3).**
+  New public newtype `oxideav_avi::demuxer::Idx1Flags { is_list,
+  is_keyframe, is_first_part, is_last_part, is_no_time, bits }` plus
+  `compressor_bits()` accessor for the `AVIIF_COMPRESSOR` upper-half
+  mask, paired with public `AVIIF_LIST` (`0x0001`),
+  `AVIIF_KEYFRAME` (`0x0010`, promoted from private),
+  `AVIIF_FIRSTPART` (`0x0020`), `AVIIF_LASTPART` (`0x0040`),
+  `AVIIF_NO_TIME` (`0x0100`), and `AVIIF_COMPRESSOR` (`0x0FFF_0000`)
+  constants per AVI 1.0 §3.4 + Microsoft `vfw.h`. New
+  `AviDemuxer::idx1_typed_flags_for_packet(stream, seq) ->
+  Option<Idx1Flags>` decodes one entry's `dwFlags` DWORD into the
+  structured shape, mirrored on the existing
+  `idx1_flags_for_packet` raw u32 accessor. Closes the previously-
+  hidden flag-bit gap surfaced by round-12's keyframe-only seek
+  exposure: callers needing palette-change / text-chunk timing
+  semantics (`AVIIF_NO_TIME`), multi-part packet detection
+  (`AVIIF_FIRSTPART` / `AVIIF_LASTPART`), or codec-private bits
+  (`compressor_bits()`) no longer have to hand-mask the raw flags.
+- **`idx1` ↔ `ix##` cross-validator (round 17 C4).** When a file
+  carries both an `idx1` table (AVI 1.0 §3.4) and per-segment
+  `ix##` standard indexes (OpenDML 2.0), the demuxer's `open()`
+  now walks them in parallel and compares per-packet `(offset,
+  size)`. On disagreement it surfaces
+  `avi:idx1.<n>.divergent_offsets = "seq=<i>
+  idx1=offset_<a>_size_<sa> ix##=offset_<b>_size_<sb>"` under the
+  metadata map. Real-world capture-card files sometimes ship a
+  stale `idx1` (recovered from a crash, rebuilt by a non-conformant
+  tool, or copied from a different cut) that disagrees with the
+  truth in `ix##`; per OpenDML 2.0 §"Index Locations" the `ix##`
+  view is canonical (64-bit offsets, per-segment) so callers
+  detecting the metadata key should prefer it. The comparison only
+  spans the primary RIFF (`idx1`'s 32-bit offsets can't address an
+  AVIX continuation), so multi-segment files compare just the
+  primary's `ix##` slice; single-segment OpenDML files where the
+  std-index scan didn't trigger silently no-op. Length mismatches
+  (idx1 has more or fewer entries than the primary `ix##`) are
+  themselves divergences and surface at the first beyond-shared-
+  prefix slot.
 - **`idx1`-from-`ix##` synthesiser (round 16 C1).** New
   `AviMuxOptions::synthesise_idx1_from_ix(true)` opt-in: when set on
   an `AviKind::OpenDml` mux, the primary segment's `idx1` body is

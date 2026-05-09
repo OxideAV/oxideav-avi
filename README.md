@@ -27,6 +27,8 @@ oxideav-avi = "0.0"
 | `avih.dwFlags` (`AVIF_*` bits)                   | yes (typed `avih_flags()` decode + raw `avi:flags` metadata) | yes (`AviMuxOptions::with_avih_flags` / `with_avih_flag_bit`) |
 | `idx1` legacy index — parse for keyframe seek    | yes   | yes  |
 | `idx1` offsets — file-absolute + movi-relative   | yes   | yes  |
+| `idx1` entry `dwFlags` (`AVIIF_*` bits)          | yes (typed `idx1_typed_flags_for_packet` decode + raw `idx1_flags_for_packet` + public `AVIIF_LIST` / `AVIIF_KEYFRAME` / `AVIIF_FIRSTPART` / `AVIIF_LASTPART` / `AVIIF_NO_TIME` / `AVIIF_COMPRESSOR` constants) | yes (`AVIIF_KEYFRAME` on every keyframe; `AVIIF_FIRSTPART | AVIIF_LASTPART` stamp on 2-field interlaced) |
+| `idx1` ↔ `ix##` cross-validator                  | yes (multi-segment OpenDML files surface `avi:idx1.<n>.divergent_offsets` when the two index views disagree on a packet's offset/size) | n/a |
 | `LIST rec ` packet grouping inside `movi`        | yes   | yes (packet-cap or byte-budget) |
 | OpenDML 2.0 multi-`RIFF AVIX` continuation       | yes   | yes  |
 | OpenDML 2.0 `indx` super-index in `strl`         | yes (parse) | yes (emit) |

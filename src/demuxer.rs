@@ -693,6 +693,114 @@ fn open_avi_inner(
         }
     }
 
+    // Round-17 candidate 4: idx1 ↔ ix## cross-validator.
+    //
+    // Both indexes describe the same packet stream (per OpenDML 2.0
+    // §"Index Locations": ix## entries and idx1 entries within the
+    // primary segment must agree on (offset, length) per packet),
+    // but real-world capture-card files sometimes ship a stale
+    // idx1 — recovered from a crash, rebuilt by a non-conformant
+    // tool, or copied from a different cut of the file — that
+    // disagrees with the truth in ix##. The OpenDML spec is
+    // explicit that ix## is more reliable when both are present
+    // (idx1 offsets are 32-bit and primary-segment-only, ix## is
+    // 64-bit and per-segment), so the canonical fix is to surface
+    // the disagreement under metadata and let downstream code
+    // prefer ix## as the source of truth.
+    //
+    // Crucially: idx1 only covers the PRIMARY segment per AVI 1.0
+    // §3.4 (its 32-bit offsets can't reach into a continuation
+    // RIFF AVIX), so we compare idx1 against ONLY the std_indexes
+    // whose `qw_base_offset` falls within the primary segment's
+    // `movi_segments[0]` byte range. For multi-segment OpenDML
+    // files this naturally drops the AVIX continuation indexes
+    // from the comparison; for single-segment OpenDML it's a no-op
+    // (every std_index belongs to the primary).
+    //
+    // We walk per-stream idx1 entries in file order and compare
+    // them against the per-stream primary-segment ix## entries
+    // (also in file order). For each ordinal we compare
+    // (file-absolute header offset, payload size). Only the first
+    // mismatch per stream is surfaced — callers want the one
+    // diagnostic line per stream, not a spam of every divergent
+    // entry. Per `parse_ix_chunk` semantics: `dw_offset` is the
+    // offset from `qw_base_offset` to chunk DATA (8 B past the
+    // header), so subtract 8 to recover the header offset that
+    // matches `IdxEntry::offset`.
+    if !idx_table.is_empty() && !std_indexes.is_empty() {
+        let primary_range = movi_segments.first().copied();
+        for (s_idx, _) in streams.iter().enumerate() {
+            let stream_id = s_idx as u32;
+            let idx1_for_stream: Vec<(u64, u32)> = idx_table
+                .iter()
+                .filter(|e| e.stream == stream_id)
+                .map(|e| (e.offset, e.size))
+                .collect();
+            if idx1_for_stream.is_empty() {
+                continue;
+            }
+            let mut ix_for_stream: Vec<(u64, u32)> = Vec::new();
+            for ix in &std_indexes {
+                let ix_stream = match parse_stream_index(&ix.chunk_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if ix_stream != stream_id {
+                    continue;
+                }
+                // Drop any std_index whose qw_base_offset falls
+                // outside the primary `movi` segment's byte range.
+                // idx1 can't address that data, so the comparison
+                // is meaningless.
+                if let Some((p_start, p_end)) = primary_range {
+                    if ix.qw_base_offset < p_start || ix.qw_base_offset >= p_end {
+                        continue;
+                    }
+                }
+                for entry in &ix.entries {
+                    let header_off = ix
+                        .qw_base_offset
+                        .saturating_add(entry.dw_offset as u64)
+                        .saturating_sub(8);
+                    ix_for_stream.push((header_off, entry.dw_size));
+                }
+            }
+            if ix_for_stream.is_empty() {
+                continue;
+            }
+            let common = idx1_for_stream.len().min(ix_for_stream.len());
+            let mut divergent_at: Option<usize> = None;
+            for i in 0..common {
+                if idx1_for_stream[i] != ix_for_stream[i] {
+                    divergent_at = Some(i);
+                    break;
+                }
+            }
+            // Length mismatch is itself a divergence even when
+            // the shared prefix matched — record it at index `common`.
+            if divergent_at.is_none() && idx1_for_stream.len() != ix_for_stream.len() {
+                divergent_at = Some(common);
+            }
+            if let Some(seq) = divergent_at {
+                let (a_off, a_size) = idx1_for_stream
+                    .get(seq)
+                    .copied()
+                    .unwrap_or((u64::MAX, u32::MAX));
+                let (b_off, b_size) = ix_for_stream
+                    .get(seq)
+                    .copied()
+                    .unwrap_or((u64::MAX, u32::MAX));
+                metadata.push((
+                    format!("avi:idx1.{stream_id}.divergent_offsets"),
+                    format!(
+                        "seq={seq} idx1=offset_{a_off}_size_{a_size} \
+                         ix##=offset_{b_off}_size_{b_size}"
+                    ),
+                ));
+            }
+        }
+    }
+
     // Round-15 candidate 1: surface a "stamped dwMaxBytesPerSec is
     // smaller than the per-stream demand" warning under the
     // `avi:over_budget` metadata key. Per AVI 1.0 §3.1 the field is
@@ -2403,6 +2511,79 @@ impl AvihFlags {
     }
 }
 
+/// Typed decode of one `idx1` entry's `dwFlags` DWORD (round-17
+/// candidate 3).
+///
+/// Per AVI 1.0 §3.4 + Microsoft's `vfw.h` `AVIIF_*` table the 32-bit
+/// flag field carries:
+/// - `AVIIF_LIST` (0x0001) — entry refers to a `LIST` chunk
+/// - `AVIIF_KEYFRAME` (0x0010) — entry is a random-access keyframe
+/// - `AVIIF_FIRSTPART` (0x0020) — entry is the first of a multi-part packet
+/// - `AVIIF_LASTPART` (0x0040) — entry is the last of a multi-part packet
+/// - `AVIIF_NO_TIME` (0x0100) — entry does NOT increment the
+///   per-stream presentation clock (typical for `xxpc` palette and
+///   `xxtx` text chunks)
+/// - `AVIIF_COMPRESSOR` (0x0FFF_0000) — compressor-specific bits
+///
+/// Returned by [`AviDemuxer::idx1_typed_flags_for_packet`]; the raw
+/// `bits` field is preserved verbatim so vendor-extension /
+/// future-spec bits don't get lost when a codec needs them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Idx1Flags {
+    /// `AVIIF_LIST` — entry refers to a `LIST` chunk (typically a
+    /// `LIST rec ` grouping inside `movi`) rather than a single
+    /// payload chunk. Rare in modern files.
+    pub is_list: bool,
+    /// `AVIIF_KEYFRAME` — entry is a keyframe (random-access /
+    /// I-frame). Same bit drives [`AviDemuxer::seek_to_keyframe_strict`].
+    pub is_keyframe: bool,
+    /// `AVIIF_FIRSTPART` — entry is the FIRST chunk of a multi-part
+    /// packet. The matching closing entry should carry
+    /// `AVIIF_LASTPART`. The muxer also sets both bits together on
+    /// every idx1 entry of a 2-field interlaced stream (see
+    /// [`AviDemuxer::idx1_flags_for_packet`] for the legacy
+    /// `0x60`-stamping convention).
+    pub is_first_part: bool,
+    /// `AVIIF_LASTPART` — entry is the LAST chunk of a multi-part
+    /// packet. See [`Self::is_first_part`].
+    pub is_last_part: bool,
+    /// `AVIIF_NO_TIME` (also spelled `AVIIF_NOTIME` in some SDK
+    /// headers) — entry doesn't advance the per-stream presentation
+    /// clock. Set on `xxpc` palette-change and `xxtx` text/subtitle
+    /// entries whose timing is gated by the surrounding video
+    /// chunk's PTS rather than carrying their own.
+    pub is_no_time: bool,
+    /// Raw `dwFlags` DWORD as recorded in idx1. Bits outside the
+    /// documented union (`AVIIF_LIST | AVIIF_KEYFRAME | AVIIF_FIRSTPART
+    /// | AVIIF_LASTPART | AVIIF_NO_TIME | AVIIF_COMPRESSOR`) are
+    /// vendor-extension or reserved-future bits and are exposed
+    /// verbatim through this field.
+    pub bits: u32,
+}
+
+impl Idx1Flags {
+    /// Decode a raw `dwFlags` u32 into a structured [`Idx1Flags`].
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            is_list: bits & AVIIF_LIST != 0,
+            is_keyframe: bits & AVIIF_KEYFRAME != 0,
+            is_first_part: bits & AVIIF_FIRSTPART != 0,
+            is_last_part: bits & AVIIF_LASTPART != 0,
+            is_no_time: bits & AVIIF_NO_TIME != 0,
+            bits,
+        }
+    }
+
+    /// Returns the masked compressor-specific bits — `bits &
+    /// AVIIF_COMPRESSOR`. Per `vfw.h` the upper 12 bits of the high
+    /// 16-bit half are reserved for codec-private use and are
+    /// opaque to the container layer; per-codec readers can pull
+    /// them out unchanged via this accessor.
+    pub fn compressor_bits(self) -> u32 {
+        self.bits & AVIIF_COMPRESSOR
+    }
+}
+
 /// One palette entry inside a [`PaletteChange`] body — `PALETTEENTRY`
 /// per Microsoft's `wingdi.h`. Layout matches the on-wire byte order
 /// used by AVI 1.0 `xxpc` chunks: `peRed`, `peGreen`, `peBlue`,
@@ -2866,8 +3047,39 @@ struct IdxEntry {
     pts: i64,
 }
 
-/// `AVIIF_KEYFRAME` bit in an idx1 entry's flags.
-const AVIIF_KEYFRAME: u32 = 0x0000_0010;
+/// `AVIIF_LIST` per Microsoft's `vfw.h` — entry refers to a `LIST`
+/// chunk (e.g. an internal `LIST rec ` grouping inside `movi`)
+/// rather than a single payload chunk. Rare in modern files but
+/// still emitted by Microsoft's reference muxer when grouping
+/// chunks for streaming I/O alignment.
+pub const AVIIF_LIST: u32 = 0x0000_0001;
+/// `AVIIF_KEYFRAME` bit in an idx1 entry's flags. Set on entries
+/// whose payload chunk is a keyframe (random-access / I-frame). The
+/// in-tree seek path uses this bit to drive
+/// [`AviDemuxer::seek_to_keyframe_strict`].
+pub const AVIIF_KEYFRAME: u32 = 0x0000_0010;
+/// `AVIIF_FIRSTPART` per `vfw.h` — entry is the FIRST chunk of a
+/// multi-part packet (the rest follow as additional idx1 entries
+/// flagged at minimum with `AVIIF_LASTPART` on the closing one).
+/// Also set as part of the `AVIIF_FIRSTPART | AVIIF_LASTPART`
+/// pair the muxer stamps on every entry for a 2-field interlaced
+/// stream — see `idx1_flags_for_packet`'s field2 detection.
+pub const AVIIF_FIRSTPART: u32 = 0x0000_0020;
+/// `AVIIF_LASTPART` per `vfw.h` — entry is the LAST chunk of a
+/// multi-part packet. See [`AVIIF_FIRSTPART`].
+pub const AVIIF_LASTPART: u32 = 0x0000_0040;
+/// `AVIIF_NO_TIME` per `vfw.h` (also spelled `AVIIF_NOTIME` in some
+/// SDK headers) — entry doesn't increment the per-stream
+/// presentation clock. Typically set on text/subtitle (`xxtx`) and
+/// palette-change (`xxpc`) chunks whose presentation is gated by
+/// the next "real" video chunk's PTS rather than carrying their
+/// own time.
+pub const AVIIF_NO_TIME: u32 = 0x0000_0100;
+/// `AVIIF_COMPRESSOR` per `vfw.h` — bitmask covering the
+/// compressor-specific upper 16 bits of `dwFlags`. Any non-zero
+/// value here is opaque to the container layer; per-codec readers
+/// may inspect it via [`Idx1Flags::compressor_bits`].
+pub const AVIIF_COMPRESSOR: u32 = 0x0FFF_0000;
 
 impl Demuxer for AviDemuxer {
     fn format_name(&self) -> &str {
@@ -3516,6 +3728,26 @@ impl AviDemuxer {
             .get(stream_index as usize)?
             .get(packet_seq)
             .copied()
+    }
+
+    /// Typed [`Idx1Flags`] decode of one idx1 entry's `dwFlags`
+    /// DWORD (round-17 candidate 3).
+    ///
+    /// Returns `Some(Idx1Flags)` for the `packet_seq`-th idx1 entry
+    /// (zero-based, in idx1 file order) belonging to `stream_index`,
+    /// or `None` for an out-of-range index, an unknown stream, or
+    /// when the file had no `idx1`. Decodes the same raw u32 the
+    /// untyped [`Self::idx1_flags_for_packet`] hands back, but
+    /// surfaces the documented `AVIIF_*` bits as boolean fields and
+    /// exposes the compressor-private upper bits through
+    /// [`Idx1Flags::compressor_bits`].
+    pub fn idx1_typed_flags_for_packet(
+        &self,
+        stream_index: u32,
+        packet_seq: usize,
+    ) -> Option<Idx1Flags> {
+        self.idx1_flags_for_packet(stream_index, packet_seq)
+            .map(Idx1Flags::from_bits)
     }
 
     pub fn field2_offset_for_packet(&self, stream_index: u32, packet_seq: usize) -> Option<u32> {
