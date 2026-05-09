@@ -106,7 +106,34 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<
 /// difference is the return type so callers can hold the concrete
 /// handle alongside the [`oxideav_core::Demuxer`] trait it
 /// implements.
-pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<AviDemuxer> {
+///
+/// Round-14 candidate 2: also runs the per-audio-stream
+/// `(strh.dwSampleSize, wave_format.format_tag)` invariant check
+/// — VBR codecs (MP3 / AAC / MPEG) require `dwSampleSize == 0`,
+/// CBR codecs (PCM / G.711 / IMA-ADPCM) require `dwSampleSize > 0`.
+/// A mismatch surfaces as [`Error::Validation`]. Use [`open_avi_lenient`]
+/// to skip this check (e.g. when re-muxing a malformed legacy file).
+pub fn open_avi(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<AviDemuxer> {
+    open_avi_inner(input, codecs, /* lenient */ false)
+}
+
+/// Open an AVI demuxer skipping the round-14 C2 audio sample-size
+/// VBR/CBR validator. Use this when the caller wants to re-mux or
+/// inspect a malformed legacy file whose `strh.dwSampleSize` doesn't
+/// match the spec for its `wFormatTag`. All other open-time checks
+/// still run — only the VBR/CBR invariant is bypassed.
+pub fn open_avi_lenient(
+    input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+) -> Result<AviDemuxer> {
+    open_avi_inner(input, codecs, /* lenient */ true)
+}
+
+fn open_avi_inner(
+    mut input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+    lenient: bool,
+) -> Result<AviDemuxer> {
     // Probe the actual file length so we can clamp over-declared chunk sizes
     // against it. Truncated-head AVI files (capture-card crash dumps,
     // copy-aborted recordings) routinely declare RIFF / LIST sizes that
@@ -158,6 +185,10 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
     // (across all RIFF segments). `None` when no `LIST odml dmlh` was
     // seen in `hdrl`.
     let mut dmlh_total_frames: Option<u32> = None;
+    // Per-stream audio strh `(format_tag, dwSampleSize)` capture for
+    // the round-14 C2 VBR/CBR validator. Parallel to `streams`:
+    // `Some` for audio, `None` otherwise.
+    let mut audio_infos: Vec<Option<AudioStrhInfo>> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -172,6 +203,7 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
         &mut super_indexes,
         &mut vprps,
         &mut dmlh_total_frames,
+        &mut audio_infos,
         codecs,
         /* is_primary */ true,
     )?;
@@ -198,6 +230,7 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
                     &mut super_indexes,
                     &mut vprps,
                     &mut dmlh_total_frames,
+                    &mut audio_infos,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -206,6 +239,33 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
             skip_pad(&mut *input, hdr.size)?;
         } else {
             skip_chunk(&mut *input, &hdr)?;
+        }
+    }
+
+    // Round-14 candidate 2: audio `(format_tag, sample_size)` invariant.
+    // Per AVI 1.0 / WAVEFORMATEX: VBR codecs (MPEG / MP3 / AAC) carry
+    // one packet per audio frame so `dwSampleSize` MUST be 0; CBR
+    // codecs (PCM / G.711 a-law / G.711 µ-law / IMA-ADPCM) carry a
+    // fixed bytes-per-sample so `dwSampleSize` MUST be > 0. A mismatch
+    // means the file lies about its own carriage and downstream
+    // `strh.dwLength` derivations (AviMuxer's audio sample-count walk)
+    // will be wrong. Skip when `lenient` (caller opted in via
+    // [`open_avi_lenient`]) so a malformed legacy file can still be
+    // re-muxed / inspected. Other format tags (codecs the spec doesn't
+    // pin one way or the other — e.g. WMA, AC-3, custom registrations)
+    // pass through with no constraint.
+    if !lenient {
+        for (i, ai) in audio_infos.iter().enumerate() {
+            let info = match ai {
+                Some(v) => v,
+                None => continue,
+            };
+            if let Some(violation) = audio_strh_violation(info) {
+                return Err(Error::invalid(format!(
+                    "AVI: audio stream {i} (wFormatTag=0x{:04X}): {violation}",
+                    info.format_tag
+                )));
+            }
         }
     }
 
@@ -681,6 +741,7 @@ fn walk_riff_body(
     super_indexes: &mut Vec<SuperIndex>,
     vprps: &mut Vec<VprpHeader>,
     dmlh_total_frames: &mut Option<u32>,
+    audio_infos: &mut Vec<Option<AudioStrhInfo>>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -701,7 +762,7 @@ fn walk_riff_body(
             let body_end = (body_start + body_len as u64).min(end).min(file_len);
             match &list_type {
                 b"hdrl" if is_primary => {
-                    let (main, stream_infos, suffixes, sxs, vps, dmlh, info_md) =
+                    let (main, stream_infos, suffixes, sxs, vps, dmlh, info_md, ais) =
                         parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
@@ -710,6 +771,7 @@ fn walk_riff_body(
                     *vprps = vps;
                     *dmlh_total_frames = dmlh;
                     metadata.extend(info_md);
+                    *audio_infos = ais;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -902,9 +964,13 @@ fn parse_avih(buf: &[u8]) -> Result<AviMainHeader> {
 /// don't declare an `indx` chunk in their `strl`), the per-stream
 /// [`VprpHeader`] (empty for streams without a `vprp` chunk), the
 /// optional `dmlh` extended-header `dwTotalFrames` value (`Some`
-/// only when `LIST odml dmlh` was present), and the metadata pairs
+/// only when `LIST odml dmlh` was present), the metadata pairs
 /// parsed from any hdrl-nested `LIST INFO` (round-6 candidate 2;
-/// empty when no nested `LIST INFO` is present).
+/// empty when no nested `LIST INFO` is present), and the per-stream
+/// audio-strh `(format_tag, sample_size)` capture (round-14
+/// candidate 2 — used by the VBR/CBR validator at `open_avi`).
+/// `audio_infos` is parallel to `streams`: `Some` for audio streams,
+/// `None` for video / data streams.
 type HdrlOutput = (
     AviMainHeader,
     Vec<StreamInfo>,
@@ -913,6 +979,7 @@ type HdrlOutput = (
     Vec<VprpHeader>,
     Option<u32>,
     Vec<(String, String)>,
+    Vec<Option<AudioStrhInfo>>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -933,6 +1000,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut suffixes: Vec<[u8; 2]> = Vec::new();
     let mut super_indexes: Vec<SuperIndex> = Vec::new();
     let mut vprps: Vec<VprpHeader> = Vec::new();
+    let mut audio_infos: Vec<Option<AudioStrhInfo>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
 
@@ -953,12 +1021,14 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx, vp) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
+                    let (si, suf, sx, vp, ai) =
+                        parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
                         suffixes.push(suf.unwrap_or(*b"xx"));
                         super_indexes.push(sx);
                         vprps.push(vp);
+                        audio_infos.push(ai);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -996,6 +1066,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         vprps,
         dmlh_total_frames,
         info_metadata,
+        audio_infos,
     ))
 }
 
@@ -1034,10 +1105,19 @@ fn parse_odml_list<R: ReadSeek + ?Sized>(r: &mut R, end_pos: u64) -> Result<Opti
     Ok(None)
 }
 
-/// 4-tuple returned by [`parse_strl`]: optional [`StreamInfo`],
+/// 5-tuple returned by [`parse_strl`]: optional [`StreamInfo`],
 /// optional packet-chunk suffix, [`SuperIndex`] (default-empty when
-/// no `indx`), and [`VprpHeader`] (default when no `vprp`).
-type StrlOutput = (Option<StreamInfo>, Option<[u8; 2]>, SuperIndex, VprpHeader);
+/// no `indx`), [`VprpHeader`] (default when no `vprp`), and the
+/// audio-stream's `(format_tag, sample_size)` pair when the strh
+/// declared `fccType == "auds"` (round-14 C2 — used by the VBR/CBR
+/// validator at `open_avi`).
+type StrlOutput = (
+    Option<StreamInfo>,
+    Option<[u8; 2]>,
+    SuperIndex,
+    VprpHeader,
+    Option<AudioStrhInfo>,
+);
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
 /// suffix, the OpenDML 2.0 [`SuperIndex`] parsed from the `indx`
@@ -1104,11 +1184,11 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     }
     let strh = match strh_buf {
         Some(b) => b,
-        None => return Ok((None, None, super_index, vprp)),
+        None => return Ok((None, None, super_index, vprp, None)),
     };
     let strf = strf_buf.unwrap_or_default();
     let parsed = build_stream(index, &strh, &strf, codecs)?;
-    Ok((Some(parsed.0), Some(parsed.1), super_index, vprp))
+    Ok((Some(parsed.0), Some(parsed.1), super_index, vprp, parsed.2))
 }
 
 /// Parse a `vprp` (Video Properties Header) chunk per OpenDML 2.0 §5.0.
@@ -1404,12 +1484,26 @@ fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
 /// surfaces a synthetic `avi:<fourcc>` (or `avi:tag_<hex>`) codec_id;
 /// downstream decoder lookup will then fail with a clean error, which
 /// is the right signal for "this codec crate hasn't been wired in".
+/// Audio-stream sample-size invariant info captured at parse time
+/// (round-14 candidate 2). For each audio stream, the muxer's strh
+/// `dwSampleSize` is supposed to be `0` for VBR codecs (MP3 / AAC /
+/// MPEG) and `> 0` for CBR codecs (PCM / G.711 / IMA-ADPCM); a
+/// mismatch means the file lies about its own carriage and downstream
+/// `strh.dwLength` derivations will be wrong. The validator at
+/// `open()` time uses these per-audio captures to surface
+/// [`Error::Validation`] (or skip it with `open_lenient`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AudioStrhInfo {
+    pub format_tag: u16,
+    pub sample_size: u32,
+}
+
 fn build_stream(
     index: u32,
     strh: &[u8],
     strf: &[u8],
     codecs: &dyn CodecResolver,
-) -> Result<(StreamInfo, [u8; 2])> {
+) -> Result<(StreamInfo, [u8; 2], Option<AudioStrhInfo>)> {
     // AVISTREAMHEADER layout (56 bytes):
     //   0  fccType       [4]
     //   4  fccHandler    [4]
@@ -1437,6 +1531,7 @@ fn build_stream(
     let length = u32::from_le_bytes([strh[32], strh[33], strh[34], strh[35]]);
     let sample_size = u32::from_le_bytes([strh[44], strh[45], strh[46], strh[47]]);
 
+    let mut audio_info: Option<AudioStrhInfo> = None;
     let (media_type, codec_id, params, suffix) = match &fcc_type {
         b"vids" => {
             let bmih = if !strf.is_empty() {
@@ -1507,6 +1602,16 @@ fn build_stream(
                     None
                 };
             }
+            // Capture (format_tag, sample_size) for the round-14 C2
+            // VBR/CBR validator: VBR codecs require dwSampleSize == 0
+            // (one packet = one variable-length frame); CBR codecs
+            // require dwSampleSize > 0 (fixed bytes-per-sample). The
+            // validator runs in `open_avi` (or is skipped by
+            // `open_avi_lenient`).
+            audio_info = Some(AudioStrhInfo {
+                format_tag,
+                sample_size,
+            });
             (MediaType::Audio, codec_id, p, *b"wb")
         }
         _ => {
@@ -1547,8 +1652,7 @@ fn build_stream(
         start_time: Some(0),
         params,
     };
-    let _ = sample_size;
-    Ok((stream, suffix))
+    Ok((stream, suffix, audio_info))
 }
 
 /// Synthesise a placeholder `avi:<fourcc>` codec_id when the resolver
@@ -2075,6 +2179,69 @@ pub const AVIF_WASCAPTUREFILE: u32 = 0x0001_0000;
 /// `AVIF_COPYRIGHTED` per `vfw.h` — file contains copyrighted data.
 pub const AVIF_COPYRIGHTED: u32 = 0x0002_0000;
 
+// --- WAVEFORMATEX format-tag constants (mmreg.h) used by the round-14
+// candidate 2 audio sample-size VBR/CBR validator. -------------------
+
+/// `WAVE_FORMAT_PCM` per Microsoft's `mmreg.h` — uncompressed integer
+/// PCM. CBR: requires `strh.dwSampleSize > 0`.
+pub const WAVE_FORMAT_PCM: u16 = 0x0001;
+/// `WAVE_FORMAT_ALAW` per `mmreg.h` — G.711 a-law companded PCM. CBR:
+/// requires `strh.dwSampleSize > 0`.
+pub const WAVE_FORMAT_ALAW: u16 = 0x0006;
+/// `WAVE_FORMAT_MULAW` per `mmreg.h` — G.711 µ-law companded PCM. CBR:
+/// requires `strh.dwSampleSize > 0`.
+pub const WAVE_FORMAT_MULAW: u16 = 0x0007;
+/// `WAVE_FORMAT_DVI_ADPCM` per `mmreg.h` (a.k.a. IMA ADPCM). CBR:
+/// requires `strh.dwSampleSize > 0`.
+pub const WAVE_FORMAT_DVI_ADPCM: u16 = 0x0011;
+/// `WAVE_FORMAT_MPEG` per `mmreg.h` — MPEG-1 Audio Layer I/II/III
+/// generic. VBR: requires `strh.dwSampleSize == 0`.
+pub const WAVE_FORMAT_MPEG: u16 = 0x0050;
+/// `WAVE_FORMAT_MPEGLAYER3` per `mmreg.h` — MP3. VBR: requires
+/// `strh.dwSampleSize == 0`.
+pub const WAVE_FORMAT_MPEGLAYER3: u16 = 0x0055;
+/// `WAVE_FORMAT_AAC` per `mmreg.h` (Microsoft's AAC tag). VBR:
+/// requires `strh.dwSampleSize == 0`.
+pub const WAVE_FORMAT_AAC: u16 = 0x00FF;
+
+/// Round-14 candidate 2: classify a WAVEFORMATEX `wFormatTag` per
+/// the AVI 1.0 sample-size invariant.
+///
+/// - `Some(true)` ⇒ VBR codec (one packet = one variable-length
+///   frame); `strh.dwSampleSize` MUST be 0.
+/// - `Some(false)` ⇒ CBR codec (fixed bytes per sample);
+///   `strh.dwSampleSize` MUST be > 0.
+/// - `None` ⇒ no constraint (codec the spec doesn't pin one way or
+///   the other — e.g. WMA, AC-3, custom registrations).
+fn classify_audio_sample_size(format_tag: u16) -> Option<bool> {
+    match format_tag {
+        WAVE_FORMAT_MPEG | WAVE_FORMAT_MPEGLAYER3 | WAVE_FORMAT_AAC => Some(true),
+        WAVE_FORMAT_PCM | WAVE_FORMAT_ALAW | WAVE_FORMAT_MULAW | WAVE_FORMAT_DVI_ADPCM => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Round-14 candidate 2: return `Some(message)` when
+/// `(format_tag, sample_size)` violates the AVI 1.0 VBR/CBR invariant
+/// (see [`classify_audio_sample_size`]); `None` when it passes (or the
+/// format tag isn't constrained).
+fn audio_strh_violation(info: &AudioStrhInfo) -> Option<String> {
+    let vbr = classify_audio_sample_size(info.format_tag)?;
+    if vbr {
+        if info.sample_size != 0 {
+            return Some(format!(
+                "VBR codec requires strh.dwSampleSize == 0, got {}",
+                info.sample_size
+            ));
+        }
+    } else if info.sample_size == 0 {
+        return Some("CBR codec requires strh.dwSampleSize > 0, got 0".to_string());
+    }
+    None
+}
+
 /// Typed decode of `AVIMAINHEADER.dwFlags` (round-10 candidate 3).
 ///
 /// Each documented `AVIF_*` bit per Microsoft's `vfw.h` (see this
@@ -2237,6 +2404,39 @@ impl PaletteChange {
         out
     }
 }
+
+/// Lazy iterator returned by [`AviDemuxer::palette_change_typed_iter`]
+/// (round-14 candidate 3). Yields one `Result<PaletteChange>` per
+/// `xxpc` chunk for the requested stream, decoding the typed shape on
+/// demand. See the parent accessor's docs for the iteration contract.
+pub struct PaletteChangeTypedIter<'a> {
+    bodies: &'a [Vec<u8>],
+    next: usize,
+}
+
+impl<'a> Iterator for PaletteChangeTypedIter<'a> {
+    type Item = Result<PaletteChange>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let body = self.bodies.get(self.next)?;
+        self.next += 1;
+        match PaletteChange::parse(body) {
+            Some(pc) => Some(Ok(pc)),
+            None => Some(Err(Error::invalid(format!(
+                "AVI: xxpc body #{} ({} bytes) failed to decode as PaletteChange",
+                self.next - 1,
+                body.len()
+            )))),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.bodies.len().saturating_sub(self.next);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for PaletteChangeTypedIter<'a> {}
 
 /// Decoded `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
 ///
@@ -2902,6 +3102,39 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .map(|v| v.iter().filter_map(|b| PaletteChange::parse(b)).collect())
             .unwrap_or_default()
+    }
+
+    /// Lazy [`PaletteChange`] iterator over every `xxpc` chunk attached
+    /// to `stream_index` (round-14 candidate 3).
+    ///
+    /// Mirrors [`Self::palette_change_typed`] but yields one
+    /// `Result<PaletteChange>` per `next()` call instead of materialising
+    /// the full `Vec` up front. Useful for palette-animated screen
+    /// captures where each second of footage may carry hundreds or
+    /// thousands of palette deltas — the eager `Vec` form clones every
+    /// `Vec<PaletteEntry>` even when the consumer only needs to walk
+    /// once.
+    ///
+    /// Each `next()` returns:
+    /// - `Some(Ok(pc))` for a successfully decoded palette delta,
+    /// - `Some(Err(_))` for a body that failed to parse (shorter than
+    ///   the 4-byte fixed header or with a non-4-multiple
+    ///   `PALETTEENTRY` tail) — the iterator advances past the bad body
+    ///   so subsequent `next()` calls keep yielding,
+    /// - `None` once every chunk for the requested stream is consumed
+    ///   (or immediately for an unknown `stream_index`).
+    ///
+    /// The iterator borrows the raw body slice from the demuxer (no
+    /// extra allocation per chunk for the body itself); only the
+    /// successfully-decoded `PaletteChange` allocates its own
+    /// `Vec<PaletteEntry>`.
+    pub fn palette_change_typed_iter(&self, stream_index: u32) -> PaletteChangeTypedIter<'_> {
+        let bodies = self
+            .palette_change_data
+            .get(stream_index as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        PaletteChangeTypedIter { bodies, next: 0 }
     }
 
     /// `avih.dwSuggestedBufferSize` accessor (round-13 candidate 2).

@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`avih.dwMaxBytesPerSec` populator (round 14 C1).**
+  `AviMuxer::write_trailer` now patches `avih.dwMaxBytesPerSec` (body
+  offset 4, file offset 36) with the file's approximate maximum data
+  rate per AVI 1.0 §3.1, computed as
+  `sum(per_track_total_bytes) * 1_000_000 / (total_video_frames *
+  micro_sec_per_frame)`. Pre-round-14 the field was hard-coded to 0,
+  forcing capture-card players to fall back to a worst-case heuristic
+  when sizing their disk-read pacing budget. The populator surfaces 0
+  for audio-only files (no usable per-frame timing) and for files with
+  zero packets, so the pre-round-14 baseline is preserved on the empty
+  case. New `AviMuxOptions::with_max_bytes_per_sec(n)` builder stamps
+  an explicit value when the encoder already knows its target peak
+  rate.
+- **`strh.dwSampleSize` VBR/CBR validator at `open_avi` (round 14
+  C2).** Per AVI 1.0 / WAVEFORMATEX, VBR codecs (MPEG / MP3 / AAC —
+  `wFormatTag` 0x0050 / 0x0055 / 0x00FF) require `dwSampleSize == 0`;
+  CBR codecs (PCM / G.711 a-law / G.711 µ-law / IMA-ADPCM —
+  `wFormatTag` 0x0001 / 0x0006 / 0x0007 / 0x0011) require
+  `dwSampleSize > 0`. A mismatch surfaces as `Error::InvalidData`
+  naming the offending stream and tag instead of letting the file
+  through to break downstream `strh.dwLength` derivations later. New
+  public `WAVE_FORMAT_PCM` / `_ALAW` / `_MULAW` / `_DVI_ADPCM` /
+  `_MPEG` / `_MPEGLAYER3` / `_AAC` constants per `mmreg.h`. Format
+  tags outside both sets pass through unchecked. New
+  `demuxer::open_avi_lenient(read, codecs)` skips the validator for
+  callers re-muxing a malformed legacy file.
+- **`palette_change_typed_iter` lazy iterator (round 14 C3).** New
+  `AviDemuxer::palette_change_typed_iter(stream) ->
+  PaletteChangeTypedIter<'_>` returns one `Result<PaletteChange>` per
+  `next()` call, decoding the typed shape on demand instead of
+  materialising the full Vec. Useful for palette-animated screen
+  captures where each second of footage may carry hundreds of palette
+  deltas — the eager `Vec` form clones every `Vec<PaletteEntry>` even
+  when the consumer only needs to walk once. Implements
+  `ExactSizeIterator` so callers can pre-allocate a sink without first
+  counting; bodies that fail to parse surface `Some(Err(_))` and the
+  iterator advances past them.
 - **Typed `xxpc` palette-change round-trip (round 13 C1).** New
   `demuxer::PaletteChange { first_entry, num_entries, flags, entries }`
   + `demuxer::PaletteEntry { red, green, blue, flags }` typed structs

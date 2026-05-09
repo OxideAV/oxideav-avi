@@ -207,6 +207,17 @@ pub struct AviMuxOptions {
     /// a player should expect to read in one shot, i.e. the
     /// recommended read-ahead allocation hint.
     pub suggested_buffer_size_override: Option<u32>,
+    /// Optional `avih.dwMaxBytesPerSec` override (round-14 candidate
+    /// 1). `None` (the default) lets the muxer compute the value
+    /// itself in `write_trailer`: total bytes across every stream's
+    /// `movi` payloads divided by the file's nominal duration in
+    /// seconds (`avih.dwTotalFrames * avih.dwMicroSecPerFrame /
+    /// 1_000_000`). `Some(n)` stamps `n` verbatim. Per AVI 1.0 §3.1
+    /// the field is the approximate maximum data rate the file
+    /// requires; capture-card players use it to size their disk-read
+    /// pacing budget. Pre-round-14 the field was hard-coded to 0,
+    /// which forced players to fall back to a worst-case heuristic.
+    pub max_bytes_per_sec_override: Option<u32>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -598,6 +609,23 @@ impl AviMuxOptions {
     /// 4-byte boundary.
     pub fn with_suggested_buffer_size(mut self, n: u32) -> Self {
         self.suggested_buffer_size_override = Some(n);
+        self
+    }
+
+    /// Builder helper: stamp `n` verbatim into
+    /// `avih.dwMaxBytesPerSec` instead of letting the muxer compute
+    /// the value from observed per-track byte totals (round-14
+    /// candidate 1). Per AVI 1.0 §3.1 the field is the approximate
+    /// maximum data rate the file requires (used by capture-card
+    /// players to size their disk-read pacing). The default (`None`)
+    /// makes the muxer compute the value in `write_trailer` from
+    /// `sum(per_track_total_bytes) / file_duration_seconds`, where
+    /// `file_duration_seconds = avih.dwTotalFrames *
+    /// avih.dwMicroSecPerFrame / 1_000_000`. Returns `0` when the
+    /// duration can't be derived (no video stream / zero frame count
+    /// / zero microseconds-per-frame).
+    pub fn with_max_bytes_per_sec(mut self, n: u32) -> Self {
+        self.max_bytes_per_sec_override = Some(n);
         self
     }
 
@@ -1356,6 +1384,57 @@ impl AviMuxer {
         //   + 16 (TotalFrames body offset) = 48.
         self.output.seek(SeekFrom::Start(48))?;
         self.output.write_all(&total_video_frames.to_le_bytes())?;
+
+        // Round-14 candidate 1: avih.dwMaxBytesPerSec sits at body
+        // offset 4 (the second u32 of AVIMAINHEADER) → file offset
+        // 12 + 12 + 8 + 4 = 36. Per AVI 1.0 §3.1 it's the approximate
+        // maximum data rate (bytes/sec) the file requires; capture-card
+        // players use it to size their disk-read pacing. Compute as
+        // `sum(per_track_total_bytes) / file_duration_seconds`, where
+        // `file_duration_seconds = total_video_frames * micro_sec_per_frame /
+        // 1_000_000`, or honour the caller's
+        // [`AviMuxOptions::with_max_bytes_per_sec`] override.
+        //
+        // Pre-round-14 we hard-coded 0 here; conformant AVI 1.0 readers
+        // (and capture players in particular) treat 0 as "rate unknown"
+        // and fall back to a worst-case allocation heuristic. Populating
+        // a real value lets them right-size the read pacing budget.
+        let max_bytes_per_sec = self.options.max_bytes_per_sec_override.unwrap_or_else(|| {
+            // Pull dwMicroSecPerFrame from the first video stream
+            // (matches `build_avih`'s source of truth). Audio-only
+            // files have no video stream → no usable
+            // micro_sec_per_frame and we surface 0.
+            let micro_per_frame: u64 = self
+                .tracks
+                .iter()
+                .find(|t| &t.entry.strh_type == b"vids")
+                .map(|t| {
+                    let scale = t.entry.scale.max(1) as u64;
+                    let rate = t.entry.rate.max(1) as u64;
+                    1_000_000u64 * scale / rate
+                })
+                .unwrap_or(0);
+            let total_bytes: u64 = self.tracks.iter().map(|t| t.total_bytes).sum();
+            let micros: u64 = (total_video_frames as u64).saturating_mul(micro_per_frame);
+            if micros == 0 || total_bytes == 0 {
+                0
+            } else {
+                // bytes_per_sec = total_bytes * 1_000_000 / micros
+                // Use u128 for the intermediate to avoid overflow
+                // on multi-GiB long-form captures (e.g. 4 GB at
+                // 1 hour ≈ 1.16 MB/s — but the multiplication
+                // factor 1_000_000 inflates a u64 sum past 2^64
+                // for ~18 GB total bytes).
+                let big = (total_bytes as u128) * 1_000_000u128;
+                let bps = big / (micros as u128);
+                // Clamp to u32::MAX — dwMaxBytesPerSec is a DWORD,
+                // and a real-world file exceeding 4 GiB/s would
+                // be wildly out of spec for AVI 1.0 anyway.
+                bps.min(u32::MAX as u128) as u32
+            }
+        });
+        self.output.seek(SeekFrom::Start(36))?;
+        self.output.write_all(&max_bytes_per_sec.to_le_bytes())?;
 
         // Round-13 candidate 2: avih.dwSuggestedBufferSize sits at
         // body offset 28 → file offset 12 + 12 + 8 + 28 = 60. Per
