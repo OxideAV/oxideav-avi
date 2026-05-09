@@ -218,6 +218,35 @@ pub struct AviMuxOptions {
     /// pacing budget. Pre-round-14 the field was hard-coded to 0,
     /// which forced players to fall back to a worst-case heuristic.
     pub max_bytes_per_sec_override: Option<u32>,
+    /// Synthesise the primary segment's `idx1` body from each stream's
+    /// `ix##` standard-index entries instead of from the muxer's own
+    /// running `index` collection (round-16 candidate 1). Default
+    /// `false` keeps the round-3 behaviour: every `write_packet` in the
+    /// primary segment appends one `IndexEntry` and `serialize_idx1`
+    /// emits them in file order.
+    ///
+    /// When set to `true` AND the file is in [`AviKind::OpenDml`]
+    /// mode, [`AviMuxer::write_trailer`] / [`AviMuxer::close_current_segment`]
+    /// instead walks every primary-segment `ix##` entry that was
+    /// recorded for any stream (snapshot taken before
+    /// [`AviMuxer::flush_ix_for_track`] clears the per-track buffer)
+    /// and emits one 16-B `idx1` entry per packet. Per AVI 1.0 + OpenDML
+    /// 2.0 §"Index Locations": AVI 1.0-only readers (Windows Media
+    /// Player on XP, ffplay's strict AVI 1.0 path) honour `idx1`
+    /// alone — they don't walk OpenDML `ix##` super-indexes. When a
+    /// file is OpenDML-muxed without `idx1`, those readers can't
+    /// seek. This option closes that compat gap by guaranteeing the
+    /// idx1 covers every primary-segment packet even if the muxer's
+    /// own `index` collection were ever bypassed (e.g. a future
+    /// "OpenDML-only" code path) — and serves as a self-consistency
+    /// check that the two index views agree.
+    ///
+    /// Result is one entry per packet × per primary-segment stream;
+    /// AVIX continuation packets are NOT included (idx1 offsets are
+    /// 32-bit and relative to the primary `movi` LIST). For
+    /// [`AviKind::Avi10`] files this option is a no-op (Avi10 has
+    /// no `ix##` chunks to walk).
+    pub synthesise_idx1_from_ix: bool,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -629,6 +658,18 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: rebuild `idx1` from the primary segment's
+    /// `ix##` entries instead of from the running per-packet
+    /// `IndexEntry` collection (round-16 candidate 1). See
+    /// [`Self::synthesise_idx1_from_ix`] for the rationale.
+    /// `true` opts in; `false` (the default) keeps the round-3
+    /// idx1-from-packets path. Only meaningful for
+    /// [`AviKind::OpenDml`]; ignored for `AviKind::Avi10`.
+    pub fn synthesise_idx1_from_ix(mut self, on: bool) -> Self {
+        self.synthesise_idx1_from_ix = on;
+        self
+    }
+
     /// Builder helper: enable mid-`movi` `ix##` index emit for
     /// `stream_index` (round-7 candidate 1). The muxer flushes an
     /// inline standard-index chunk (`ix##`) every `packets_per_flush`
@@ -682,6 +723,28 @@ struct TrackState {
     /// close. Always populated so the OpenDML emit path can decide
     /// whether to write `ix##` regardless of stream type.
     ix_entries: Vec<IxStdEntry>,
+}
+
+/// One snapshot record taken from the primary segment for the
+/// round-16 C1 idx1-from-ix synthesiser. We capture enough metadata
+/// at packet-write time to rebuild a 16-byte idx1 entry without
+/// re-walking `tracks[*].ix_entries` (which gets drained by
+/// `flush_ix_for_track` long before `serialize_idx1` runs).
+#[derive(Clone, Copy, Debug)]
+struct PrimaryIxSnapshot {
+    /// Chunk FourCC: `00dc` / `00wb` / `00tx` / `00pc` / etc.
+    /// Mirrors the wire bytes the demuxer's idx1 parser expects.
+    ckid: [u8; 4],
+    /// Pre-baked idx1 flags DWORD (AVIIF_KEYFRAME for keyframe
+    /// packets, plus AVIIF_FIRSTPART|AVIIF_LASTPART when the
+    /// packet's stream is registered as 2-field per round-6 C1).
+    flags: u32,
+    /// Offset relative to the start of the primary `movi` LIST
+    /// body (i.e. of the `"movi"` form-type FourCC) — same shape
+    /// as [`IndexEntry::offset`].
+    offset: u32,
+    /// Payload size in bytes (high keyframe-bit cleared).
+    size: u32,
 }
 
 /// One AVISTDINDEX_ENTRY-shaped record for a packet inside the current
@@ -801,6 +864,7 @@ pub fn open_avi(
         rec_packets_in_cluster: 0,
         rec_bytes_in_cluster: 0,
         pending_field2_offset: None,
+        primary_ix_snapshot: Vec::new(),
         header_written: false,
         trailer_written: false,
     })
@@ -897,6 +961,15 @@ pub struct AviMuxer {
     /// (round-4 P1/P3). Set via [`AviMuxer::set_field2_offset`]
     /// and consumed by the next `write_packet`.
     pending_field2_offset: Option<u32>,
+    /// Snapshot of every primary-segment `ix##` record, captured at
+    /// `write_packet` / `write_sideband_chunk` time BEFORE
+    /// [`Self::flush_ix_for_track`] drains the per-track buffer
+    /// (round-16 candidate 1). Used by
+    /// [`Self::serialize_idx1_from_ix`] to rebuild `idx1` when
+    /// [`AviMuxOptions::synthesise_idx1_from_ix`] is on. Empty when
+    /// the option is off (we don't pay the per-packet clone) or
+    /// when the file is `AviKind::Avi10`.
+    primary_ix_snapshot: Vec<PrimaryIxSnapshot>,
     header_written: bool,
     trailer_written: bool,
 }
@@ -1171,11 +1244,32 @@ impl Muxer for AviMuxer {
                     } else {
                         0
                     };
-                    self.tracks[idx].ix_entries.push(IxStdEntry {
+                    let ix_entry = IxStdEntry {
                         dw_offset: d as u32,
                         dw_size_with_flag,
                         dw_offset_field2,
-                    });
+                    };
+                    self.tracks[idx].ix_entries.push(ix_entry);
+                    // Round-16 C1: snapshot every primary-segment ix##
+                    // record so `serialize_idx1_from_ix` can rebuild
+                    // idx1 from the standard-index view. We only pay
+                    // the per-packet snapshot when the option is on,
+                    // and continuation segments (idx1 is 32-bit and
+                    // primary-only) are skipped.
+                    if self.options.synthesise_idx1_from_ix && self.segments.is_empty() {
+                        // ix##.dw_offset is from qwBaseOffset =
+                        // movi_start_off + 4 to chunk DATA, while
+                        // idx1 wants the offset to the chunk HEADER
+                        // from movi_start_off. So idx1.offset =
+                        // ix##.dw_offset - 4.
+                        let idx1_offset = (d as u32).saturating_sub(4);
+                        self.primary_ix_snapshot.push(PrimaryIxSnapshot {
+                            ckid: fourcc,
+                            flags,
+                            offset: idx1_offset,
+                            size,
+                        });
+                    }
                 }
             }
         }
@@ -1545,13 +1639,52 @@ impl AviMuxer {
     }
 
     /// Serialize the idx1 body for the primary segment.
+    ///
+    /// When [`AviMuxOptions::synthesise_idx1_from_ix`] is set AND the
+    /// muxer is in OpenDML mode AND a non-empty primary `ix##`
+    /// snapshot has been captured, builds idx1 from those records via
+    /// [`Self::serialize_idx1_from_ix`]. Otherwise emits the
+    /// running per-packet [`IndexEntry`] collection (the round-3
+    /// default).
     fn serialize_idx1(&self) -> Vec<u8> {
+        if self.options.synthesise_idx1_from_ix
+            && matches!(self.kind, AviKind::OpenDml(_))
+            && !self.primary_ix_snapshot.is_empty()
+        {
+            return self.serialize_idx1_from_ix();
+        }
         let mut idx_body = Vec::with_capacity(self.index.len() * 16);
         for e in &self.index {
             idx_body.extend_from_slice(&e.ckid);
             idx_body.extend_from_slice(&e.flags.to_le_bytes());
             idx_body.extend_from_slice(&e.offset.to_le_bytes());
             idx_body.extend_from_slice(&e.size.to_le_bytes());
+        }
+        idx_body
+    }
+
+    /// Round-16 candidate 1: rebuild the primary segment's idx1 body
+    /// from the captured per-packet `ix##` standard-index records
+    /// instead of the running [`IndexEntry`] collection. One 16-B
+    /// `idx1` entry per snapshot record, in the order the packets
+    /// were written.
+    ///
+    /// Per AVI 1.0 + OpenDML 2.0 §"Index Locations": AVI 1.0-only
+    /// readers (Windows Media Player on XP, ffplay's strict AVI 1.0
+    /// path) honour `idx1` alone — they don't walk OpenDML `ix##`
+    /// super-indexes. When a file is OpenDML-muxed without `idx1`,
+    /// those readers can't seek. This path closes that compat gap.
+    ///
+    /// All fields (chunk fourcc, flags, idx1-relative offset, size)
+    /// are pre-baked into the [`PrimaryIxSnapshot`] at packet-write
+    /// time so the offset/flags math here stays trivial.
+    fn serialize_idx1_from_ix(&self) -> Vec<u8> {
+        let mut idx_body = Vec::with_capacity(self.primary_ix_snapshot.len() * 16);
+        for s in &self.primary_ix_snapshot {
+            idx_body.extend_from_slice(&s.ckid);
+            idx_body.extend_from_slice(&s.flags.to_le_bytes());
+            idx_body.extend_from_slice(&s.offset.to_le_bytes());
+            idx_body.extend_from_slice(&s.size.to_le_bytes());
         }
         idx_body
     }
@@ -1883,11 +2016,26 @@ impl AviMuxer {
             if let Some(d) = data_off.checked_sub(qw_base) {
                 if d <= u32::MAX as u64 {
                     let dw_size_with_flag = size | 0x8000_0000;
-                    self.tracks[idx].ix_entries.push(IxStdEntry {
+                    let ix_entry = IxStdEntry {
                         dw_offset: d as u32,
                         dw_size_with_flag,
                         dw_offset_field2: 0,
-                    });
+                    };
+                    self.tracks[idx].ix_entries.push(ix_entry);
+                    if self.options.synthesise_idx1_from_ix && self.segments.is_empty() {
+                        // Side-band chunks (xxtx / xxpc) carry no
+                        // AVIIF_KEYFRAME bit so the demuxer's
+                        // suffix-scanner attributes them to the
+                        // per-stream side-band counter (mirror of the
+                        // `flags = 0` rule below).
+                        let idx1_offset = (d as u32).saturating_sub(4);
+                        self.primary_ix_snapshot.push(PrimaryIxSnapshot {
+                            ckid: fourcc,
+                            flags: 0,
+                            offset: idx1_offset,
+                            size,
+                        });
+                    }
                 }
             }
         }

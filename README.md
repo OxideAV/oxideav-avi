@@ -31,6 +31,7 @@ oxideav-avi = "0.0"
 | OpenDML 2.0 multi-`RIFF AVIX` continuation       | yes   | yes  |
 | OpenDML 2.0 `indx` super-index in `strl`         | yes (parse) | yes (emit) |
 | OpenDML 2.0 `ix##` per-segment std-index in `movi` | yes (parse) | yes (segment-tail emit + opt-in mid-`movi` periodic flush via `AviMuxOptions::with_mid_movi_index`) |
+| `idx1`-from-`ix##` synthesis (AVI 1.0 reader compat) | n/a | yes (`AviMuxOptions::synthesise_idx1_from_ix(true)` rebuilds primary segment's `idx1` from per-packet `ix##` records) |
 | OpenDML 2.0 `LIST odml dmlh` extended header     | yes (parse) | yes (emit) |
 | OpenDML 2.0 `vprp` Video Properties Header       | yes (parse) | yes (NTSC/PAL/SECAM presets + custom aspect) |
 | OpenDML 2.0 `AVI_INDEX_2FIELD` interlaced std-index | yes (parse + metadata surface + per-packet `field2_offset_for_packet` accessor) | yes (`open_avi` + `set_field2_offset`) |

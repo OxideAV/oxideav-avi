@@ -2266,6 +2266,36 @@ pub const WAVE_FORMAT_MPEGLAYER3: u16 = 0x0055;
 /// `WAVE_FORMAT_AAC` per `mmreg.h` (Microsoft's AAC tag). VBR:
 /// requires `strh.dwSampleSize == 0`.
 pub const WAVE_FORMAT_AAC: u16 = 0x00FF;
+/// `WAVE_FORMAT_AAC_ADTS` per `mmreg.h` — AAC carried in ADTS frames
+/// (the alternative tag some captures use instead of `0x00FF`). VBR:
+/// requires `strh.dwSampleSize == 0`. Round-16 candidate 4.
+pub const WAVE_FORMAT_AAC_ADTS: u16 = 0x1601;
+/// `WAVE_FORMAT_DOLBY_AC3_SPDIF` / `WAVE_FORMAT_AC3` per `mmreg.h` —
+/// Dolby Digital AC-3 (SPDIF passthrough form-tag also used in AVI
+/// for AC-3 carriage). VBR: requires `strh.dwSampleSize == 0`.
+/// Round-16 candidate 4.
+pub const WAVE_FORMAT_AC3: u16 = 0x2000;
+/// `WAVE_FORMAT_DTS` per `mmreg.h` — DTS Coherent Acoustics audio.
+/// VBR: requires `strh.dwSampleSize == 0`. Round-16 candidate 4.
+pub const WAVE_FORMAT_DTS: u16 = 0x2001;
+/// `WAVE_FORMAT_WMAUDIO1` per `mmreg.h` — Windows Media Audio v1.
+/// VBR: requires `strh.dwSampleSize == 0`. Round-16 candidate 4.
+pub const WAVE_FORMAT_WMA1: u16 = 0x0160;
+/// `WAVE_FORMAT_WMAUDIO2` per `mmreg.h` — Windows Media Audio v2/v9.
+/// VBR: requires `strh.dwSampleSize == 0`. Round-16 candidate 4.
+pub const WAVE_FORMAT_WMA2: u16 = 0x0161;
+/// `WAVE_FORMAT_WMAUDIO3` / `WMAUDIO_PRO` per `mmreg.h` — Windows
+/// Media Audio Pro. VBR: requires `strh.dwSampleSize == 0`.
+/// Round-16 candidate 4.
+pub const WAVE_FORMAT_WMA_PRO: u16 = 0x0162;
+/// `WAVE_FORMAT_WMAUDIO_LOSSLESS` per `mmreg.h` — Windows Media
+/// Audio Lossless. VBR: requires `strh.dwSampleSize == 0`.
+/// Round-16 candidate 4.
+pub const WAVE_FORMAT_WMA_LOSSLESS: u16 = 0x0163;
+/// Xiph-assigned Opus form-tag for AVI carriage (`0x704F`, ASCII
+/// `pO` little-endian). VBR: requires `strh.dwSampleSize == 0`.
+/// Round-16 candidate 4.
+pub const WAVE_FORMAT_OPUS: u16 = 0x704F;
 
 /// Round-14 candidate 2: classify a WAVEFORMATEX `wFormatTag` per
 /// the AVI 1.0 sample-size invariant.
@@ -2275,10 +2305,25 @@ pub const WAVE_FORMAT_AAC: u16 = 0x00FF;
 /// - `Some(false)` ⇒ CBR codec (fixed bytes per sample);
 ///   `strh.dwSampleSize` MUST be > 0.
 /// - `None` ⇒ no constraint (codec the spec doesn't pin one way or
-///   the other — e.g. WMA, AC-3, custom registrations).
+///   the other — e.g. obscure / custom registrations).
+///
+/// Round-16 candidate 4 widens the VBR side to cover AC-3 / DTS /
+/// WMA1 / WMA2 / WMA Pro / WMA Lossless / Opus / AAC-ADTS — every
+/// modern compressed-audio tag the AVI carriage rules pin to
+/// per-frame packets.
 fn classify_audio_sample_size(format_tag: u16) -> Option<bool> {
     match format_tag {
-        WAVE_FORMAT_MPEG | WAVE_FORMAT_MPEGLAYER3 | WAVE_FORMAT_AAC => Some(true),
+        WAVE_FORMAT_MPEG
+        | WAVE_FORMAT_MPEGLAYER3
+        | WAVE_FORMAT_AAC
+        | WAVE_FORMAT_AAC_ADTS
+        | WAVE_FORMAT_AC3
+        | WAVE_FORMAT_DTS
+        | WAVE_FORMAT_WMA1
+        | WAVE_FORMAT_WMA2
+        | WAVE_FORMAT_WMA_PRO
+        | WAVE_FORMAT_WMA_LOSSLESS
+        | WAVE_FORMAT_OPUS => Some(true),
         WAVE_FORMAT_PCM | WAVE_FORMAT_ALAW | WAVE_FORMAT_MULAW | WAVE_FORMAT_DVI_ADPCM => {
             Some(false)
         }

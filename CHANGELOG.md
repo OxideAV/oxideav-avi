@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`idx1`-from-`ix##` synthesiser (round 16 C1).** New
+  `AviMuxOptions::synthesise_idx1_from_ix(true)` opt-in: when set on
+  an `AviKind::OpenDml` mux, the primary segment's `idx1` body is
+  rebuilt from each stream's `ix##` standard-index records (one
+  16-B `idx1` entry per packet) instead of the muxer's running
+  `IndexEntry` collection. Per AVI 1.0 + OpenDML 2.0 §"Index
+  Locations": AVI 1.0-only readers (Windows Media Player on XP,
+  ffplay's strict AVI 1.0 path) honour `idx1` alone — they don't
+  walk OpenDML `ix##` super-indexes — so an OpenDML-muxed file
+  without `idx1` can't be seeked by them. Closes the long-deferred
+  AVI 1.0 / OpenDML reader-compat gap. AVIX continuation packets
+  are NOT included (idx1 offsets are 32-bit and primary-only). The
+  per-packet snapshot bookkeeping is paid only when the option is
+  on; default `false` and `AviKind::Avi10` mode are byte-equal
+  no-ops vs. round-15.
+- **Wider WAVE_FORMAT_\* constants + VBR validator (round 16 C4).**
+  New public constants in `oxideav_avi::demuxer`: `WAVE_FORMAT_AC3`
+  (`0x2000`), `WAVE_FORMAT_DTS` (`0x2001`), `WAVE_FORMAT_WMA1`
+  (`0x0160`), `WAVE_FORMAT_WMA2` (`0x0161`), `WAVE_FORMAT_WMA_PRO`
+  (`0x0162`), `WAVE_FORMAT_WMA_LOSSLESS` (`0x0163`),
+  `WAVE_FORMAT_OPUS` (`0x704F`), `WAVE_FORMAT_AAC_ADTS` (`0x1601`)
+  per Microsoft `mmreg.h` + the Xiph Opus-in-AVI assignment. The
+  round-14 C2 VBR/CBR validator's lookup table now classifies all
+  eight tags as VBR (require `strh.dwSampleSize == 0`); a non-zero
+  sample size is rejected at `open_avi` with `Error::InvalidData`
+  naming the offending stream and tag. The lenient demuxer
+  entry-point (`open_avi_lenient`) still skips the validator for
+  re-mux / inspection of malformed files.
 - **Audio-only `dwMaxBytesPerSec` fallback (round 15 C2).** Closes the
   round-14 "audio-only file surfaces 0" reporting gap. When no video
   stream is present the per-frame-timing path returns 0, so the
