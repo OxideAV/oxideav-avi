@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-avi/compare/v0.0.5...v0.0.6) - 2026-05-09
+
+### Other
+
+- open_avi_strict + Idx1Flags-aware NO_TIME-skip seek + per-stream dwMaxBytesPerSec cap
+- typed Idx1Flags AVIIF_* accessors + idx1↔ix## cross-validator
+- idx1-from-ix synthesiser + wider WAVE_FORMAT_* constants
+- audio-only dwMaxBytesPerSec fallback + xxtx typed iter + over-budget warning
+- dwMaxBytesPerSec populator + audio sample_size validator + lazy palette-change iterator
+- typed PaletteChange round-trip + dwSuggestedBufferSize populator + named AVIF_* builders
+- side-band data accessors + avih.dwFlags builder + str-keyed all_info_for rows
+- side-band data accessors + avih.dwFlags builder + str-keyed all_info_for
+- top-level LIST INFO + std-index strict seek + xxtx/xxpc emit
+- xxtx text-chunk skip + vprp field-desc override + AvihFlags accessor
+- vprp per-field rect array + dmlh_total_frames + strict-keyframe seek
+- O(1) idx1-flags cache + LIST INFO read accessor + xxpc skip metadata
+- round-7 feature matrix updates (mid-movi ix## + LIST INFO mux)
+- mid-movi ix## periodic flush + multi-value INFO parsing
+- 2-field idx1 flag bits + LIST INFO emit + super-index capacity opt-in
+- Drop cross-crate dev-deps; tests register synthetic codecs
+- per-packet field2 accessor + idx1 2-field hint + VBR duration + super-index overflow signalling
+- feature matrix entries for round-4 additions
+- AVI_INDEX_2FIELD encoder + vprp populator + rec byte budget
+- OpenDML 2.0 dmlh + vprp + 2-field index + LIST rec clusters
+- OpenDML 2.0 ix## std-index emit + parse + seek
+- best-effort parse for truncated-head AVI 1.0
+- prefer params.tag; drop tag_for_codec usage
+- route codec resolution through oxideav-core CodecResolver
+- OpenDML 2.0 super-index emit + parse, MagicYUV FourCC family
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-avi/pull/502))
+
 ### Added
 
 - **Strict idx1↔ix## cross-validator (round 18 C3).** New
