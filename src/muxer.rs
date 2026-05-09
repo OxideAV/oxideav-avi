@@ -184,6 +184,19 @@ pub struct AviMuxOptions {
     /// non-empty. Default `false` (nested in hdrl) preserves the
     /// round-6 byte layout for existing callers.
     pub info_top_level: bool,
+    /// Optional `AVIMAINHEADER.dwFlags` override (round-12 candidate
+    /// 2). `None` keeps the round-6 default
+    /// `AVIF_HASINDEX | AVIF_TRUSTCKTYPE` (`0x0000_0810`); `Some(n)`
+    /// stamps `n` verbatim into the `avih.dwFlags` DWORD per
+    /// Microsoft's `vfw.h` `AVIF_*` constants. Pairs with the round-10
+    /// C3 demuxer accessor [`crate::demuxer::AviDemuxer::avih_flags`]
+    /// so a builder→writer→demuxer round-trip can preserve flag bits
+    /// like `AVIF_ISINTERLEAVED` (0x0100), `AVIF_WASCAPTUREFILE`
+    /// (0x0001_0000), `AVIF_COPYRIGHTED` (0x0002_0000), and
+    /// `AVIF_MUSTUSEINDEX` (0x0020) that the legacy default omits.
+    /// Use [`Self::with_avih_flags`] / [`Self::with_avih_flag_bit`] to
+    /// construct without remembering the constants.
+    pub avih_flags_override: Option<u32>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -448,6 +461,37 @@ impl AviMuxOptions {
     /// payload. No-op when [`Self::with_info`] was never called.
     pub fn with_top_level_info(mut self, on: bool) -> Self {
         self.info_top_level = on;
+        self
+    }
+
+    /// Builder helper: stamp `bits` verbatim into `avih.dwFlags`
+    /// (round-12 candidate 2). Replaces the round-6 default of
+    /// `AVIF_HASINDEX | AVIF_TRUSTCKTYPE` (`0x0000_0810`) with the
+    /// caller's exact value. Use the constants from
+    /// [`crate::demuxer`]'s `AVIF_*` namespace
+    /// (`AVIF_HASINDEX | AVIF_ISINTERLEAVED | AVIF_WASCAPTUREFILE`,
+    /// etc.) per Microsoft's `vfw.h`.
+    ///
+    /// To OR in additional flags on top of the muxer's default
+    /// instead of replacing it, see [`Self::with_avih_flag_bit`].
+    pub fn with_avih_flags(mut self, bits: u32) -> Self {
+        self.avih_flags_override = Some(bits);
+        self
+    }
+
+    /// Builder helper: OR a single `AVIF_*` bit into the muxer's
+    /// default `avih.dwFlags` (round-12 candidate 2). Convenience over
+    /// [`Self::with_avih_flags`] for the common case of "default plus
+    /// one extra bit" — e.g. `with_avih_flag_bit(AVIF_ISINTERLEAVED)`
+    /// to keep the default `AVIF_HASINDEX | AVIF_TRUSTCKTYPE` and
+    /// additionally set the interleaved-streams hint.
+    ///
+    /// Repeated calls keep accumulating bits. Calling
+    /// [`Self::with_avih_flags`] AFTER this method overwrites all
+    /// accumulated bits (caller picks the final value).
+    pub fn with_avih_flag_bit(mut self, bit: u32) -> Self {
+        let base = self.avih_flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
+        self.avih_flags_override = Some(base | bit);
         self
     }
 
@@ -755,7 +799,7 @@ impl Muxer for AviMuxer {
 
         // hdrl LIST with avih + strl*.
         let hdrl_size_off = begin_list(self.output.as_mut(), &LIST, b"hdrl")?;
-        let avih = build_avih(&self.tracks);
+        let avih = build_avih(&self.tracks, self.options.avih_flags_override);
         write_chunk(self.output.as_mut(), b"avih", &avih)?;
         // For OpenDML, embed the super-index in the FIRST stream's strl
         // (typically video). For Avi10, no super-index.
@@ -1687,10 +1731,23 @@ fn write_info_list<W: Write + Seek + ?Sized>(
     Ok(())
 }
 
+/// Default `avih.dwFlags` value: `AVIF_HASINDEX | AVIF_TRUSTCKTYPE`
+/// per Microsoft's `vfw.h` (the round-6 muxer baseline — the bit
+/// pattern matches what a round-trip with the demuxer's `avih_flags()`
+/// surfaces; older comments mislabeled this as
+/// `AVIF_ISINTERLEAVED | AVIF_HASINDEX` but the constant emitted has
+/// always been `0x0810`, which is HASINDEX | TRUSTCKTYPE per
+/// `vfw.h`'s actual bit definitions). Used by
+/// [`AviMuxOptions::with_avih_flag_bit`] as the OR base when the
+/// caller wants "default plus one extra bit" without specifying every
+/// flag explicitly. Override entirely via
+/// [`AviMuxOptions::with_avih_flags`].
+pub const DEFAULT_AVIH_FLAGS: u32 = 0x0000_0810;
+
 /// AVIMAINHEADER (56 bytes): dwMicroSecPerFrame, dwMaxBytesPerSec,
 /// dwPaddingGranularity, dwFlags, dwTotalFrames, dwInitialFrames, dwStreams,
 /// dwSuggestedBufferSize, dwWidth, dwHeight, dwReserved[4].
-fn build_avih(tracks: &[TrackState]) -> Vec<u8> {
+fn build_avih(tracks: &[TrackState], flags_override: Option<u32>) -> Vec<u8> {
     let (video_micro_per_frame, width, height) = tracks
         .iter()
         .find(|t| &t.entry.strh_type == b"vids")
@@ -1704,7 +1761,11 @@ fn build_avih(tracks: &[TrackState]) -> Vec<u8> {
             (upf, w, h)
         })
         .unwrap_or((0, 0, 0));
-    let flags: u32 = 0x00000810; // AVIF_ISINTERLEAVED | AVIF_HASINDEX
+    // Round-12 candidate 2: caller may override `dwFlags` via
+    // [`AviMuxOptions::with_avih_flags`] / [`with_avih_flag_bit`].
+    // Default `AVIF_HASINDEX | AVIF_TRUSTCKTYPE` per Microsoft's
+    // `vfw.h` (the round-6 baseline; see [`DEFAULT_AVIH_FLAGS`]).
+    let flags: u32 = flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
     let total_frames: u32 = 0; // patched post-hoc
     let streams = tracks.len() as u32;
 

@@ -431,9 +431,33 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
     // with [`AviDemuxer::palette_change_count`].
     let mut palette_change_counts: Vec<u32> = vec![0u32; streams.len()];
     let mut text_chunk_counts: Vec<u32> = vec![0u32; streams.len()];
+    // Round-12 candidate 1: also buffer the actual `xxpc`/`xxtx` chunk
+    // bodies eagerly when `idx1` is present so callers can inspect
+    // them via `palette_change_data` / `text_chunk_data` without
+    // first walking every regular packet via `next_packet`.
+    let mut palette_change_data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); streams.len()];
+    let mut text_chunk_data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); streams.len()];
+    let mut sideband_data_loaded = false;
     let idx_table = if let Some(raw) = idx1_raw {
         scan_idx1_for_suffix(&raw, &streams, *b"pc", &mut palette_change_counts);
         scan_idx1_for_suffix(&raw, &streams, *b"tx", &mut text_chunk_counts);
+        read_sideband_data_from_idx1(
+            &mut *input,
+            &raw,
+            movi_start,
+            &streams,
+            *b"pc",
+            &mut palette_change_data,
+        );
+        read_sideband_data_from_idx1(
+            &mut *input,
+            &raw,
+            movi_start,
+            &streams,
+            *b"tx",
+            &mut text_chunk_data,
+        );
+        sideband_data_loaded = true;
         build_idx_table(&mut *input, &raw, movi_start, &streams)?
     } else {
         Vec::new()
@@ -631,6 +655,9 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
         avih_flags: avih.as_ref().map(|h| h.flags).unwrap_or(0),
         vprps,
         dmlh_total_frames,
+        palette_change_data,
+        text_chunk_data,
+        sideband_data_loaded,
     })
 }
 
@@ -1665,6 +1692,98 @@ fn scan_idx1_for_suffix(raw: &[u8], streams: &[StreamInfo], suffix: [u8; 2], cou
     }
 }
 
+/// Round-12 candidate 1: walk `idx1` for entries whose `ckid` ends in
+/// `suffix` (`b"pc"` for palette change, `b"tx"` for text/subtitle),
+/// resolve each entry's offset to a file-absolute chunk header, and
+/// read the chunk body into the matching per-stream Vec. Mirrors the
+/// offset-resolution rules in [`build_idx_table`] (idx1 offsets may be
+/// `movi`-relative or file-absolute; we use the same `movi_relative`
+/// flag the seek-table builder probed).
+///
+/// Returns silently on malformed input (truncated raw, short header,
+/// over-declared body sizes) — side-band data is best-effort and a
+/// missing chunk body just leaves the corresponding slot empty so
+/// downstream `palette_change_data(s)[k]` still indexes correctly with
+/// the per-stream count.
+fn read_sideband_data_from_idx1<R: ReadSeek + ?Sized>(
+    r: &mut R,
+    raw: &[u8],
+    movi_start: u64,
+    streams: &[StreamInfo],
+    suffix: [u8; 2],
+    out: &mut [Vec<Vec<u8>>],
+) {
+    if raw.len() < 16 || out.len() < streams.len() {
+        return;
+    }
+    // Same offset-base probe as `build_idx_table` so the two stay in sync.
+    let n = raw.len() / 16;
+    let movi_fourcc_pos = movi_start.saturating_sub(4);
+    let mut probe_raw_offset: Option<u32> = None;
+    let mut probe_ckid: Option<[u8; 4]> = None;
+    for i in 0..n {
+        let base = i * 16;
+        let off =
+            u32::from_le_bytes([raw[base + 8], raw[base + 9], raw[base + 10], raw[base + 11]]);
+        if off != 0 {
+            let mut ckid = [0u8; 4];
+            ckid.copy_from_slice(&raw[base..base + 4]);
+            probe_raw_offset = Some(off);
+            probe_ckid = Some(ckid);
+            break;
+        }
+    }
+    let mut movi_relative = true;
+    if let (Some(raw_off), Some(ckid)) = (probe_raw_offset, probe_ckid) {
+        let try_movi = movi_fourcc_pos.checked_add(raw_off as u64);
+        let movi_ok = match try_movi {
+            Some(p) => probe_offset_has_ckid(r, p, &ckid).unwrap_or(false),
+            None => false,
+        };
+        let abs_ok = probe_offset_has_ckid(r, raw_off as u64, &ckid).unwrap_or(false);
+        movi_relative = match (movi_ok, abs_ok) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => true,
+        };
+    }
+    let base_off = if movi_relative { movi_fourcc_pos } else { 0 };
+    for i in 0..n {
+        let base = i * 16;
+        let ckid = [raw[base], raw[base + 1], raw[base + 2], raw[base + 3]];
+        if ckid[2] != suffix[0] || ckid[3] != suffix[1] {
+            continue;
+        }
+        let stream = match parse_stream_index(&ckid) {
+            Some(s) => s,
+            None => continue,
+        };
+        let s = stream as usize;
+        if s >= out.len() || s >= streams.len() {
+            continue;
+        }
+        let raw_off =
+            u32::from_le_bytes([raw[base + 8], raw[base + 9], raw[base + 10], raw[base + 11]]);
+        let size = u32::from_le_bytes([
+            raw[base + 12],
+            raw[base + 13],
+            raw[base + 14],
+            raw[base + 15],
+        ]);
+        let chunk_off = base_off.saturating_add(raw_off as u64);
+        // `chunk_off` points at the 4-byte ckid; body starts 8 bytes in.
+        // Read the body bytes directly. Failure leaves the chunk slot
+        // out (best-effort).
+        if r.seek(SeekFrom::Start(chunk_off + 8)).is_err() {
+            continue;
+        }
+        match read_body_bounded(r, size) {
+            Ok(body) => out[s].push(body),
+            Err(_) => continue,
+        }
+    }
+}
+
 fn build_idx_table<R: ReadSeek + ?Sized>(
     r: &mut R,
     raw: &[u8],
@@ -1878,6 +1997,33 @@ pub struct AviDemuxer {
     /// typed [`AviDemuxer::dmlh_total_frames`] accessor in addition
     /// to the existing `avi:total_frames_all_segments` metadata key.
     dmlh_total_frames: Option<u32>,
+    /// Per-stream buffered `xxpc` palette-change chunk bodies in file
+    /// order (round-12 candidate 1). Each inner Vec is the raw chunk
+    /// payload — typically an AVI 1.0 `BITMAPINFO`-style palette delta:
+    /// 1-byte `bFirstEntry`, 1-byte `bNumEntries`, 2-byte `wFlags`,
+    /// then `bNumEntries * 4`-byte palette quads. Surfaced via
+    /// [`AviDemuxer::palette_change_data`] so muxer→demuxer round-trips
+    /// can compare bytes directly with what
+    /// [`crate::muxer::AviMuxer::write_palette_change`] emitted.
+    /// Populated eagerly from `idx1` at `open()`; for `idx1`-less
+    /// (OpenDML-only) files the lazy `next_packet` walk appends as it
+    /// sees each chunk so callers iterating packets get the data
+    /// progressively. Empty when no `xxpc` chunks were seen for that
+    /// stream.
+    palette_change_data: Vec<Vec<Vec<u8>>>,
+    /// Per-stream buffered `xxtx` text/subtitle chunk bodies in file
+    /// order (round-12 candidate 1). Mirror of
+    /// [`Self::palette_change_data`] for the text-stream FourCC family.
+    /// Each inner Vec is the chunk payload verbatim — typically a
+    /// caption / subtitle / cuepoint string written by
+    /// [`crate::muxer::AviMuxer::write_text_chunk`].
+    text_chunk_data: Vec<Vec<Vec<u8>>>,
+    /// `true` once the side-band data buffers have been populated from
+    /// `idx1` at `open()` time. The lazy `next_packet` skip-and-buffer
+    /// path checks this flag to avoid double-appending the same chunks
+    /// once the eager path already cached them. `false` for `idx1`-less
+    /// (OpenDML-only) files where `next_packet` is the only producer.
+    sideband_data_loaded: bool,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -2223,7 +2369,28 @@ impl Demuxer for AviDemuxer {
                         }
                         self.palette_change_counts[s] =
                             self.palette_change_counts[s].saturating_add(1);
-                        skip_chunk(&mut *self.input, &hdr)?;
+                        // Round-12 C1: also buffer the body so
+                        // `palette_change_data(stream)` can return it.
+                        // Skip when the eager `idx1` walk in `open()`
+                        // already populated the buffer (avoids double-
+                        // append on idx1-bearing files where
+                        // `next_packet` re-walks the same chunks).
+                        if self.sideband_data_loaded {
+                            skip_chunk(&mut *self.input, &hdr)?;
+                        } else {
+                            if self.palette_change_data.len() <= s {
+                                self.palette_change_data.resize(s + 1, Vec::new());
+                            }
+                            match read_body_bounded(&mut *self.input, hdr.size) {
+                                Ok(body) => {
+                                    skip_pad(&mut *self.input, hdr.size)?;
+                                    self.palette_change_data[s].push(body);
+                                }
+                                Err(_) => {
+                                    skip_chunk(&mut *self.input, &hdr)?;
+                                }
+                            }
+                        }
                         continue;
                     }
                     // Round-10 C1: explicitly recognise `xxtx`
@@ -2241,7 +2408,23 @@ impl Demuxer for AviDemuxer {
                             self.text_chunk_counts.resize(s + 1, 0);
                         }
                         self.text_chunk_counts[s] = self.text_chunk_counts[s].saturating_add(1);
-                        skip_chunk(&mut *self.input, &hdr)?;
+                        // Round-12 C1: same body-buffer hookup as `xxpc`.
+                        if self.sideband_data_loaded {
+                            skip_chunk(&mut *self.input, &hdr)?;
+                        } else {
+                            if self.text_chunk_data.len() <= s {
+                                self.text_chunk_data.resize(s + 1, Vec::new());
+                            }
+                            match read_body_bounded(&mut *self.input, hdr.size) {
+                                Ok(body) => {
+                                    skip_pad(&mut *self.input, hdr.size)?;
+                                    self.text_chunk_data[s].push(body);
+                                }
+                                Err(_) => {
+                                    skip_chunk(&mut *self.input, &hdr)?;
+                                }
+                            }
+                        }
                         continue;
                     }
                     let accept = suffix == expected
@@ -2462,6 +2645,27 @@ impl AviDemuxer {
         None
     }
 
+    /// String-keyed sibling of [`Self::info_all_for`] (round-12
+    /// candidate 3). Accepts the 4-byte `LIST INFO` FourCC as a `&str`
+    /// (e.g. `"INAM"`, `"IART"`, `"ICMT"`) instead of a `[u8; 4]`
+    /// literal so callers that already have FourCCs as strings —
+    /// from JSON, command-line flags, or metadata mapping tables —
+    /// don't have to convert. Non-4-character keys return an empty
+    /// Vec (no canonical-key fallback: this is the strict-FourCC
+    /// surface, not the canonical-name lookup).
+    ///
+    /// Returns every matching value in file order. For multi-entry
+    /// FourCCs (e.g. two `IART` for two artists) returns both. Empty
+    /// Vec means no `LIST INFO` entry was parsed for that FourCC.
+    pub fn all_info_for(&self, fourcc: &str) -> Vec<&str> {
+        let bytes = fourcc.as_bytes();
+        if bytes.len() != 4 {
+            return Vec::new();
+        }
+        let id = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        self.info_all_for(id)
+    }
+
     /// `LIST INFO` round-trip read accessor for repeating FourCCs
     /// (round-8 candidate 2). The `LIST INFO` registry is a flat
     /// list, so a single `id` may appear multiple times (e.g. two
@@ -2529,6 +2733,52 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Per-stream `xxpc` palette-change chunk bodies in file order
+    /// (round-12 candidate 1). Returns the raw payloads written by
+    /// [`crate::muxer::AviMuxer::write_palette_change`] (or any other
+    /// AVI 1.0 writer) — typically a `BITMAPINFO`-style palette delta:
+    /// 1-byte `bFirstEntry`, 1-byte `bNumEntries`, 2-byte `wFlags`,
+    /// then `bNumEntries * 4`-byte palette quads. Closes the round-trip
+    /// pair with the round-11 C3 muxer write helper so callers can
+    /// verify byte-equality across mux→demux without re-reading the
+    /// raw file.
+    ///
+    /// For files that carry an `idx1`, the bodies are populated
+    /// eagerly at `open()` and available before the first
+    /// [`oxideav_core::Demuxer::next_packet`] call. For `idx1`-less
+    /// (OpenDML-only) files, `xxpc` chunks land in the buffer as the
+    /// `next_packet` walk encounters them (the demuxer skips them from
+    /// the regular packet stream but reads their body for this
+    /// accessor).
+    ///
+    /// Returns an empty slice for unknown `stream_index`. The returned
+    /// slice's length matches [`Self::palette_change_count`] when the
+    /// data path is fully populated.
+    pub fn palette_change_data(&self, stream_index: u32) -> &[Vec<u8>] {
+        self.palette_change_data
+            .get(stream_index as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Per-stream `xxtx` text/subtitle chunk bodies in file order
+    /// (round-12 candidate 1). Mirror of [`Self::palette_change_data`]
+    /// for the text family — returns the verbatim payloads as written
+    /// by [`crate::muxer::AviMuxer::write_text_chunk`] (typically a
+    /// caption / subtitle / cuepoint string per `mmsystem.h`'s
+    /// `ckidAVITextSF` convention).
+    ///
+    /// Same population rules as `palette_change_data`: eagerly cached
+    /// from `idx1` at `open()` when present, else populated lazily by
+    /// the `next_packet` walk for OpenDML-only files. The slice length
+    /// matches [`Self::text_chunk_count`] when fully populated.
+    pub fn text_chunk_data(&self, stream_index: u32) -> &[Vec<u8>] {
+        self.text_chunk_data
+            .get(stream_index as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Typed [`AvihFlags`] decode of `AVIMAINHEADER.dwFlags` (round-10

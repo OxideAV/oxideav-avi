@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Side-band chunk data accessors (round 12 C1).** Closes the byte
+  round-trip with round 11 C3's `write_palette_change` /
+  `write_text_chunk` muxer write helpers. New
+  `AviDemuxer::palette_change_data(stream) -> &[Vec<u8>]` and
+  `AviDemuxer::text_chunk_data(stream) -> &[Vec<u8>]` accessors return
+  every `xxpc` / `xxtx` chunk body for a given stream in file order.
+  Bodies are populated eagerly from `idx1` at `open()` time when
+  present (the AVI 1.0 default), so callers can inspect palette /
+  caption metadata without paying for a full `next_packet` walk; for
+  `idx1`-less (OpenDML-only) files the lazy `next_packet` path
+  appends each chunk body as it sees it. Slice length matches the
+  existing `palette_change_count` / `text_chunk_count` accessors.
+- **`avih.dwFlags` builder (round 12 C2).**
+  `AviMuxOptions::with_avih_flags(bits)` stamps a verbatim u32 into
+  `avih.dwFlags`; `AviMuxOptions::with_avih_flag_bit(bit)` ORs a
+  single `AVIF_*` bit on top of the muxer's `DEFAULT_AVIH_FLAGS`
+  baseline (`AVIF_HASINDEX | AVIF_TRUSTCKTYPE`). Pairs with the round
+  10 C3 `AviDemuxer::avih_flags()` typed accessor so a builder →
+  writer → demuxer round-trip can preserve flag bits like
+  `AVIF_ISINTERLEAVED` (0x0100), `AVIF_WASCAPTUREFILE`
+  (0x0001_0000), `AVIF_COPYRIGHTED` (0x0002_0000), and
+  `AVIF_MUSTUSEINDEX` (0x0020) that the legacy round-6 default
+  omits. Public `DEFAULT_AVIH_FLAGS = 0x0000_0810` constant lets
+  callers reference the baseline by name.
+- **String-keyed `LIST INFO` accessor (round 12 C3).**
+  `AviDemuxer::all_info_for(fourcc: &str) -> Vec<&str>` is a sibling
+  of round 8 C2's `info_all_for([u8; 4])` that accepts the FourCC as
+  a `&str` (e.g. `"INAM"`, `"IART"`, `"ICMT"`) instead of a byte
+  literal. Returns every matching value in file order. Non-4-character
+  keys return an empty Vec; valid 4-char keys delegate to
+  `info_all_for` so behaviour stays consistent across both lookup
+  shapes.
 - **Top-level `LIST INFO` muxer write path (round 11 C1).**
   `AviMuxOptions::with_top_level_info(true)` now emits the metadata
   `LIST INFO` chunk as a sibling of `LIST hdrl` (between hdrl and
