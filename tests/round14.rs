@@ -183,13 +183,14 @@ fn max_bytes_per_sec_zero_when_no_packets_written() {
 }
 
 #[test]
-fn max_bytes_per_sec_zero_for_audio_only_file() {
-    // Round-14 C1: the populator pulls dwMicroSecPerFrame from the
-    // first video stream. Audio-only files have no video stream → no
-    // usable per-frame timing, so the populator surfaces 0 instead of
-    // dividing by garbage. (Capture-card players with audio-only
-    // recordings already treat 0 as "rate unknown" and pace from
-    // wave_format.avg_bytes_per_sec instead.)
+fn max_bytes_per_sec_audio_only_falls_back_to_wave_format_sum() {
+    // Round-15 C2: closes round-14's "audio-only file surfaces 0"
+    // gap. With no video stream the per-frame timing path returns 0,
+    // so the populator now falls back to summing each audio track's
+    // WAVEFORMATEX `nAvgBytesPerSec` (per AVI 1.0 §3.1, the right
+    // pacing budget for an audio-only file). PCM s16le stereo at
+    // 48 kHz → block_align = 2 ch × 2 B = 4, nAvgBytesPerSec =
+    // 48_000 × 4 = 192_000.
     let mut params =
         CodecParameters::audio(CodecId::new("pcm_s16le")).with_tag(CodecTag::wave_format(0x0001));
     params.channels = Some(2);
@@ -227,8 +228,8 @@ fn max_bytes_per_sec_zero_for_audio_only_file() {
     let bytes = std::fs::read(&tmp).unwrap();
     let got = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]);
     assert_eq!(
-        got, 0,
-        "audio-only mux must surface zero (no usable frame rate)"
+        got, 192_000,
+        "audio-only mux must surface sum(wave_format.avg_bytes_per_sec)"
     );
 }
 

@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Audio-only `dwMaxBytesPerSec` fallback (round 15 C2).** Closes the
+  round-14 "audio-only file surfaces 0" reporting gap. When no video
+  stream is present the per-frame-timing path returns 0, so the
+  populator now falls back to summing every audio track's
+  WAVEFORMATEX `nAvgBytesPerSec` (strf body bytes 8..12, LE) per AVI
+  1.0 §3.1. For PCM s16le stereo @ 48 kHz this lands the spec-blessed
+  `48_000 × 4 = 192_000`. Returns 0 only when there are no audio
+  tracks (or every audio track had a zero `avg_bytes_per_sec`). The
+  `AviMuxOptions::with_max_bytes_per_sec(n)` override stays
+  authoritative when set.
+- **`text_chunk_typed_iter` + `TextChunk` typed round-trip (round 15
+  C3).** Mirrors the round-14 `palette_change_typed_iter` pattern
+  symmetrically for the `xxtx` text/subtitle chunk family. New
+  `demuxer::TextChunk { codepage, language, dialect, body }` typed
+  struct with `parse(&[u8]) -> Option<Self>` and `to_bytes() ->
+  Vec<u8>` per Microsoft `vfw.h`'s 6-byte text-chunk header
+  (`wCodePage` / `wLanguage` / `wDialect` + raw payload). Codepage
+  `0` and `65001` decode/encode as UTF-8 (lossy on invalid
+  sequences); any other code page uses a Latin-1 byte pass-through so
+  a `parse → to_bytes` cycle on the same buffer is byte-exact. New
+  `AviDemuxer::text_chunk_typed(stream) -> Vec<TextChunk>` (eager)
+  and `text_chunk_typed_iter(stream) -> TextChunkTypedIter<'_>`
+  (lazy, ExactSizeIterator) accessors. New
+  `AviMuxer::with_text_chunk_typed(stream, &TextChunk)` writes the
+  typed struct via the existing raw-bytes `write_text_chunk` path.
+- **`avi:over_budget` warning metadata (round 15 C1).** Demuxer
+  surfaces a new `avi:over_budget = "expected_max=N stamped=M"`
+  metadata key when the file's stamped `avih.dwMaxBytesPerSec` is
+  smaller than `sum(audio.avg_bytes_per_sec) +
+  computed_video_bytes_per_sec` (the per-stream demand a capture-card
+  player must allocate disk-read pacing for). Audio bytes-per-sec
+  comes from each `auds` stream's parsed WAVEFORMATEX (preserved on
+  `params.bit_rate / 8`); video bytes-per-sec from the sum of idx1
+  entry sizes for `vids` streams divided by the file's
+  `duration_micros`. Warning is skipped silently when the avih is
+  absent, the stamp is 0 (writer didn't bother), there's no usable
+  duration, or there's no idx1 (no video bitrate term) — so no false
+  positives on minimal / corner-case files.
 - **`avih.dwMaxBytesPerSec` populator (round 14 C1).**
   `AviMuxer::write_trailer` now patches `avih.dwMaxBytesPerSec` (body
   offset 4, file offset 36) with the file's approximate maximum data

@@ -1403,7 +1403,15 @@ impl AviMuxer {
             // Pull dwMicroSecPerFrame from the first video stream
             // (matches `build_avih`'s source of truth). Audio-only
             // files have no video stream → no usable
-            // micro_sec_per_frame and we surface 0.
+            // micro_sec_per_frame and we fall back to summing
+            // per-stream WAVEFORMATEX `nAvgBytesPerSec` (round-15
+            // candidate 2). Per AVI 1.0 §3.1, the field is the
+            // approximate maximum data rate the file requires; for
+            // audio-only files the per-stream `avg_bytes_per_sec`
+            // is exactly the right pacing budget (a CBR sum gives
+            // the wire rate; a VBR codec's `avg_bytes_per_sec` is
+            // its declared average and the spec-blessed proxy when
+            // no peak is known).
             let micro_per_frame: u64 = self
                 .tracks
                 .iter()
@@ -1417,7 +1425,17 @@ impl AviMuxer {
             let total_bytes: u64 = self.tracks.iter().map(|t| t.total_bytes).sum();
             let micros: u64 = (total_video_frames as u64).saturating_mul(micro_per_frame);
             if micros == 0 || total_bytes == 0 {
-                0
+                // Round-15 C2: audio-only fallback. Sum every audio
+                // track's WAVEFORMATEX `nAvgBytesPerSec` (strf body
+                // bytes 8..12, LE). Returns 0 when there are no
+                // audio tracks (or each one had a zero
+                // avg_bytes_per_sec, which most CBR PCM tracks
+                // never do but a misconfigured VBR encoder may).
+                self.tracks
+                    .iter()
+                    .filter(|t| &t.entry.strh_type == b"auds")
+                    .filter_map(|t| audio_strf_avg_bytes_per_sec(&t.entry.strf))
+                    .fold(0u32, |acc, v| acc.saturating_add(v))
             } else {
                 // bytes_per_sec = total_bytes * 1_000_000 / micros
                 // Use u128 for the intermediate to avoid overflow
@@ -1745,6 +1763,27 @@ impl AviMuxer {
     ) -> Result<()> {
         let body = change.to_bytes();
         self.write_palette_change(stream_index, &body)
+    }
+
+    /// Typed sibling of [`Self::write_text_chunk`] (round-15
+    /// candidate 3).
+    ///
+    /// Serialises the [`crate::demuxer::TextChunk`] struct into the
+    /// VfW-style `xxtx` body layout (2-byte LE `wCodePage` /
+    /// `wLanguage` / `wDialect` followed by the body bytes — UTF-8
+    /// for codepage `0` / `65001`, Latin-1 truncation otherwise) and
+    /// emits it via the existing raw-bytes `write_text_chunk` path.
+    /// Closes the typed round-trip with
+    /// [`crate::demuxer::AviDemuxer::text_chunk_typed`] so callers
+    /// don't have to hand-pack the 6-byte text-chunk header. Mirror
+    /// of the round-13 [`Self::with_palette_change_typed`] pattern.
+    pub fn with_text_chunk_typed(
+        &mut self,
+        stream_index: u32,
+        text: &crate::demuxer::TextChunk,
+    ) -> Result<()> {
+        let body = text.to_bytes();
+        self.write_text_chunk(stream_index, &body)
     }
 
     /// Common path for `NN<suffix>` side-band chunks (text / palette
@@ -2268,6 +2307,24 @@ fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> 
 /// converted back to a wall-clock duration.
 ///
 /// Non-audio streams always get 1 per packet (frame count).
+/// Pull `nAvgBytesPerSec` (the third u32, byte offset 8..12) out of a
+/// WAVEFORMATEX strf body (round-15 candidate 2). Returns `None` when
+/// the strf is shorter than 12 bytes (defensive — the spec's minimum
+/// is 14 for legacy WAVEFORMAT, 16 for PCMWAVEFORMAT, 18 for the full
+/// WAVEFORMATEX, and `build_audio_strf` always emits 18+) or when the
+/// declared rate is zero.
+fn audio_strf_avg_bytes_per_sec(strf: &[u8]) -> Option<u32> {
+    if strf.len() < 12 {
+        return None;
+    }
+    let bps = u32::from_le_bytes([strf[8], strf[9], strf[10], strf[11]]);
+    if bps == 0 {
+        None
+    } else {
+        Some(bps)
+    }
+}
+
 fn sample_count_of_packet(
     stream: &StreamInfo,
     entry: &StrfEntry,

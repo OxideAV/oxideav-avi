@@ -693,6 +693,69 @@ fn open_avi_inner(
         }
     }
 
+    // Round-15 candidate 1: surface a "stamped dwMaxBytesPerSec is
+    // smaller than the per-stream demand" warning under the
+    // `avi:over_budget` metadata key. Per AVI 1.0 §3.1 the field is
+    // the approximate maximum data rate; a capture-card player that
+    // sized its disk-read pacing budget from this value will under-
+    // allocate when the real demand exceeds it. We compute the
+    // expected demand as `sum(audio.avg_bytes_per_sec) +
+    // computed_video_bytes_per_sec`, where the audio sum comes from
+    // each `auds` stream's parsed WAVEFORMATEX `nAvgBytesPerSec`
+    // (preserved on `params.bit_rate / 8` by `build_stream`) and the
+    // video bytes-per-sec comes from `sum(idx1 entry sizes for vids
+    // streams) * 1_000_000 / duration_micros`. Skip silently when:
+    //   - avih is missing,
+    //   - dwMaxBytesPerSec is 0 (writer didn't bother — there's no
+    //     stamped value to compare against),
+    //   - duration_micros is 0 (no usable per-frame timing for the
+    //     video bitrate term — false positives outweigh signal),
+    //   - the file has no idx1 (the video bitrate term is 0 and
+    //     audio-only pacing is already exact in the populator).
+    if let Some(h) = &avih {
+        if h.max_bytes_per_sec > 0 && duration_micros > 0 && !idx_table.is_empty() {
+            // Audio: pull `avg_bytes_per_sec` per stream off
+            // `params.bit_rate` (which `build_stream` already set
+            // from the parsed WAVEFORMATEX's `nAvgBytesPerSec * 8`).
+            let audio_sum: u64 = streams
+                .iter()
+                .filter(|s| matches!(s.params.media_type, MediaType::Audio))
+                .filter_map(|s| s.params.bit_rate)
+                .map(|br| br / 8)
+                .sum();
+            // Video: sum of idx1 entry sizes for video streams,
+            // converted to bytes/sec via the file duration.
+            let mut video_bytes: u64 = 0;
+            for e in &idx_table {
+                let s = e.stream as usize;
+                if let Some(stream) = streams.get(s) {
+                    if matches!(stream.params.media_type, MediaType::Video) {
+                        video_bytes = video_bytes.saturating_add(e.size as u64);
+                    }
+                }
+            }
+            // bytes_per_sec = video_bytes * 1_000_000 / micros.
+            let video_bps = if duration_micros > 0 {
+                let big = (video_bytes as u128) * 1_000_000u128;
+                let bps = big / (duration_micros as u128);
+                bps.min(u32::MAX as u128) as u64
+            } else {
+                0
+            };
+            let expected = audio_sum.saturating_add(video_bps);
+            if expected > h.max_bytes_per_sec as u64 {
+                metadata.push((
+                    "avi:over_budget".into(),
+                    format!(
+                        "expected_max={} stamped={}",
+                        expected.min(u32::MAX as u64),
+                        h.max_bytes_per_sec
+                    ),
+                ));
+            }
+        }
+    }
+
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
@@ -2438,6 +2501,156 @@ impl<'a> Iterator for PaletteChangeTypedIter<'a> {
 
 impl<'a> ExactSizeIterator for PaletteChangeTypedIter<'a> {}
 
+/// Typed decode of an `xxtx` text/subtitle chunk body (round-15
+/// candidate 3).
+///
+/// Per Microsoft `vfw.h` the `xxtx` chunk body for an AVI text stream
+/// (`txts` `fccType`) carries a 6-byte fixed header followed by the
+/// raw text payload:
+/// ```text
+/// WORD  wCodePage  // ANSI code page (e.g. 0 = system default,
+///                  //   1252 = Windows-1252, 65001 = UTF-8). Per
+///                  //   `mmsystem.h`'s `MM_PALETTE_FOREGROUND` /
+///                  //   text-stream conventions, 0 means "no
+///                  //   conversion — interpret bytes as the system
+///                  //   default", which is what most legacy capture
+///                  //   tools emit.
+/// WORD  wLanguage  // Primary language tag (LANGID; ITU/ISO not
+///                  //   normatively pinned by AVI, but `vfw.h`
+///                  //   re-uses Win32's `LANGID` packed `(sublang
+///                  //   << 10) | primary`).
+/// WORD  wDialect   // Sub-language / dialect (0 = neutral).
+/// BYTE  body[]     // Raw payload — code-page bytes for an ANSI
+///                  //   page, UTF-8 octets for codepage 65001.
+/// ```
+/// Composed by [`AviDemuxer::text_chunk_typed`] /
+/// [`AviDemuxer::text_chunk_typed_iter`] from the round-12 raw
+/// [`AviDemuxer::text_chunk_data`] accessor; consumed by
+/// [`crate::muxer::AviMuxer::with_text_chunk_typed`] to write the
+/// equivalent chunk back. Closes the typed round-trip pair so callers
+/// don't have to hand-pack the 6-byte VfW header.
+///
+/// `body` is a `String`: when `codepage == 65001` (or `0`, treated as
+/// "best-effort UTF-8") the parser decodes the raw bytes as UTF-8
+/// (lossy — invalid sequences become `U+FFFD`); for any other code
+/// page the bytes are interpreted as Latin-1 (each byte → one
+/// `char`), preserving every octet without depending on a code-page
+/// converter crate. Callers that need byte-exact round-trip for a
+/// non-UTF-8 page should re-encode their `String` themselves before
+/// muxing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextChunk {
+    /// `wCodePage`. `0` means "system default" per `vfw.h`; `65001`
+    /// is UTF-8 (the modern recommendation); anything else is a
+    /// Windows ANSI code page.
+    pub codepage: u16,
+    /// `wLanguage` — primary LANGID per Microsoft conventions. AVI
+    /// itself doesn't pin a registry; modern tools use BCP 47 tags
+    /// out-of-band (e.g. via the parent `txts` strh's `wLanguage`).
+    pub language: u16,
+    /// `wDialect` — sub-language / dialect ID. `0` is neutral.
+    pub dialect: u16,
+    /// Decoded text body. UTF-8 for `codepage == 0` or `65001`,
+    /// Latin-1 (each byte → one `char`) otherwise. See struct docs
+    /// for the round-trip caveat on non-UTF-8 pages.
+    pub body: String,
+}
+
+impl TextChunk {
+    /// Parse a raw `xxtx` chunk body into the typed shape. Returns
+    /// `None` for bodies shorter than the 6-byte fixed header.
+    /// Body decoding picks UTF-8 (lossy) for codepage `0` / `65001`
+    /// and Latin-1 byte-pass-through for any other code page; see
+    /// the struct-level docs for the round-trip caveat.
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < 6 {
+            return None;
+        }
+        let codepage = u16::from_le_bytes([body[0], body[1]]);
+        let language = u16::from_le_bytes([body[2], body[3]]);
+        let dialect = u16::from_le_bytes([body[4], body[5]]);
+        let tail = &body[6..];
+        let text = if codepage == 0 || codepage == 65001 {
+            // Interpret as UTF-8 (lossy on invalid sequences).
+            String::from_utf8_lossy(tail).into_owned()
+        } else {
+            // Latin-1 byte pass-through: every byte is one char.
+            // Preserves the raw octets so a downstream caller can
+            // re-encode if it knows the page; avoids pulling in a
+            // code-page converter crate for the common path.
+            tail.iter().map(|&b| b as char).collect()
+        };
+        Some(Self {
+            codepage,
+            language,
+            dialect,
+            body: text,
+        })
+    }
+
+    /// Encode the typed shape back into a raw `xxtx` chunk body
+    /// suitable for [`crate::muxer::AviMuxer::write_text_chunk`].
+    /// Output layout matches [`Self::parse`]'s expectations exactly:
+    /// 2-byte LE `codepage`, 2-byte LE `language`, 2-byte LE
+    /// `dialect`, then the body bytes (UTF-8 for codepage `0` /
+    /// `65001`, Latin-1 truncated to the low byte of each `char`
+    /// otherwise — symmetric to `parse`'s decode rule).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(6 + self.body.len());
+        out.extend_from_slice(&self.codepage.to_le_bytes());
+        out.extend_from_slice(&self.language.to_le_bytes());
+        out.extend_from_slice(&self.dialect.to_le_bytes());
+        if self.codepage == 0 || self.codepage == 65001 {
+            out.extend_from_slice(self.body.as_bytes());
+        } else {
+            // Latin-1 pass-through inverse: take the low byte of
+            // each char. For an unmodified parse→to_bytes cycle on
+            // the same body this is byte-exact (parse mapped each
+            // byte to `b as char` whose low byte is `b`).
+            for c in self.body.chars() {
+                out.push((c as u32) as u8);
+            }
+        }
+        out
+    }
+}
+
+/// Lazy iterator returned by [`AviDemuxer::text_chunk_typed_iter`]
+/// (round-15 candidate 3). Mirrors [`PaletteChangeTypedIter`] for the
+/// `xxtx` text-chunk family — yields one `Result<TextChunk>` per
+/// chunk for the requested stream, decoding the typed shape on
+/// demand instead of materialising the full Vec. Useful for
+/// long-running subtitle / cuepoint streams where the full set may
+/// be tens of thousands of entries.
+pub struct TextChunkTypedIter<'a> {
+    bodies: &'a [Vec<u8>],
+    next: usize,
+}
+
+impl<'a> Iterator for TextChunkTypedIter<'a> {
+    type Item = Result<TextChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let body = self.bodies.get(self.next)?;
+        self.next += 1;
+        match TextChunk::parse(body) {
+            Some(tc) => Some(Ok(tc)),
+            None => Some(Err(Error::invalid(format!(
+                "AVI: xxtx body #{} ({} bytes) failed to decode as TextChunk",
+                self.next - 1,
+                body.len()
+            )))),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.bodies.len().saturating_sub(self.next);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for TextChunkTypedIter<'a> {}
+
 /// Decoded `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
 ///
 /// The 9 fixed DWORDs at the start of a `vprp` body, plus the
@@ -3169,6 +3382,59 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Typed [`TextChunk`] decode of every `xxtx` chunk attached to
+    /// `stream_index` (round-15 candidate 3).
+    ///
+    /// Composes the round-12 raw [`Self::text_chunk_data`] accessor
+    /// with [`TextChunk::parse`] so callers don't have to hand-decode
+    /// the VfW 6-byte text-chunk header. Each entry corresponds 1:1
+    /// with the same-indexed raw payload; bodies that fail to parse
+    /// (shorter than the 6-byte fixed header) are dropped from the
+    /// returned `Vec` rather than aborting the call. Returns an empty
+    /// `Vec` for unknown `stream_index`.
+    ///
+    /// Pairs with [`crate::muxer::AviMuxer::with_text_chunk_typed`]
+    /// for the typed muxer side; a writer → reader cycle preserves
+    /// `codepage` / `language` / `dialect` / the body bytes (UTF-8
+    /// for codepage `0` / `65001`, Latin-1 byte-pass-through
+    /// otherwise — see [`TextChunk`] struct docs for the round-trip
+    /// caveat on non-UTF-8 pages).
+    pub fn text_chunk_typed(&self, stream_index: u32) -> Vec<TextChunk> {
+        self.text_chunk_data
+            .get(stream_index as usize)
+            .map(|v| v.iter().filter_map(|b| TextChunk::parse(b)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Lazy [`TextChunk`] iterator over every `xxtx` chunk attached
+    /// to `stream_index` (round-15 candidate 3).
+    ///
+    /// Mirrors [`Self::text_chunk_typed`] but yields one
+    /// `Result<TextChunk>` per `next()` call instead of materialising
+    /// the full `Vec` up front. Useful for long-running subtitle /
+    /// cuepoint streams where the eager `Vec` form would clone every
+    /// `String` body even when the consumer only needs to walk once.
+    ///
+    /// Each `next()` returns:
+    /// - `Some(Ok(tc))` for a successfully decoded text chunk,
+    /// - `Some(Err(_))` for a body shorter than the 6-byte VfW header
+    ///   — the iterator advances past the bad body so subsequent
+    ///   `next()` calls keep yielding,
+    /// - `None` once every chunk for the requested stream is consumed
+    ///   (or immediately for an unknown `stream_index`).
+    ///
+    /// Implements [`ExactSizeIterator`] so callers can pre-allocate a
+    /// sink Vec without first counting; mirrors the round-14
+    /// [`Self::palette_change_typed_iter`] pattern symmetrically.
+    pub fn text_chunk_typed_iter(&self, stream_index: u32) -> TextChunkTypedIter<'_> {
+        let bodies = self
+            .text_chunk_data
+            .get(stream_index as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        TextChunkTypedIter { bodies, next: 0 }
     }
 
     /// Typed [`AvihFlags`] decode of `AVIMAINHEADER.dwFlags` (round-10
