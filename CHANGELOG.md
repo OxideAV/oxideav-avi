@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Top-level `LIST INFO` muxer write path (round 11 C1).**
+  `AviMuxOptions::with_top_level_info(true)` now emits the metadata
+  `LIST INFO` chunk as a sibling of `LIST hdrl` (between hdrl and
+  movi inside the outer `RIFF AVI ` form) instead of nested inside
+  hdrl. Both placements are spec-compliant per the AVI 1.0
+  reference; the sibling layout matches the recommended placement
+  in Microsoft's Multimedia File Reference and several modern
+  authoring tools. The demuxer's existing `b"INFO" if is_primary`
+  walker arm recognises both layouts so the metadata payload
+  round-trips byte-equally regardless of which the muxer chose.
+  Default `false` keeps the round 6 nested-in-hdrl byte layout for
+  existing callers.
+- **OpenDML-only strict-keyframe seek variant (round 11 C2).**
+  `AviDemuxer::seek_to_keyframe_strict_via_std_index(stream, pts)`
+  is a parallel of round 9 C4's `seek_to_keyframe_strict` that
+  always walks the OpenDML 2.0 `ix##` standard-index collection,
+  bypassing the AVI 1.0 `idx1` table even when one is present.
+  Returns the same `KeyframeSeekResult` (target_pts / landed_pts /
+  gop_distance) so callers can plan a decode-and-discard loop after
+  the seek. Use this variant when working with OpenDML-only files
+  (no `idx1` chunk) to get a compile-time guarantee the seek used
+  the std-index path, or as a sanity check on muxer fidelity for
+  dual-indexed files. Errors with `Unsupported` when no `ix##`
+  chunks are present (e.g. an `AviKind::Avi10` envelope).
+- **`xxtx` / `xxpc` muxer write helpers (round 11 C3).** Closes the
+  muxer side of round 8 C3 (`xxpc` palette-change) and round 10 C1
+  (`xxtx` text/subtitle) read paths. New `AviMuxer::write_text_chunk(stream, data)`
+  and `AviMuxer::write_palette_change(stream, data)` methods emit
+  `NN<suffix>` side-band chunks into the current `movi` LIST,
+  honour active `LIST rec ` clustering and OpenDML segment-rolling,
+  record an `idx1` entry (no `AVIIF_KEYFRAME` so the demuxer's
+  suffix-scanner picks it up under the per-stream side-band
+  counter), and stamp an `ix##` standard-index entry when in
+  `AviKind::OpenDml` mode. Side-band chunks do NOT bump
+  `strh.dwLength` for the parent stream — they live alongside the
+  stream's regular packets without being counted as one of them.
+  The demuxer's `palette_change_count` / `text_chunk_count`
+  accessors close the round-trip.
 - **`xxtx` text/subtitle chunk recognition (round 10 C1).** Mirror of
   round 8 C3 (`xxpc` palette-change handling) for the text-stream
   FourCC family per `mmsystem.h`'s `ckidAVITextSF`. `xxtx` chunks are

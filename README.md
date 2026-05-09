@@ -22,7 +22,7 @@ oxideav-avi = "0.0"
 |--------------------------------------------------|:-----:|:----:|
 | RIFF/AVI 1.0 (hdrl/strl/movi/idx1)               | yes   | yes  |
 | Multi-stream (video + audio + ...)               | yes   | yes  |
-| `LIST INFO` metadata (title/artist/album/...)    | yes (known FourCCs + `avi:info.<fourcc>` for unknowns) | yes (`AviMuxOptions::with_info`) |
+| `LIST INFO` metadata (title/artist/album/...)    | yes (known FourCCs + `avi:info.<fourcc>` for unknowns; nested-in-hdrl + sibling-of-hdrl placements) | yes (`AviMuxOptions::with_info` + `with_top_level_info` for sibling layout) |
 | Duration from `avih` (microseconds-per-frame)    | yes   | n/a  |
 | `idx1` legacy index — parse for keyframe seek    | yes   | yes  |
 | `idx1` offsets — file-absolute + movi-relative   | yes   | yes  |
@@ -35,10 +35,11 @@ oxideav-avi = "0.0"
 | OpenDML 2.0 `AVI_INDEX_2FIELD` interlaced std-index | yes (parse + metadata surface + per-packet `field2_offset_for_packet` accessor) | yes (`open_avi` + `set_field2_offset`) |
 | OpenDML 2.0 super-index overflow signalling      | yes (`avi:indx.<n>.overflow_entries`) | yes (`AviMuxer::truncated_super_index_segments()`) |
 | VBR audio framing via `Packet.duration`          | n/a   | yes (drives `strh.dwLength` for non-PCM) |
-| OpenDML-driven seeking (`ix##` std-index)        | yes (no-idx1 fallback) | n/a |
+| OpenDML-driven seeking (`ix##` std-index)        | yes (no-idx1 fallback + explicit `seek_to_keyframe_strict_via_std_index` returning `KeyframeSeekResult`) | n/a |
 | Uncompressed `db` video chunks                   | yes   | yes  |
 | Variable stream interleave                       | yes   | yes  |
-| Palette-change (`pc`) chunks                     | skip  | no   |
+| Palette-change (`xxpc`) chunks                   | skip + per-stream `palette_change_count(stream)` accessor + `avi:palette_change.<n>` metadata | yes (`AviMuxer::write_palette_change`) |
+| Text/subtitle (`xxtx`) chunks                    | skip + per-stream `text_chunk_count(stream)` accessor + `avi:text_chunk.<n>` metadata | yes (`AviMuxer::write_text_chunk`) |
 | Truncated-head tolerance (capture-card crash dumps) | yes | n/a |
 
 OpenDML 2.0 muxing is opt-in via `muxer::open_with_kind` with an

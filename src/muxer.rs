@@ -172,6 +172,18 @@ pub struct AviMuxOptions {
     /// Only meaningful for [`AviKind::OpenDml`]; ignored for
     /// `AviKind::Avi10`.
     pub mid_movi_index_streams: Vec<(u32, u32)>,
+    /// Place `LIST INFO` as a sibling of `LIST hdrl` (top-level
+    /// child of the outer `RIFF AVI ` form) instead of nesting it
+    /// inside `LIST hdrl` (round-11 candidate 1). The AVI 1.0 spec
+    /// permits both placements: most legacy writers nest INFO inside
+    /// hdrl (the round-6 default), but several tools — notably
+    /// Microsoft's own Multimedia File Reference recommended layout
+    /// — emit `LIST INFO` between hdrl and movi as a sibling of
+    /// hdrl. The demuxer accepts both placements; this flag picks
+    /// which one the muxer emits when [`Self::info_entries`] is
+    /// non-empty. Default `false` (nested in hdrl) preserves the
+    /// round-6 byte layout for existing callers.
+    pub info_top_level: bool,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -422,6 +434,20 @@ impl AviMuxOptions {
         if !v.is_empty() {
             self.info_entries.push((id, v));
         }
+        self
+    }
+
+    /// Builder helper: emit `LIST INFO` as a sibling of `LIST hdrl`
+    /// rather than nested inside `hdrl` (round-11 candidate 1).
+    /// Both layouts are spec-compliant per the AVI 1.0 reference;
+    /// the sibling placement matches the recommended layout in
+    /// Microsoft's Multimedia File Reference and several modern
+    /// authoring tools. Default is `false` (nested-in-hdrl, the
+    /// round-6 default). The demuxer recognises both layouts so
+    /// either selection round-trips byte-equally on the metadata
+    /// payload. No-op when [`Self::with_info`] was never called.
+    pub fn with_top_level_info(mut self, on: bool) -> Self {
+        self.info_top_level = on;
         self
     }
 
@@ -788,24 +814,30 @@ impl Muxer for AviMuxer {
         }
         // Round-6 candidate 2: emit `LIST INFO` inside `hdrl` when
         // the caller registered any [`AviMuxOptions::with_info`]
-        // entries. Placed after the strls (and after `LIST odml`
-        // when present) so strl offsets stay stable for
+        // entries and did NOT enable the top-level placement
+        // (round-11 candidate 1). Placed after the strls (and after
+        // `LIST odml` when present) so strl offsets stay stable for
         // `patch_post_counts`. Each child is a 4-CC chunk whose
         // payload is a NUL-terminated string per the AVI 1.0
         // `LIST INFO` registry — see `parse_info_list` in the
         // demuxer.
-        if !self.options.info_entries.is_empty() {
-            let info_size_off = begin_list(self.output.as_mut(), &LIST, b"INFO")?;
-            for (id, value) in &self.options.info_entries {
-                // NUL-terminate per the AVI 1.0 `LIST INFO` convention
-                // and pad odd lengths with the implicit RIFF pad byte.
-                let mut body = value.as_bytes().to_vec();
-                body.push(0);
-                write_chunk(self.output.as_mut(), id, &body)?;
-            }
-            finish_chunk(self.output.as_mut(), info_size_off)?;
+        let want_info = !self.options.info_entries.is_empty();
+        if want_info && !self.options.info_top_level {
+            write_info_list(self.output.as_mut(), &self.options.info_entries)?;
         }
         finish_chunk(self.output.as_mut(), hdrl_size_off)?;
+        // Round-11 candidate 1: emit `LIST INFO` as a SIBLING of
+        // `LIST hdrl` (top-level child of the outer `RIFF AVI ` form).
+        // Both placements are spec-compliant per the AVI 1.0
+        // reference; sibling placement matches the recommended
+        // layout in Microsoft's Multimedia File Reference and
+        // several modern authoring tools. The demuxer (see
+        // `walk_riff_body`'s `b"INFO" if is_primary` arm) recognises
+        // either placement so the metadata payload round-trips
+        // byte-equally regardless of which the muxer chose.
+        if want_info && self.options.info_top_level {
+            write_info_list(self.output.as_mut(), &self.options.info_entries)?;
+        }
 
         // movi LIST — size patched in write_trailer (or when this segment
         // is closed in OpenDML mode).
@@ -1408,6 +1440,172 @@ impl AviMuxer {
         self.pending_field2_offset = Some(payload_offset);
     }
 
+    /// Emit a `NNtx` text/subtitle side-band chunk for `stream_index`
+    /// (round-11 candidate 3). Written into the current `movi` LIST
+    /// after [`oxideav_core::Muxer::write_header`] and before
+    /// [`oxideav_core::Muxer::write_trailer`]. Honours the active
+    /// `LIST rec ` clustering and OpenDML segment-rolling, and
+    /// records both an `idx1` entry (with no `AVIIF_KEYFRAME` bit so
+    /// the demuxer's `scan_idx1_for_suffix` picks it up under
+    /// `text_chunk_count`) and an `ix##` standard-index entry when
+    /// in `AviKind::OpenDml` mode.
+    ///
+    /// Does NOT bump `strh.dwLength` for the parent stream — the
+    /// chunk lives alongside the stream's regular packets without
+    /// being counted as one of them. Mirror of the demuxer's round-10
+    /// C1 read path: `xxtx` chunks come back via
+    /// [`AviDemuxer::text_chunk_count`] and the
+    /// `avi:text_chunk.<n>` metadata key.
+    pub fn write_text_chunk(&mut self, stream_index: u32, data: &[u8]) -> Result<()> {
+        self.write_sideband_chunk(stream_index, *b"tx", data)
+    }
+
+    /// Emit a `NNpc` palette-change side-band chunk for `stream_index`
+    /// (round-11 candidate 3). Mirror of [`Self::write_text_chunk`]
+    /// using suffix `b"pc"` so the demuxer's `scan_idx1_for_suffix`
+    /// picks it up under [`AviDemuxer::palette_change_count`]. Per
+    /// the AVI 1.0 spec the body is a `BITMAPINFO`-style payload
+    /// (1-byte `bFirstEntry`, 1-byte `bNumEntries`, 2-byte `wFlags`,
+    /// then `bNumEntries * 4`-byte palette quads); this helper
+    /// writes `data` verbatim so callers compose the body themselves.
+    pub fn write_palette_change(&mut self, stream_index: u32, data: &[u8]) -> Result<()> {
+        self.write_sideband_chunk(stream_index, *b"pc", data)
+    }
+
+    /// Common path for `NN<suffix>` side-band chunks (text / palette
+    /// change). Lays out the chunk into the current `movi` LIST,
+    /// honours `LIST rec ` clustering, rolls a fresh OpenDML segment
+    /// when the projected size would push past the configured
+    /// byte limit, records an `idx1` entry (no `AVIIF_KEYFRAME` so
+    /// the demuxer's suffix scanner attributes the chunk to the
+    /// per-stream side-band counter), and stamps an `ix##`
+    /// standard-index entry when in OpenDML mode.
+    fn write_sideband_chunk(
+        &mut self,
+        stream_index: u32,
+        suffix: [u8; 2],
+        data: &[u8],
+    ) -> Result<()> {
+        if !self.header_written {
+            return Err(Error::other(
+                "avi muxer: write_sideband_chunk before write_header",
+            ));
+        }
+        if self.trailer_written {
+            return Err(Error::other(
+                "avi muxer: write_sideband_chunk after write_trailer",
+            ));
+        }
+        let idx = stream_index as usize;
+        if idx >= self.tracks.len() {
+            return Err(Error::invalid(format!(
+                "avi muxer: unknown stream index {idx}"
+            )));
+        }
+        if data.len() > u32::MAX as usize {
+            return Err(Error::invalid(
+                "avi muxer: side-band chunk larger than 4 GiB",
+            ));
+        }
+
+        // OpenDML: roll a new RIFF AVIX segment if this side-band chunk
+        // would push the current segment past the configured byte
+        // ceiling. Mirrors `write_packet` so side-band chunks don't
+        // straddle segment boundaries.
+        if let AviKind::OpenDml(limit) = self.kind {
+            let projected = self.output.stream_position()?
+                + 8 // chunk header
+                + data.len() as u64
+                + (data.len() & 1) as u64
+                + 16 /* idx1 entry */;
+            let segment_start = self.riff_size_off - 4;
+            let segment_used = projected.saturating_sub(segment_start);
+            if self.current_segment_packets > 0 && segment_used > limit.bytes() {
+                self.close_current_segment()?;
+                self.open_avix_segment()?;
+            }
+        }
+
+        // `LIST rec ` clustering — open or roll the cluster the same
+        // way `write_packet` does, so a side-band chunk lands inside
+        // the same cluster as its surrounding regular packets.
+        let want_clustering =
+            self.options.rec_cluster_packets.is_some() || self.options.rec_cluster_bytes.is_some();
+        if want_clustering {
+            let projected_chunk_bytes = 8u64 + data.len() as u64 + (data.len() & 1) as u64;
+            let needs_close_for_packets = self
+                .options
+                .rec_cluster_packets
+                .map(|n| self.rec_packets_in_cluster >= n)
+                .unwrap_or(false);
+            let needs_close_for_bytes = self
+                .options
+                .rec_cluster_bytes
+                .map(|n| {
+                    self.rec_packets_in_cluster > 0
+                        && self.rec_bytes_in_cluster + projected_chunk_bytes > n as u64
+                })
+                .unwrap_or(false);
+            if self.rec_open_size_off.is_none() {
+                self.open_rec_cluster()?;
+            } else if needs_close_for_packets || needs_close_for_bytes {
+                self.close_rec_cluster()?;
+                self.open_rec_cluster()?;
+            }
+        }
+
+        let fourcc = packet_fourcc_for(stream_index, suffix);
+        let chunk_off = self.output.stream_position()?;
+        let rel_off_opt = chunk_off.checked_sub(self.movi_start_off);
+        let size = data.len() as u32;
+
+        // OpenDML std-index: record the side-band chunk so the
+        // segment-tail `ix##` flush includes it, mirroring how
+        // regular packets land. The chunk is never a keyframe, so
+        // the high `dwSize` bit is set to flag a delta-frame entry.
+        if matches!(self.kind, AviKind::OpenDml(_)) {
+            let qw_base = self.movi_start_off + 4;
+            let data_off = chunk_off + 8;
+            if let Some(d) = data_off.checked_sub(qw_base) {
+                if d <= u32::MAX as u64 {
+                    let dw_size_with_flag = size | 0x8000_0000;
+                    self.tracks[idx].ix_entries.push(IxStdEntry {
+                        dw_offset: d as u32,
+                        dw_size_with_flag,
+                        dw_offset_field2: 0,
+                    });
+                }
+            }
+        }
+
+        write_chunk(self.output.as_mut(), &fourcc, data)?;
+
+        if want_clustering {
+            self.rec_packets_in_cluster += 1;
+            self.rec_bytes_in_cluster += 8u64 + data.len() as u64 + (data.len() & 1) as u64;
+        }
+
+        // idx1 entry — flags = 0 so the demuxer's
+        // `scan_idx1_for_suffix(*b"tx", ...)` /
+        // `scan_idx1_for_suffix(*b"pc", ...)` picks up the chunk
+        // under the per-stream side-band counter (the scanner only
+        // matches on the chunk-id suffix; flags don't gate it).
+        let in_primary_segment = self.segments.is_empty();
+        if in_primary_segment {
+            if let Some(rel_off) = rel_off_opt {
+                if rel_off <= u32::MAX as u64 {
+                    self.index.push(IndexEntry {
+                        ckid: fourcc,
+                        flags: 0,
+                        offset: rel_off as u32,
+                        size,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Number of OpenDML segments that overflowed the
     /// configured super-index reserve (round-5 candidate 4).
     /// Default reserve is
@@ -1466,6 +1664,27 @@ impl AviMuxer {
         self.output.seek(SeekFrom::Start(end_pos))?;
         Ok(())
     }
+}
+
+/// Write a `LIST INFO` chunk carrying the `(fourcc, value)` entries
+/// per the AVI 1.0 `LIST INFO` registry. Each child is a 4-CC chunk
+/// whose payload is a NUL-terminated string. Used by `write_header`
+/// for both placements (nested-in-hdrl and sibling-of-hdrl per
+/// round-11 candidate 1).
+fn write_info_list<W: Write + Seek + ?Sized>(
+    w: &mut W,
+    entries: &[([u8; 4], String)],
+) -> Result<()> {
+    let info_size_off = begin_list(w, &LIST, b"INFO")?;
+    for (id, value) in entries {
+        // NUL-terminate per the AVI 1.0 `LIST INFO` convention and
+        // pad odd lengths with the implicit RIFF pad byte.
+        let mut body = value.as_bytes().to_vec();
+        body.push(0);
+        write_chunk(w, id, &body)?;
+    }
+    finish_chunk(w, info_size_off)?;
+    Ok(())
 }
 
 /// AVIMAINHEADER (56 bytes): dwMicroSecPerFrame, dwMaxBytesPerSec,

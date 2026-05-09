@@ -2677,6 +2677,50 @@ impl AviDemuxer {
         })
     }
 
+    /// OpenDML-only strict keyframe seek (round-11 candidate 2).
+    ///
+    /// Mirror of [`Self::seek_to_keyframe_strict`] that always walks
+    /// the OpenDML 2.0 `ix##` standard-index collection — bypassing
+    /// the AVI 1.0 `idx1` table even when one is present. Returns
+    /// the same [`KeyframeSeekResult`] shape so callers can interrogate
+    /// `gop_distance` to plan a decode-and-discard loop.
+    ///
+    /// Use this variant when:
+    /// - The file has BOTH `idx1` and `ix##` and you want to verify
+    ///   that the std-index seek lands on the same keyframe (a
+    ///   sanity check on muxer fidelity), or
+    /// - You're working with an OpenDML-only file (no `idx1` chunk
+    ///   at all) and you want a compile-time guarantee the seek
+    ///   used the std-index path rather than failing through the
+    ///   `seek_to` dispatcher.
+    ///
+    /// Returns `Error::Unsupported` when the file has no `ix##`
+    /// chunks, or no keyframe entry for `stream_index` exists in
+    /// the std-index collection.
+    pub fn seek_to_keyframe_strict_via_std_index(
+        &mut self,
+        stream_index: u32,
+        target_pts: i64,
+    ) -> Result<KeyframeSeekResult> {
+        if (stream_index as usize) >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "AVI: stream index {stream_index} out of range"
+            )));
+        }
+        if self.std_indexes.is_empty() {
+            return Err(Error::unsupported(
+                "AVI: seek_to_keyframe_strict_via_std_index requires OpenDML ix## standard indexes",
+            ));
+        }
+        let landed_pts = self.seek_via_std_indexes(stream_index, target_pts)?;
+        let gop_distance = target_pts.saturating_sub(landed_pts).max(0);
+        Ok(KeyframeSeekResult {
+            target_pts,
+            landed_pts,
+            gop_distance,
+        })
+    }
+
     /// OpenDML 2.0 fallback for `seek_to` when no AVI 1.0 `idx1` table
     /// is present.
     ///
