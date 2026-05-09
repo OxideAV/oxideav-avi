@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `xxpc` palette-change round-trip (round 13 C1).** New
+  `demuxer::PaletteChange { first_entry, num_entries, flags, entries }`
+  + `demuxer::PaletteEntry { red, green, blue, flags }` typed structs
+  with `parse(&[u8]) -> Option<Self>` and `to_bytes() -> Vec<u8>`
+  helpers per AVI 1.0 / `vfw.h`'s `PALCHANGE` shape (BYTE bFirstEntry,
+  BYTE bNumEntries, WORD wFlags, PALETTEENTRY entries[]). New
+  `AviDemuxer::palette_change_typed(stream) -> Vec<PaletteChange>`
+  decodes every `xxpc` body buffered by round 12 C1 (bodies that fail
+  to parse are skipped rather than aborting). New
+  `AviMuxer::with_palette_change_typed(stream, &PaletteChange)`
+  serialises the typed struct via the existing
+  `write_palette_change` raw-bytes path. Closes the typed round-trip
+  pair so callers don't have to hand-pack BITMAPINFO palette deltas.
+- **`avih.dwSuggestedBufferSize` populator (round 13 C2).**
+  `AviMuxer::write_trailer` now patches
+  `avih.dwSuggestedBufferSize` (body offset 28, file offset 60) with
+  the largest packet body observed across every stream, rounded up
+  to the next 4-byte boundary, per AVI 1.0 §3.1's read-ahead
+  allocation hint. Pre-round-13 the field was hard-coded to 0;
+  capture-card players that allocate a single read buffer up-front
+  now get a real allocation hint instead of falling back to a
+  worst-case heuristic. New
+  `AviMuxOptions::with_suggested_buffer_size(n)` builder lets the
+  caller stamp an explicit value (skipping the per-track walk) when
+  the encoder's peak packet budget is already known. New
+  `AviDemuxer::avih_suggested_buffer_size() -> u32` typed accessor
+  pairs the read side; the existing `avi:suggested_buffer_size`
+  metadata key still reports the same value.
+- **Named per-bit `AVIF_*` muxer builders (round 13 C3).** Six new
+  fluent builder methods on `AviMuxOptions` —
+  `with_has_index(bool)`, `with_must_use_index(bool)`,
+  `with_is_interleaved(bool)`, `with_trust_ck_type(bool)`,
+  `with_was_capture_file(bool)`, `with_copyrighted(bool)` — toggle
+  the corresponding `AVIF_*` bit in `avih.dwFlags` without
+  requiring callers to import the bit constants. Passing `false`
+  masks the bit out so a baseline-on flag like `AVIF_TRUSTCKTYPE`
+  can be cleared. The starting baseline is the current override (or
+  `DEFAULT_AVIH_FLAGS` when none was set), so the named setters
+  compose with `with_avih_flags` / `with_avih_flag_bit`.
 - **Side-band chunk data accessors (round 12 C1).** Closes the byte
   round-trip with round 11 C3's `write_palette_change` /
   `write_text_chunk` muxer write helpers. New

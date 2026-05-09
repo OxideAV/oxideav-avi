@@ -197,6 +197,16 @@ pub struct AviMuxOptions {
     /// Use [`Self::with_avih_flags`] / [`Self::with_avih_flag_bit`] to
     /// construct without remembering the constants.
     pub avih_flags_override: Option<u32>,
+    /// Optional `avih.dwSuggestedBufferSize` override (round-13
+    /// candidate 2). `None` (the default) lets the muxer compute the
+    /// hint itself in `write_trailer`: the maximum chunk-body size
+    /// observed across every stream, rounded up to the next 4-byte
+    /// boundary. `Some(n)` stamps `n` verbatim — useful for capture
+    /// tools that already know their per-stream peak allocation
+    /// budget. Per AVI 1.0 §3.1 the field is the largest single chunk
+    /// a player should expect to read in one shot, i.e. the
+    /// recommended read-ahead allocation hint.
+    pub suggested_buffer_size_override: Option<u32>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -492,6 +502,102 @@ impl AviMuxOptions {
     pub fn with_avih_flag_bit(mut self, bit: u32) -> Self {
         let base = self.avih_flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
         self.avih_flags_override = Some(base | bit);
+        self
+    }
+
+    /// Builder helper: toggle the `AVIF_HASINDEX` bit in
+    /// `avih.dwFlags` (round-13 candidate 3). Convenience over
+    /// [`Self::with_avih_flag_bit`] / [`Self::with_avih_flags`] so
+    /// callers don't have to import the bit constants. Pass `true`
+    /// to OR the bit on top of the running flags value, `false` to
+    /// mask it back out. The starting baseline is the current
+    /// override (or [`DEFAULT_AVIH_FLAGS`] when none was set).
+    pub fn with_has_index(mut self, on: bool) -> Self {
+        let base = self.avih_flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
+        self.avih_flags_override = Some(if on {
+            base | crate::demuxer::AVIF_HASINDEX
+        } else {
+            base & !crate::demuxer::AVIF_HASINDEX
+        });
+        self
+    }
+
+    /// Builder helper: toggle `AVIF_MUSTUSEINDEX` in `avih.dwFlags`
+    /// (round-13 candidate 3). See [`Self::with_has_index`] for the
+    /// semantics.
+    pub fn with_must_use_index(mut self, on: bool) -> Self {
+        let base = self.avih_flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
+        self.avih_flags_override = Some(if on {
+            base | crate::demuxer::AVIF_MUSTUSEINDEX
+        } else {
+            base & !crate::demuxer::AVIF_MUSTUSEINDEX
+        });
+        self
+    }
+
+    /// Builder helper: toggle `AVIF_ISINTERLEAVED` in `avih.dwFlags`
+    /// (round-13 candidate 3). See [`Self::with_has_index`] for the
+    /// semantics.
+    pub fn with_is_interleaved(mut self, on: bool) -> Self {
+        let base = self.avih_flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
+        self.avih_flags_override = Some(if on {
+            base | crate::demuxer::AVIF_ISINTERLEAVED
+        } else {
+            base & !crate::demuxer::AVIF_ISINTERLEAVED
+        });
+        self
+    }
+
+    /// Builder helper: toggle `AVIF_TRUSTCKTYPE` in `avih.dwFlags`
+    /// (round-13 candidate 3). See [`Self::with_has_index`] for the
+    /// semantics.
+    pub fn with_trust_ck_type(mut self, on: bool) -> Self {
+        let base = self.avih_flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
+        self.avih_flags_override = Some(if on {
+            base | crate::demuxer::AVIF_TRUSTCKTYPE
+        } else {
+            base & !crate::demuxer::AVIF_TRUSTCKTYPE
+        });
+        self
+    }
+
+    /// Builder helper: toggle `AVIF_WASCAPTUREFILE` in
+    /// `avih.dwFlags` (round-13 candidate 3). See
+    /// [`Self::with_has_index`] for the semantics.
+    pub fn with_was_capture_file(mut self, on: bool) -> Self {
+        let base = self.avih_flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
+        self.avih_flags_override = Some(if on {
+            base | crate::demuxer::AVIF_WASCAPTUREFILE
+        } else {
+            base & !crate::demuxer::AVIF_WASCAPTUREFILE
+        });
+        self
+    }
+
+    /// Builder helper: toggle `AVIF_COPYRIGHTED` in `avih.dwFlags`
+    /// (round-13 candidate 3). See [`Self::with_has_index`] for the
+    /// semantics.
+    pub fn with_copyrighted(mut self, on: bool) -> Self {
+        let base = self.avih_flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
+        self.avih_flags_override = Some(if on {
+            base | crate::demuxer::AVIF_COPYRIGHTED
+        } else {
+            base & !crate::demuxer::AVIF_COPYRIGHTED
+        });
+        self
+    }
+
+    /// Builder helper: stamp `n` verbatim into
+    /// `avih.dwSuggestedBufferSize` instead of letting the muxer
+    /// compute the hint from the observed peak chunk size (round-13
+    /// candidate 2). Per AVI 1.0 §3.1 the field is a read-ahead
+    /// allocation hint — pass the value your capture pipeline already
+    /// reserves per packet to skip the muxer's own walk over the
+    /// per-track `max_chunk_size` table. The default (`None`) makes
+    /// the muxer pick `max(per_track_max)` rounded up to the next
+    /// 4-byte boundary.
+    pub fn with_suggested_buffer_size(mut self, n: u32) -> Self {
+        self.suggested_buffer_size_override = Some(n);
         self
     }
 
@@ -1251,6 +1357,32 @@ impl AviMuxer {
         self.output.seek(SeekFrom::Start(48))?;
         self.output.write_all(&total_video_frames.to_le_bytes())?;
 
+        // Round-13 candidate 2: avih.dwSuggestedBufferSize sits at
+        // body offset 28 → file offset 12 + 12 + 8 + 28 = 60. Per
+        // AVI 1.0 §3.1 it's the recommended read-ahead allocation
+        // hint, i.e. the largest chunk body a player should expect
+        // to read in one shot. Compute as `max(per_track max_chunk_size)`
+        // rounded up to the next 4-byte boundary, or honour the
+        // caller's [`AviMuxOptions::with_suggested_buffer_size`]
+        // override.
+        let suggested_buffer_size =
+            self.options
+                .suggested_buffer_size_override
+                .unwrap_or_else(|| {
+                    let max_track = self
+                        .tracks
+                        .iter()
+                        .map(|t| t.max_chunk_size)
+                        .max()
+                        .unwrap_or(0);
+                    // Round up to a 4-byte boundary; saturate so a u32::MAX
+                    // packet doesn't wrap silently.
+                    max_track.saturating_add(3) & !3u32
+                });
+        self.output.seek(SeekFrom::Start(60))?;
+        self.output
+            .write_all(&suggested_buffer_size.to_le_bytes())?;
+
         // First strl LIST starts at the file offset right after the avih
         // chunk: 12 + 12 + 8 + 56 = 88 ... wait, but the avih body is
         // 56 B → avih chunk = 64 B → first strl LIST starts at
@@ -1514,6 +1646,26 @@ impl AviMuxer {
     /// writes `data` verbatim so callers compose the body themselves.
     pub fn write_palette_change(&mut self, stream_index: u32, data: &[u8]) -> Result<()> {
         self.write_sideband_chunk(stream_index, *b"pc", data)
+    }
+
+    /// Typed sibling of [`Self::write_palette_change`] (round-13
+    /// candidate 1).
+    ///
+    /// Serialises the [`crate::demuxer::PaletteChange`] struct into
+    /// the AVI 1.0 `BITMAPINFO`-style palette delta layout
+    /// (`bFirstEntry` / `bNumEntries` / `wFlags` /
+    /// `PALETTEENTRY[entries.len()]`) and emits it via the existing
+    /// raw-bytes `write_palette_change` path. Closes the typed
+    /// round-trip with [`crate::demuxer::AviDemuxer::palette_change_typed`]
+    /// so callers can produce + consume palette deltas without
+    /// hand-packing the BITMAPINFO header.
+    pub fn with_palette_change_typed(
+        &mut self,
+        stream_index: u32,
+        change: &crate::demuxer::PaletteChange,
+    ) -> Result<()> {
+        let body = change.to_bytes();
+        self.write_palette_change(stream_index, &body)
     }
 
     /// Common path for `NN<suffix>` side-band chunks (text / palette

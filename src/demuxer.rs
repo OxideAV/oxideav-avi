@@ -653,6 +653,7 @@ pub fn open_avi(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Res
         palette_change_counts,
         text_chunk_counts,
         avih_flags: avih.as_ref().map(|h| h.flags).unwrap_or(0),
+        avih_suggested_buffer_size: avih.as_ref().map(|h| h.suggested_buffer_size).unwrap_or(0),
         vprps,
         dmlh_total_frames,
         palette_change_data,
@@ -1986,6 +1987,13 @@ pub struct AviDemuxer {
     /// seen — typed-flag accessors then return their `false` /
     /// "no flag set" defaults.
     avih_flags: u32,
+    /// Raw `dwSuggestedBufferSize` from `AVIMAINHEADER` (round-13
+    /// candidate 2). Mirror of [`Self::avih_flags`] for the
+    /// per-AVI 1.0 §3.1 read-ahead allocation hint. Populated from
+    /// the parsed `avih.dwSuggestedBufferSize` DWORD (same data also
+    /// surfaces under the `avi:suggested_buffer_size` metadata key);
+    /// zero when the file had no parsable `avih`.
+    avih_suggested_buffer_size: u32,
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -2117,6 +2125,116 @@ impl AvihFlags {
             copyrighted: bits & AVIF_COPYRIGHTED != 0,
             bits,
         }
+    }
+}
+
+/// One palette entry inside a [`PaletteChange`] body — `PALETTEENTRY`
+/// per Microsoft's `wingdi.h`. Layout matches the on-wire byte order
+/// used by AVI 1.0 `xxpc` chunks: `peRed`, `peGreen`, `peBlue`,
+/// `peFlags`. The trailing `flags` byte usually carries
+/// `PC_RESERVED | PC_EXPLICIT | PC_NOCOLLAPSE` bits per Microsoft's
+/// `wingdi.h` palette flags; most files leave it zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaletteEntry {
+    /// `peRed`.
+    pub red: u8,
+    /// `peGreen`.
+    pub green: u8,
+    /// `peBlue`.
+    pub blue: u8,
+    /// `peFlags` (palette-entry flag byte; usually zero).
+    pub flags: u8,
+}
+
+/// Typed decode of an `xxpc` palette-change chunk body (round-13
+/// candidate 1).
+///
+/// Per AVI 1.0 / `vfw.h`'s `PALCHANGE` shape the chunk body is:
+/// ```text
+/// BYTE  bFirstEntry            // first palette index updated
+/// BYTE  bNumEntries            // number of entries (0 → 256)
+/// WORD  wFlags                 // reserved (usually zero)
+/// PALETTEENTRY entries[bNumEntries]   // 4 bytes each
+/// ```
+/// Composed by [`AviDemuxer::palette_change_typed`] from the round-12
+/// raw [`AviDemuxer::palette_change_data`] accessor; consumed by
+/// [`crate::muxer::AviMuxer::with_palette_change_typed`] to write the
+/// equivalent chunk back. Closes the typed round-trip pair so callers
+/// don't have to hand-pack `BITMAPINFO` palette deltas.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaletteChange {
+    /// `bFirstEntry` — first palette index this delta updates.
+    pub first_entry: u8,
+    /// `bNumEntries` as parsed from the wire. The spec's literal-zero
+    /// convention ("0 → all 256 entries") is honoured by checking
+    /// against the actual `entries` slice length: a trailing array of
+    /// 256 quads with `bNumEntries == 0` round-trips intact.
+    pub num_entries: u8,
+    /// `wFlags`. Most files leave this zero; the spec reserves the
+    /// field for future palette-update flag bits.
+    pub flags: u16,
+    /// Decoded `PALETTEENTRY[]`. Length matches the number of quads
+    /// found after the 4-byte header — usually `num_entries`, or `256`
+    /// when the body declared `num_entries == 0`. An empty `entries`
+    /// vector is allowed (spec doesn't forbid an empty delta).
+    pub entries: Vec<PaletteEntry>,
+}
+
+impl PaletteChange {
+    /// Parse a raw `xxpc` chunk body into the typed shape. Returns
+    /// `None` for bodies shorter than the 4-byte fixed header or with
+    /// a trailing array length that isn't a multiple of 4 bytes (the
+    /// `PALETTEENTRY` size). The trailing-array length determines the
+    /// `entries` vector size: callers can detect the spec's
+    /// `num_entries == 0 → 256` convention by checking
+    /// `entries.len() == 256 && num_entries == 0`.
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < 4 {
+            return None;
+        }
+        let first_entry = body[0];
+        let num_entries = body[1];
+        let flags = u16::from_le_bytes([body[2], body[3]]);
+        let tail = &body[4..];
+        if tail.len() % 4 != 0 {
+            return None;
+        }
+        let mut entries = Vec::with_capacity(tail.len() / 4);
+        for chunk in tail.chunks_exact(4) {
+            entries.push(PaletteEntry {
+                red: chunk[0],
+                green: chunk[1],
+                blue: chunk[2],
+                flags: chunk[3],
+            });
+        }
+        Some(Self {
+            first_entry,
+            num_entries,
+            flags,
+            entries,
+        })
+    }
+
+    /// Encode the typed shape back into a raw `xxpc` chunk body
+    /// suitable for [`crate::muxer::AviMuxer::write_palette_change`].
+    /// Output layout matches [`Self::parse`]'s expectations exactly:
+    /// 1-byte `first_entry`, 1-byte `num_entries`, 2-byte LE `flags`,
+    /// then `entries.len() * 4` bytes of `PALETTEENTRY` quads. Output
+    /// length is always even (header + 4-aligned tail) so no muxer-side
+    /// pad byte is needed.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.entries.len() * 4);
+        out.push(self.first_entry);
+        out.push(self.num_entries);
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        for e in &self.entries {
+            out.push(e.red);
+            out.push(e.green);
+            out.push(e.blue);
+            out.push(e.flags);
+        }
+        out
     }
 }
 
@@ -2761,6 +2879,45 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Typed [`PaletteChange`] decode of every `xxpc` chunk attached
+    /// to `stream_index` (round-13 candidate 1).
+    ///
+    /// Composes the round-12 raw [`Self::palette_change_data`]
+    /// accessor with [`PaletteChange::parse`] so callers don't have to
+    /// hand-decode the AVI 1.0 `BITMAPINFO`-style palette delta. Each
+    /// entry corresponds 1:1 with the same-indexed raw payload; bodies
+    /// that fail to parse (shorter than the 4-byte fixed header or with
+    /// a non-4-multiple `PALETTEENTRY` tail) are dropped from the
+    /// returned `Vec` rather than aborting the call. Returns an empty
+    /// `Vec` for unknown `stream_index`.
+    ///
+    /// Pairs with [`crate::muxer::AviMuxer::with_palette_change_typed`]
+    /// for the typed muxer side; a writer → reader cycle preserves
+    /// `first_entry` / `num_entries` / `flags` / every
+    /// [`PaletteEntry`] quad.
+    pub fn palette_change_typed(&self, stream_index: u32) -> Vec<PaletteChange> {
+        self.palette_change_data
+            .get(stream_index as usize)
+            .map(|v| v.iter().filter_map(|b| PaletteChange::parse(b)).collect())
+            .unwrap_or_default()
+    }
+
+    /// `avih.dwSuggestedBufferSize` accessor (round-13 candidate 2).
+    ///
+    /// Per AVI 1.0 §3.1, the avih's `dwSuggestedBufferSize` is the
+    /// largest single chunk a player should expect to read in one
+    /// shot — the recommended read-ahead allocation hint. Conformant
+    /// muxers populate it with the maximum chunk-body size across all
+    /// streams (see [`crate::muxer::AviMuxOptions::with_suggested_buffer_size`]
+    /// for the writer override). The same value also surfaces under the
+    /// `avi:suggested_buffer_size` metadata key.
+    ///
+    /// Returns `0` when the field was zero on disk (some legacy writers
+    /// leave it unpopulated) or the file had no parsable `avih`.
+    pub fn avih_suggested_buffer_size(&self) -> u32 {
+        self.avih_suggested_buffer_size
     }
 
     /// Per-stream `xxtx` text/subtitle chunk bodies in file order
