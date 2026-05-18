@@ -19,7 +19,9 @@
 
 use oxideav_core::{CodecId, CodecParameters, CodecTag, Error, MediaType, Result, SampleFormat};
 
-use crate::stream_format::{write_bitmap_info_header, write_waveformatex};
+use crate::stream_format::{
+    write_bitmap_info_header, write_bitmap_info_header_oriented, write_waveformatex,
+};
 
 /// Result of building a stream-format chunk for the muxer.
 #[derive(Debug)]
@@ -47,9 +49,15 @@ pub(crate) struct StrfEntry {
 /// `params.tag`, no printable `extradata[0..4]` hint, and the codec
 /// id isn't an uncompressed `rgb24` / PCM family for which the tag
 /// is synthesised.
-pub(crate) fn build_strf(params: &CodecParameters) -> Result<StrfEntry> {
+///
+/// `top_down` (round-19 C1) is only honoured for video streams and
+/// only when the resolved FourCC is the all-zero `BI_RGB` sentinel —
+/// the spec REQUIRES positive `biHeight` for compressed FourCCs per
+/// VfW §"biHeight sign rules". For audio / non-RGB video streams it
+/// has no effect.
+pub(crate) fn build_strf(params: &CodecParameters, top_down: bool) -> Result<StrfEntry> {
     match params.media_type {
-        MediaType::Video => build_video_strf(params),
+        MediaType::Video => build_video_strf(params, top_down),
         MediaType::Audio => build_audio_strf(params),
         _ => Err(Error::unsupported(format!(
             "avi muxer: media type {:?} not supported",
@@ -145,7 +153,7 @@ fn extradata_fourcc_hint(extradata: &[u8]) -> Option<[u8; 4]> {
     Some(hint)
 }
 
-fn build_video_strf(params: &CodecParameters) -> Result<StrfEntry> {
+fn build_video_strf(params: &CodecParameters, top_down: bool) -> Result<StrfEntry> {
     let width = params
         .width
         .ok_or_else(|| Error::invalid("avi muxer: video stream missing width"))?;
@@ -157,7 +165,16 @@ fn build_video_strf(params: &CodecParameters) -> Result<StrfEntry> {
     // value); for BI_RGB we use 24 too (24-bit packed RGB is the
     // canonical uncompressed AVI pixel format we package).
     let bit_count: u16 = 24;
-    let strf = write_bitmap_info_header(width, height, fourcc, bit_count, &params.extradata);
+    // Round-19 C1: a top-down DIB is only legal for `BI_RGB` (and
+    // `BI_BITFIELDS`, which we don't currently emit) per VfW
+    // §"biHeight sign rules". Silently drop the flag for compressed
+    // FourCCs rather than producing an out-of-spec file.
+    let allow_top_down = fourcc == [0, 0, 0, 0];
+    let strf = if top_down && allow_top_down {
+        write_bitmap_info_header_oriented(width, height, fourcc, bit_count, &params.extradata, true)
+    } else {
+        write_bitmap_info_header(width, height, fourcc, bit_count, &params.extradata)
+    };
     let (scale, rate) = video_scale_rate(params);
     // BI_RGB streams use `db` chunks; everything else `dc`.
     let chunk_suffix = if fourcc == [0, 0, 0, 0] {
@@ -362,7 +379,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p).unwrap();
+        let entry = build_strf(&p, false).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         assert_eq!(entry.sample_size, 4); // 2ch × 2B
     }
@@ -373,7 +390,7 @@ mod tests {
             CodecParameters::audio(CodecId::new("mp3")).with_tag(CodecTag::wave_format(0x0055));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p).unwrap();
+        let entry = build_strf(&p, false).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         // First 2 bytes of the WAVEFORMATEX are the wFormatTag in LE.
         assert_eq!(&entry.strf[0..2], &0x0055u16.to_le_bytes());
@@ -384,9 +401,32 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("noexist"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        match build_strf(&p) {
+        match build_strf(&p, false) {
             Err(Error::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn top_down_only_honoured_for_bi_rgb() {
+        // Round-19 C1: top_down=true on a non-BI_RGB stream silently
+        // drops the flag (compressed FourCCs MUST use positive
+        // biHeight per VfW §"biHeight sign rules").
+        let mut p = CodecParameters::video(CodecId::new("mjpeg"))
+            .with_tag(oxideav_core::CodecTag::fourcc(b"MJPG"));
+        p.width = Some(320);
+        p.height = Some(240);
+        let entry = build_strf(&p, true).unwrap();
+        // biHeight offset 8..12 in the BMIH; must be positive 240.
+        let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
+        assert_eq!(h, 240, "compressed FourCCs MUST use positive biHeight");
+
+        // BI_RGB (rgb24) does honour top_down.
+        let mut p = CodecParameters::video(CodecId::new("rgb24"));
+        p.width = Some(320);
+        p.height = Some(240);
+        let entry = build_strf(&p, true).unwrap();
+        let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
+        assert_eq!(h, -240, "BI_RGB + top_down ⇒ negative biHeight");
     }
 }

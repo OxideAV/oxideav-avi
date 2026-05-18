@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Top-down DIB orientation round-trip (round 19 C1).** New public
+  `BitmapInfoHeader.top_down: bool` field on the parsed `strf` body
+  preserves the sign of the on-wire `biHeight` per VfW `wingdi.h`
+  §"biHeight sign rules" (positive ⇒ bottom-up DIB origin
+  lower-left; negative ⇒ top-down DIB origin upper-left). New
+  helper `stream_format::write_bitmap_info_header_oriented(width,
+  height, compression, bit_count, extradata, top_down)` stamps a
+  negative `biHeight` for the top-down case so a parse → emit cycle
+  preserves orientation byte-for-byte. The convenience
+  `write_bitmap_info_header` wrapper keeps the old positive-only
+  behaviour. Demuxer surfaces the side-info via the new
+  `AviDemuxer::stream_top_down(stream) -> Option<bool>` accessor
+  (`None` for non-video streams or streams whose `strf` was too
+  short to parse a BMIH) and the metadata key
+  `avi:vids.<n>.top_down = "true"` (only emitted when the flag is
+  set so absence is observable). Muxer-side: new
+  `AviMuxOptions::with_top_down_video(stream_index)` builder pushes
+  a per-stream flag; the muxer honours it only for uncompressed RGB
+  streams (`BI_RGB` all-zero FourCC) since the VfW spec REQUIRES
+  positive `biHeight` for compressed FourCCs and YUV bitmaps are
+  always top-down regardless of sign. Pairs with the
+  `BitmapInfoHeader.top_down` parse-side flag for full
+  `parse → mutate → emit` round-trips on top-down RGB streams (the
+  capture-card / desktop-grabber convention).
+- **`BI_BITFIELDS` color-mask exposure (round 19 C2).** New public
+  `stream_format::BI_BITFIELDS = [3, 0, 0, 0]` constant and
+  `stream_format::parse_bitfields_masks(&[u8]) -> Option<(u32, u32,
+  u32)>` helper that reads the three little-endian DWORDs the
+  spec requires immediately after the 40-byte BMIH whenever
+  `biCompression == BI_BITFIELDS` per VfW `wingdi.h` §"Color
+  tables (palettes)". Demuxer-side: when an uncompressed RGB
+  stream declares `BI_BITFIELDS`, the parsed `(red_mask,
+  green_mask, blue_mask)` triple is now surfaced via the new
+  `AviDemuxer::stream_bitfields_masks(stream) -> Option<(u32, u32,
+  u32)>` accessor and the metadata key
+  `avi:vids.<n>.bitfields = "r=0x<R>,g=0x<G>,b=0x<B>"`. Returns
+  `None` / no key for any other compression (FourCC bitstreams,
+  `BI_RGB`, etc.), for non-video streams, or when extradata was
+  shorter than 12 bytes. Common masks per VfW §"biCompression":
+  `(0xF800, 0x07E0, 0x001F)` ⇒ 16-bpp RGB565; `(0x7C00, 0x03E0,
+  0x001F)` ⇒ 16-bpp RGB555; `(0x00FF_0000, 0x0000_FF00,
+  0x0000_00FF)` ⇒ 32-bpp BGRA. Closes a long-standing parse-side
+  gap that silently discarded the per-pixel channel layout for
+  16/32-bpp uncompressed RGB AVIs.
+- **`VideoStrfInfo` typed side-info struct.** New
+  `oxideav_avi::demuxer::VideoStrfInfo { top_down, bitfields_masks
+  }` aggregates the round-19 C1 + C2 BMIH-derived facts the AVI
+  spec exposes per video stream. Indexed parallel to
+  [`AviDemuxer::streams`] internally; only the two typed
+  accessors above need to be called for the public API.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-avi/compare/v0.0.5...v0.0.6) - 2026-05-09
 
 ### Other

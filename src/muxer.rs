@@ -281,6 +281,24 @@ pub struct AviMuxOptions {
     /// at least one [`Self::per_stream_max_bytes_per_sec`] entry was
     /// registered.
     pub strict_per_stream_budget: bool,
+    /// Per-stream top-down DIB flag (round-19 candidate 1). Stream
+    /// indexes listed here are emitted with a **negative `biHeight`**
+    /// in their BMIH `strf` payload, signalling a top-down DIB
+    /// (origin upper-left) per VfW `wingdi.h` §"biHeight sign
+    /// rules". Only semantically meaningful for uncompressed RGB
+    /// streams (`BI_RGB` and `BI_BITFIELDS`) — YUV bitmaps are
+    /// always top-down regardless of sign, and the spec REQUIRES a
+    /// positive `biHeight` for compressed FourCCs, so the muxer
+    /// silently drops the flag for any stream whose `params.tag`
+    /// resolves to a printable FourCC (rgb24's all-zero
+    /// `[0,0,0,0]` sentinel is the one stream that's actually
+    /// uncompressed). Pairs with the round-19 C1 demuxer accessor
+    /// [`crate::demuxer::AviDemuxer::stream_top_down`] so a parsed
+    /// top-down stream can round-trip its orientation. Duplicate
+    /// entries for the same stream are deduplicated; empty list
+    /// (the default) preserves the round-3 byte layout (positive
+    /// `biHeight`) for existing callers.
+    pub top_down_video_streams: Vec<u32>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -767,6 +785,22 @@ impl AviMuxOptions {
         }
         self
     }
+
+    /// Builder helper: mark `stream_index` as a top-down DIB video
+    /// stream (round-19 candidate 1). The muxer stamps a negative
+    /// `biHeight` in that stream's BMIH `strf` payload per VfW
+    /// `wingdi.h` §"biHeight sign rules" (negative ⇒ origin at
+    /// upper-left). Only takes effect for uncompressed RGB streams
+    /// — compressed FourCCs MUST use positive `biHeight` per the
+    /// same VfW section, so the flag is silently dropped for them
+    /// (see [`Self::top_down_video_streams`]). Duplicate calls for
+    /// the same `stream_index` are deduplicated.
+    pub fn with_top_down_video(mut self, stream_index: u32) -> Self {
+        if !self.top_down_video_streams.contains(&stream_index) {
+            self.top_down_video_streams.push(stream_index);
+        }
+        self
+    }
 }
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
@@ -906,7 +940,14 @@ pub fn open_avi(
     }
     let mut tracks = Vec::with_capacity(streams.len());
     for (i, s) in streams.iter().enumerate() {
-        let entry = build_strf(&s.params)?;
+        // Round-19 C1: honour `top_down_video_streams` for `BI_RGB`
+        // (uncompressed RGB) video streams; the helper itself drops
+        // the flag for compressed FourCCs.
+        let top_down = options
+            .top_down_video_streams
+            .iter()
+            .any(|&idx| idx as usize == i);
+        let entry = build_strf(&s.params, top_down)?;
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {
             stream: s.clone(),

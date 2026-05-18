@@ -47,6 +47,8 @@ oxideav-avi = "0.0"
 | Palette-change (`xxpc`) chunks                   | skip + per-stream `palette_change_count(stream)` + `palette_change_data(stream)` body accessors + `avi:palette_change.<n>` metadata | yes (`AviMuxer::write_palette_change`) |
 | Text/subtitle (`xxtx`) chunks                    | skip + per-stream `text_chunk_count(stream)` + `text_chunk_data(stream)` body accessors + `avi:text_chunk.<n>` metadata | yes (`AviMuxer::write_text_chunk`) |
 | Truncated-head tolerance (capture-card crash dumps) | yes | n/a |
+| Top-down DIB orientation (negative `biHeight`) | yes (`stream_top_down` accessor + `avi:vids.<n>.top_down` metadata; preserved across parse) | yes (`AviMuxOptions::with_top_down_video`; honoured only for `BI_RGB` per VfW §"biHeight sign rules") |
+| `BI_BITFIELDS` color masks (16/32-bpp RGB) | yes (`stream_bitfields_masks` accessor + `avi:vids.<n>.bitfields = "r=...,g=...,b=..."` metadata) | n/a |
 
 OpenDML 2.0 muxing is opt-in via `muxer::open_with_kind` with an
 `AviKind::OpenDml(RiffSegmentLimit::OneGiB)` (or `Bytes(n)` for

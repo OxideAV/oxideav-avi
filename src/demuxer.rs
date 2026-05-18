@@ -216,6 +216,10 @@ fn open_avi_inner(
     // the round-14 C2 VBR/CBR validator. Parallel to `streams`:
     // `Some` for audio, `None` otherwise.
     let mut audio_infos: Vec<Option<AudioStrhInfo>> = Vec::new();
+    // Per-stream video BMIH side-info (top-down + BI_BITFIELDS masks)
+    // — round-19 C1+C2. Parallel to `streams`: `Some` for video,
+    // `None` otherwise.
+    let mut video_strfs: Vec<Option<VideoStrfInfo>> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -231,6 +235,7 @@ fn open_avi_inner(
         &mut vprps,
         &mut dmlh_total_frames,
         &mut audio_infos,
+        &mut video_strfs,
         codecs,
         /* is_primary */ true,
     )?;
@@ -258,6 +263,7 @@ fn open_avi_inner(
                     &mut vprps,
                     &mut dmlh_total_frames,
                     &mut audio_infos,
+                    &mut video_strfs,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -496,6 +502,28 @@ fn open_avi_inner(
                     fd.video_y_valid_start_line.to_string(),
                 ));
             }
+        }
+    }
+
+    // Round-19 candidates 1+2: surface BMIH side-info per video stream.
+    // `avi:vids.<n>.top_down = "true"` whenever the on-wire `biHeight`
+    // was negative (top-down DIB origin upper-left, per VfW `wingdi.h`
+    // §"biHeight sign rules"). `avi:vids.<n>.bitfields = "r=<hex>,
+    // g=<hex>,b=<hex>"` when `biCompression == BI_BITFIELDS` and the
+    // three trailing color masks parsed cleanly.
+    for (i, vs_opt) in video_strfs.iter().enumerate() {
+        let vs = match vs_opt {
+            Some(v) => v,
+            None => continue,
+        };
+        if vs.top_down {
+            metadata.push((format!("avi:vids.{i}.top_down"), "true".into()));
+        }
+        if let Some((r, g, b)) = vs.bitfields_masks {
+            metadata.push((
+                format!("avi:vids.{i}.bitfields"),
+                format!("r=0x{r:08X},g=0x{g:08X},b=0x{b:08X}"),
+            ));
         }
     }
 
@@ -933,6 +961,7 @@ fn open_avi_inner(
         palette_change_data,
         text_chunk_data,
         sideband_data_loaded,
+        video_strf: video_strfs,
     })
 }
 
@@ -956,6 +985,7 @@ fn walk_riff_body(
     vprps: &mut Vec<VprpHeader>,
     dmlh_total_frames: &mut Option<u32>,
     audio_infos: &mut Vec<Option<AudioStrhInfo>>,
+    video_strfs: &mut Vec<Option<VideoStrfInfo>>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -976,7 +1006,7 @@ fn walk_riff_body(
             let body_end = (body_start + body_len as u64).min(end).min(file_len);
             match &list_type {
                 b"hdrl" if is_primary => {
-                    let (main, stream_infos, suffixes, sxs, vps, dmlh, info_md, ais) =
+                    let (main, stream_infos, suffixes, sxs, vps, dmlh, info_md, ais, vss) =
                         parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
@@ -986,6 +1016,7 @@ fn walk_riff_body(
                     *dmlh_total_frames = dmlh;
                     metadata.extend(info_md);
                     *audio_infos = ais;
+                    *video_strfs = vss;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -1194,6 +1225,7 @@ type HdrlOutput = (
     Option<u32>,
     Vec<(String, String)>,
     Vec<Option<AudioStrhInfo>>,
+    Vec<Option<VideoStrfInfo>>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -1215,6 +1247,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut super_indexes: Vec<SuperIndex> = Vec::new();
     let mut vprps: Vec<VprpHeader> = Vec::new();
     let mut audio_infos: Vec<Option<AudioStrhInfo>> = Vec::new();
+    let mut video_strfs: Vec<Option<VideoStrfInfo>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
 
@@ -1235,7 +1268,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx, vp, ai) =
+                    let (si, suf, sx, vp, ai, vs) =
                         parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1243,6 +1276,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         super_indexes.push(sx);
                         vprps.push(vp);
                         audio_infos.push(ai);
+                        video_strfs.push(vs);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1281,6 +1315,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         dmlh_total_frames,
         info_metadata,
         audio_infos,
+        video_strfs,
     ))
 }
 
@@ -1319,18 +1354,21 @@ fn parse_odml_list<R: ReadSeek + ?Sized>(r: &mut R, end_pos: u64) -> Result<Opti
     Ok(None)
 }
 
-/// 5-tuple returned by [`parse_strl`]: optional [`StreamInfo`],
+/// 6-tuple returned by [`parse_strl`]: optional [`StreamInfo`],
 /// optional packet-chunk suffix, [`SuperIndex`] (default-empty when
-/// no `indx`), [`VprpHeader`] (default when no `vprp`), and the
+/// no `indx`), [`VprpHeader`] (default when no `vprp`), the
 /// audio-stream's `(format_tag, sample_size)` pair when the strh
 /// declared `fccType == "auds"` (round-14 C2 — used by the VBR/CBR
-/// validator at `open_avi`).
+/// validator at `open_avi`), and the video-stream's BMIH-derived
+/// side-info ([`VideoStrfInfo`]) when the strh declared
+/// `fccType == "vids"` (round-19 C1+C2).
 type StrlOutput = (
     Option<StreamInfo>,
     Option<[u8; 2]>,
     SuperIndex,
     VprpHeader,
     Option<AudioStrhInfo>,
+    Option<VideoStrfInfo>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -1398,11 +1436,18 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     }
     let strh = match strh_buf {
         Some(b) => b,
-        None => return Ok((None, None, super_index, vprp, None)),
+        None => return Ok((None, None, super_index, vprp, None, None)),
     };
     let strf = strf_buf.unwrap_or_default();
     let parsed = build_stream(index, &strh, &strf, codecs)?;
-    Ok((Some(parsed.0), Some(parsed.1), super_index, vprp, parsed.2))
+    Ok((
+        Some(parsed.0),
+        Some(parsed.1),
+        super_index,
+        vprp,
+        parsed.2,
+        parsed.3,
+    ))
 }
 
 /// Parse a `vprp` (Video Properties Header) chunk per OpenDML 2.0 §5.0.
@@ -1712,12 +1757,24 @@ pub(crate) struct AudioStrhInfo {
     pub sample_size: u32,
 }
 
+/// 4-tuple returned by [`build_stream`]: the [`StreamInfo`], the
+/// 2-byte chunk suffix (`dc` / `db` / `wb` / `xx`), the
+/// audio-strh `(format_tag, sample_size)` pair (`Some` for audio
+/// streams only — round-14 C2), and the video-strf BMIH side-info
+/// (`Some` for video streams only — round-19 C1+C2).
+type BuildStreamOutput = (
+    StreamInfo,
+    [u8; 2],
+    Option<AudioStrhInfo>,
+    Option<VideoStrfInfo>,
+);
+
 fn build_stream(
     index: u32,
     strh: &[u8],
     strf: &[u8],
     codecs: &dyn CodecResolver,
-) -> Result<(StreamInfo, [u8; 2], Option<AudioStrhInfo>)> {
+) -> Result<BuildStreamOutput> {
     // AVISTREAMHEADER layout (56 bytes):
     //   0  fccType       [4]
     //   4  fccHandler    [4]
@@ -1746,6 +1803,7 @@ fn build_stream(
     let sample_size = u32::from_le_bytes([strh[44], strh[45], strh[46], strh[47]]);
 
     let mut audio_info: Option<AudioStrhInfo> = None;
+    let mut video_strf_info: Option<VideoStrfInfo> = None;
     let (media_type, codec_id, params, suffix) = match &fcc_type {
         b"vids" => {
             let bmih = if !strf.is_empty() {
@@ -1771,6 +1829,22 @@ fn build_stream(
                 p.width = Some(b.width);
                 p.height = Some(b.height);
                 p.extradata = b.extradata.clone();
+                // Round-19 C1+C2: surface BMIH-derived side-info
+                // (top-down orientation per VfW §"biHeight sign
+                // rules"; `BI_BITFIELDS` color masks per VfW
+                // §"Color tables (palettes)"). Only `BI_BITFIELDS`
+                // streams have meaningful R/G/B masks in extradata;
+                // for other compression types the masks accessor
+                // returns `None` and only `top_down` is filled.
+                let bitfields_masks = if b.compression == crate::stream_format::BI_BITFIELDS {
+                    crate::stream_format::parse_bitfields_masks(&b.extradata)
+                } else {
+                    None
+                };
+                video_strf_info = Some(VideoStrfInfo {
+                    top_down: b.top_down,
+                    bitfields_masks,
+                });
             }
             // Frame rate from scale/rate (rate/scale = fps).
             p.frame_rate = Some(Rational::new(rate as i64, scale as i64));
@@ -1866,7 +1940,7 @@ fn build_stream(
         start_time: Some(0),
         params,
     };
-    Ok((stream, suffix, audio_info))
+    Ok((stream, suffix, audio_info, video_strf_info))
 }
 
 /// Synthesise a placeholder `avi:<fourcc>` codec_id when the resolver
@@ -2228,6 +2302,31 @@ fn probe_offset_has_ckid<R: ReadSeek + ?Sized>(
 
 // --- Demuxer runtime ------------------------------------------------------
 
+/// Per-video-stream `strf` (BITMAPINFOHEADER) decoded side-data the
+/// demuxer captures at `open()` for callers that need orientation,
+/// `BI_BITFIELDS` color-mask layouts, or other DIB-shape facts that
+/// don't fit on [`oxideav_core::CodecParameters`]. Round-19 candidate
+/// 1 + 2 per VfW `wingdi.h` §"biHeight sign rules" and
+/// §"Color tables (palettes) / BI_BITFIELDS".
+///
+/// One entry per video stream (parallel to [`AviDemuxer::streams`]
+/// for `media_type == Video`); audio / data streams have `None`.
+#[derive(Clone, Debug, Default)]
+pub struct VideoStrfInfo {
+    /// `true` when the on-wire `biHeight` was negative ⇒ top-down
+    /// DIB (origin upper-left) per VfW §"biHeight sign rules". Only
+    /// semantically meaningful for `BI_RGB` and `BI_BITFIELDS`
+    /// streams; YUV bitmaps are always top-down regardless of sign,
+    /// and compressed FourCCs MUST use positive `biHeight`.
+    pub top_down: bool,
+    /// `(red_mask, green_mask, blue_mask)` for `BI_BITFIELDS`
+    /// compression (16-bpp / 32-bpp uncompressed RGB whose
+    /// channel layout is declared via the three trailing color
+    /// masks). `None` when the stream isn't `BI_BITFIELDS` or the
+    /// extradata was too short to carry the three DWORDs.
+    pub bitfields_masks: Option<(u32, u32, u32)>,
+}
+
 /// Concrete AVI demuxer. Returned by [`open_avi`] for callers that
 /// need direct access to AVI-specific accessors like
 /// [`AviDemuxer::field2_offset_for_packet`] (round-5 candidate 1).
@@ -2350,6 +2449,12 @@ pub struct AviDemuxer {
     /// once the eager path already cached them. `false` for `idx1`-less
     /// (OpenDML-only) files where `next_packet` is the only producer.
     sideband_data_loaded: bool,
+    /// Per-video-stream BMIH-derived side-info (top-down orientation,
+    /// `BI_BITFIELDS` color masks) — round-19 candidates 1+2 per VfW
+    /// `wingdi.h` §"biHeight sign rules" and §"BI_BITFIELDS". Indexed
+    /// by stream number; `None` for non-video streams or video streams
+    /// whose `strf` payload was empty / shorter than 40 bytes.
+    video_strf: Vec<Option<VideoStrfInfo>>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -3859,6 +3964,51 @@ impl AviDemuxer {
             Some(vp) => &vp.field_descs,
             None => &[],
         }
+    }
+
+    /// Round-19 candidate 1: per-video-stream top-down DIB flag.
+    ///
+    /// Returns `Some(true)` when the stream's BMIH carried a negative
+    /// `biHeight` (origin upper-left, top-down DIB per VfW
+    /// `wingdi.h` §"biHeight sign rules"); `Some(false)` for
+    /// positive `biHeight` (origin lower-left, bottom-up DIB);
+    /// `None` for non-video streams or video streams whose `strf`
+    /// payload was missing / too short to parse a BMIH.
+    ///
+    /// Only semantically meaningful for uncompressed RGB streams
+    /// (`BI_RGB` and `BI_BITFIELDS`) — YUV bitmaps are always
+    /// top-down regardless of sign per the same VfW section, and
+    /// compressed FourCCs MUST use positive `biHeight`. Callers
+    /// that re-mux a top-down RGB stream and want the orientation
+    /// preserved can pair this with
+    /// [`crate::muxer::AviMuxOptions::with_top_down_video`].
+    pub fn stream_top_down(&self, stream_index: u32) -> Option<bool> {
+        self.video_strf
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+            .map(|vs| vs.top_down)
+    }
+
+    /// Round-19 candidate 2: per-video-stream `BI_BITFIELDS` color
+    /// masks.
+    ///
+    /// Returns `Some((red, green, blue))` when the stream's BMIH
+    /// declared `biCompression == BI_BITFIELDS` (3) and the trailing
+    /// 12 bytes parsed as three little-endian DWORDs per VfW
+    /// `wingdi.h` §"Color tables (palettes)". `None` for any other
+    /// compression (FourCC bitstreams, `BI_RGB`, etc.), for
+    /// non-video streams, or when the extradata was shorter than
+    /// 12 bytes.
+    ///
+    /// Common masks per VfW §"biCompression":
+    /// - `(0xF800, 0x07E0, 0x001F)` ⇒ 16-bpp RGB565
+    /// - `(0x7C00, 0x03E0, 0x001F)` ⇒ 16-bpp RGB555
+    /// - `(0x00FF_0000, 0x0000_FF00, 0x0000_00FF)` ⇒ 32-bpp BGRA
+    pub fn stream_bitfields_masks(&self, stream_index: u32) -> Option<(u32, u32, u32)> {
+        self.video_strf
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+            .and_then(|vs| vs.bitfields_masks)
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).

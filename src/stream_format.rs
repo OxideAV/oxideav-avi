@@ -21,8 +21,18 @@ pub struct BitmapInfoHeader {
     pub y_pels_per_meter: i32,
     pub clr_used: u32,
     pub clr_important: u32,
-    /// Extradata following the 40-byte header (palette/codec private data).
+    /// Extradata following the 40-byte header (palette/codec private data,
+    /// or `BI_BITFIELDS` color masks for 16/32-bpp uncompressed RGB).
     pub extradata: Vec<u8>,
+    /// `true` when the on-wire `biHeight` was negative, indicating a
+    /// **top-down DIB** for uncompressed RGB streams per VfW
+    /// `wingdi.h` §"biHeight sign rules": positive `biHeight` is
+    /// bottom-up (origin lower-left), negative is top-down (origin
+    /// upper-left). YUV bitmaps are always top-down regardless of
+    /// sign; compressed formats MUST use positive `biHeight` per the
+    /// same section, so this flag is only semantically meaningful for
+    /// `BI_RGB` and `BI_BITFIELDS` streams.
+    pub top_down: bool,
 }
 
 /// Parse a BITMAPINFOHEADER (+ trailing extradata) from a `strf` payload.
@@ -37,7 +47,12 @@ pub fn parse_bitmap_info_header(buf: &[u8]) -> Result<BitmapInfoHeader> {
     let _bi_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let width = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as i32 as u32;
     let height_signed = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    // height can be negative to indicate top-down orientation; take absolute.
+    // Per VfW `wingdi.h` §"biHeight sign rules": positive height ⇒
+    // bottom-up DIB (origin lower-left), negative ⇒ top-down DIB (origin
+    // upper-left). Take the absolute value for the public `height`
+    // accessor (pixel count) and preserve the sign in `top_down` so
+    // callers can re-emit the correct orientation on remux.
+    let top_down = height_signed.is_negative();
     let height = height_signed.unsigned_abs();
     let planes = u16::from_le_bytes([buf[12], buf[13]]);
     let bit_count = u16::from_le_bytes([buf[14], buf[15]]);
@@ -69,10 +84,44 @@ pub fn parse_bitmap_info_header(buf: &[u8]) -> Result<BitmapInfoHeader> {
         clr_used,
         clr_important,
         extradata,
+        top_down,
     })
 }
 
+/// `BI_BITFIELDS` per `wingdi.h` (compression value `3`, little-endian
+/// DWORD `[3, 0, 0, 0]`). Valid for 16-bpp and 32-bpp uncompressed RGB
+/// per VfW §"biCompression" — the BMIH is followed by three `DWORD`
+/// color masks specifying the red/green/blue byte layout (e.g.
+/// `(0xF800, 0x07E0, 0x001F)` for 16-bpp RGB565,
+/// `(0x7C00, 0x03E0, 0x001F)` for 16-bpp RGB555,
+/// `(0x00FF_0000, 0x0000_FF00, 0x0000_00FF)` for 32-bpp BGRA).
+pub const BI_BITFIELDS: [u8; 4] = [3, 0, 0, 0];
+
+/// Parse the three `BI_BITFIELDS` color masks from the trailing
+/// extradata of a BMIH (the 12 bytes immediately after the 40-byte
+/// fixed header). Returns `(red_mask, green_mask, blue_mask)`.
+///
+/// Per VfW `wingdi.h` §"Color tables (palettes)": when `biCompression
+/// == BI_BITFIELDS`, three `DWORD` color masks follow the fixed
+/// header. Returns `None` when fewer than 12 bytes are available.
+///
+/// Validity (which bpps `BI_BITFIELDS` is legal for) is the caller's
+/// concern; the function just reads the three little-endian DWORDs.
+pub fn parse_bitfields_masks(extradata: &[u8]) -> Option<(u32, u32, u32)> {
+    if extradata.len() < 12 {
+        return None;
+    }
+    let r = u32::from_le_bytes([extradata[0], extradata[1], extradata[2], extradata[3]]);
+    let g = u32::from_le_bytes([extradata[4], extradata[5], extradata[6], extradata[7]]);
+    let b = u32::from_le_bytes([extradata[8], extradata[9], extradata[10], extradata[11]]);
+    Some((r, g, b))
+}
+
 /// Emit a 40-byte BITMAPINFOHEADER followed by optional extradata.
+///
+/// `biHeight` is written positive (bottom-up DIB). Call
+/// [`write_bitmap_info_header_oriented`] when the caller needs to
+/// signal a top-down DIB per VfW `wingdi.h` §"biHeight sign rules".
 pub fn write_bitmap_info_header(
     width: u32,
     height: u32,
@@ -80,11 +129,34 @@ pub fn write_bitmap_info_header(
     bit_count: u16,
     extradata: &[u8],
 ) -> Vec<u8> {
+    write_bitmap_info_header_oriented(width, height, compression, bit_count, extradata, false)
+}
+
+/// Same as [`write_bitmap_info_header`] but stamps a negative `biHeight`
+/// when `top_down` is `true`, signalling a top-down DIB (origin at
+/// upper-left) per VfW `wingdi.h` §"biHeight sign rules". Only
+/// semantically meaningful for uncompressed RGB streams (`BI_RGB` or
+/// `BI_BITFIELDS`); compressed formats MUST use positive `biHeight`
+/// per the same section.
+pub fn write_bitmap_info_header_oriented(
+    width: u32,
+    height: u32,
+    compression: [u8; 4],
+    bit_count: u16,
+    extradata: &[u8],
+    top_down: bool,
+) -> Vec<u8> {
     let bi_size = 40u32 + extradata.len() as u32;
     let mut out = Vec::with_capacity(bi_size as usize);
     out.extend_from_slice(&bi_size.to_le_bytes());
     out.extend_from_slice(&width.to_le_bytes());
-    out.extend_from_slice(&height.to_le_bytes());
+    // Sign rule: positive ⇒ bottom-up, negative ⇒ top-down.
+    let height_field: i32 = if top_down {
+        -(height as i32)
+    } else {
+        height as i32
+    };
+    out.extend_from_slice(&height_field.to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes()); // planes = 1
     out.extend_from_slice(&bit_count.to_le_bytes());
     out.extend_from_slice(&compression);
@@ -188,6 +260,36 @@ mod tests {
         assert_eq!(&h.compression, b"MJPG");
         assert_eq!(h.bit_count, 24);
         assert_eq!(h.extradata, vec![0xAA, 0xBB]);
+        assert!(!h.top_down);
+    }
+
+    #[test]
+    fn bmih_roundtrip_top_down() {
+        // Negative biHeight ⇒ top-down DIB per VfW §"biHeight sign rules".
+        let bytes = write_bitmap_info_header_oriented(320, 240, [0, 0, 0, 0], 24, &[], true);
+        let h = parse_bitmap_info_header(&bytes).unwrap();
+        assert_eq!(h.height, 240, "abs(biHeight) reported as positive pixels");
+        assert!(h.top_down, "negative biHeight ⇒ top_down flag set");
+        // And the on-wire i32 at offset 8..12 must encode -240.
+        let on_wire = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(on_wire, -240);
+    }
+
+    #[test]
+    fn bitfields_masks_rgb565() {
+        // RGB565 masks per VfW §"biCompression".
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&0x0000_F800u32.to_le_bytes()); // R
+        ext.extend_from_slice(&0x0000_07E0u32.to_le_bytes()); // G
+        ext.extend_from_slice(&0x0000_001Fu32.to_le_bytes()); // B
+        let masks = parse_bitfields_masks(&ext).unwrap();
+        assert_eq!(masks, (0xF800, 0x07E0, 0x001F));
+    }
+
+    #[test]
+    fn bitfields_masks_too_short_returns_none() {
+        assert!(parse_bitfields_masks(&[1u8, 2, 3]).is_none());
+        assert!(parse_bitfields_masks(&[]).is_none());
     }
 
     #[test]
