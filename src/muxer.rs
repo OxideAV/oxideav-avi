@@ -299,6 +299,28 @@ pub struct AviMuxOptions {
     /// (the default) preserves the round-3 byte layout (positive
     /// `biHeight`) for existing callers.
     pub top_down_video_streams: Vec<u32>,
+    /// Per-stream WAVEFORMATEXTENSIBLE emit (round-75). Each entry is
+    /// `(stream_index, channel_mask, valid_bits_per_sample,
+    /// subformat_guid)`: when an `auds` stream is listed here, the
+    /// muxer emits a 40-byte `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`)
+    /// `strf` per Microsoft `mmreg.h` § "WAVEFORMATEXTENSIBLE" instead
+    /// of the legacy 18-byte `WAVEFORMATEX`. The 22-byte extension
+    /// carries the channel-mask bitmap, valid bits per sample, and
+    /// SubFormat GUID (i.e. the canonical codec identifier when the
+    /// legacy `wFormatTag` escape hatch is in use). Duplicate calls
+    /// for the same `stream_index` replace the prior entry.
+    ///
+    /// Required for any audio stream that needs to carry one of:
+    /// - More than 2 channels with an explicit speaker assignment
+    ///   (5.1, 7.1, …) — the channel mask drives byte order;
+    /// - 24-bit precision in a 32-bit container — `valid_bits_per_sample`
+    ///   captures the precision while WAVEFORMATEX-side
+    ///   `bits_per_sample` holds the container size;
+    /// - Identification via SubFormat GUID — multi-codec dispatch
+    ///   beyond the 16-bit `wFormatTag` registry.
+    ///
+    /// See [`Self::with_extensible_audio`].
+    pub extensible_audio_streams: Vec<(u32, u32, u16, crate::stream_format::Guid)>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -801,6 +823,53 @@ impl AviMuxOptions {
         }
         self
     }
+
+    /// Builder helper: register `stream_index` as a
+    /// `WAVE_FORMAT_EXTENSIBLE` audio stream (round-75). On
+    /// `write_header`, the muxer emits a 40-byte
+    /// `WAVEFORMATEXTENSIBLE` `strf` payload instead of the legacy
+    /// 18-byte `WAVEFORMATEX` per Microsoft `mmreg.h` §
+    /// "WAVEFORMATEXTENSIBLE": the trailing 22-byte extension carries
+    /// `(channel_mask, valid_bps, subformat_guid)` so consumers that
+    /// honour the extensible shape can resolve channel layout, actual
+    /// sample precision, and codec identity from the file alone
+    /// rather than relying on per-codec defaults.
+    ///
+    /// Use the constants in [`crate::stream_format`] for the GUID
+    /// (e.g. `KSDATAFORMAT_SUBTYPE_PCM`, `_IEEE_FLOAT`, `_ALAW`,
+    /// `_MULAW`, `_ADPCM`, `_MPEG`, `_DRM`) when emitting one of the
+    /// canonical Microsoft `KSDATAFORMAT_SUBTYPE_*` codecs. For
+    /// stream channel layouts, the docs README maps the most common
+    /// `dwChannelMask` values:
+    /// - mono → `0x00004` (`SPEAKER_FRONT_CENTER`)
+    /// - stereo → `0x00003` (`FL | FR`)
+    /// - 5.1 (Microsoft) → `0x0003F`
+    /// - 7.1 → `0x0063F`
+    ///
+    /// `valid_bps` is the WAVEFORMATEXTENSIBLE
+    /// `Samples.wValidBitsPerSample` field — the actual sample
+    /// precision; for 24-bit-in-32-bit-container PCM, set
+    /// `valid_bps = 24` and let the underlying WAVEFORMATEX-side
+    /// `bits_per_sample` (derived from `params.sample_format` /
+    /// codec_id) hold the container size of 32. For codecs whose
+    /// container size equals the precision (e.g. PCM `s16le`), use
+    /// the same value for both.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Repeated builder chaining is supported.
+    pub fn with_extensible_audio(
+        mut self,
+        stream_index: u32,
+        channel_mask: u32,
+        valid_bps: u16,
+        subformat: crate::stream_format::Guid,
+    ) -> Self {
+        self.extensible_audio_streams
+            .retain(|(idx, _, _, _)| *idx != stream_index);
+        self.extensible_audio_streams
+            .push((stream_index, channel_mask, valid_bps, subformat));
+        self
+    }
 }
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
@@ -947,7 +1016,17 @@ pub fn open_avi(
             .top_down_video_streams
             .iter()
             .any(|&idx| idx as usize == i);
-        let entry = build_strf(&s.params, top_down)?;
+        // Round-75: honour `extensible_audio_streams` for audio
+        // streams that want a 40-byte WAVEFORMATEXTENSIBLE `strf`
+        // payload instead of the legacy 18-byte WAVEFORMATEX. The
+        // helper itself drops the flag for non-audio streams (i.e.
+        // it's a no-op on a video stream registered with this opt).
+        let extensible = options
+            .extensible_audio_streams
+            .iter()
+            .find(|(idx, _, _, _)| (*idx as usize) == i)
+            .map(|(_, mask, valid, guid)| (*mask, *valid, *guid));
+        let entry = build_strf(&s.params, top_down, extensible)?;
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {
             stream: s.clone(),

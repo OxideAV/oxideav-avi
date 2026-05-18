@@ -63,7 +63,10 @@ use oxideav_core::{
 use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_FORM, LIST, RIFF};
-use crate::stream_format::{parse_bitmap_info_header, parse_waveformatex};
+use crate::stream_format::{
+    parse_bitmap_info_header, parse_waveformatex, parse_waveformatextensible, subformat_codec_hint,
+    Guid, WAVE_FORMAT_EXTENSIBLE,
+};
 
 /// `bIndexType` of an `AVIMETAINDEX` super-index (`indx` of indexes).
 const AVI_INDEX_OF_INDEXES: u8 = 0x00;
@@ -220,6 +223,11 @@ fn open_avi_inner(
     // — round-19 C1+C2. Parallel to `streams`: `Some` for video,
     // `None` otherwise.
     let mut video_strfs: Vec<Option<VideoStrfInfo>> = Vec::new();
+    // Per-stream audio WAVEFORMATEX(TENSIBLE) side-info (channel
+    // mask, valid-bits-per-sample, SubFormat GUID) — round-75
+    // WAVEFORMATEXTENSIBLE landing. Parallel to `streams`: `Some`
+    // for audio, `None` otherwise.
+    let mut audio_strfs: Vec<Option<AudioStrfInfo>> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -236,6 +244,7 @@ fn open_avi_inner(
         &mut dmlh_total_frames,
         &mut audio_infos,
         &mut video_strfs,
+        &mut audio_strfs,
         codecs,
         /* is_primary */ true,
     )?;
@@ -264,6 +273,7 @@ fn open_avi_inner(
                     &mut dmlh_total_frames,
                     &mut audio_infos,
                     &mut video_strfs,
+                    &mut audio_strfs,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -524,6 +534,42 @@ fn open_avi_inner(
                 format!("avi:vids.{i}.bitfields"),
                 format!("r=0x{r:08X},g=0x{g:08X},b=0x{b:08X}"),
             ));
+        }
+    }
+
+    // Round-75: WAVEFORMATEXTENSIBLE side-info per audio stream.
+    // Mirrors the round-19 video_strf metadata-key pattern. Keys are
+    // only emitted for streams whose `wFormatTag` was
+    // `WAVE_FORMAT_EXTENSIBLE` (0xFFFE) and whose extension parsed
+    // cleanly — absence is observable.
+    for (i, as_opt) in audio_strfs.iter().enumerate() {
+        let asi = match as_opt {
+            Some(a) => a,
+            None => continue,
+        };
+        if asi.format_tag != WAVE_FORMAT_EXTENSIBLE {
+            continue;
+        }
+        if let Some(valid) = asi.valid_bits_per_sample {
+            metadata.push((
+                format!("avi:auds.{i}.valid_bits_per_sample"),
+                valid.to_string(),
+            ));
+        }
+        if let Some(mask) = asi.channel_mask {
+            metadata.push((
+                format!("avi:auds.{i}.channel_mask"),
+                format!("0x{mask:08X}"),
+            ));
+        }
+        if let Some(guid) = asi.subformat {
+            metadata.push((format!("avi:auds.{i}.subformat"), guid.display()));
+            if let Some(tag) = guid.ksdataformat_tag() {
+                metadata.push((
+                    format!("avi:auds.{i}.subformat_wformat_tag"),
+                    format!("0x{tag:04X}"),
+                ));
+            }
         }
     }
 
@@ -962,6 +1008,7 @@ fn open_avi_inner(
         text_chunk_data,
         sideband_data_loaded,
         video_strf: video_strfs,
+        audio_strf: audio_strfs,
     })
 }
 
@@ -986,6 +1033,7 @@ fn walk_riff_body(
     dmlh_total_frames: &mut Option<u32>,
     audio_infos: &mut Vec<Option<AudioStrhInfo>>,
     video_strfs: &mut Vec<Option<VideoStrfInfo>>,
+    audio_strfs: &mut Vec<Option<AudioStrfInfo>>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -1006,7 +1054,7 @@ fn walk_riff_body(
             let body_end = (body_start + body_len as u64).min(end).min(file_len);
             match &list_type {
                 b"hdrl" if is_primary => {
-                    let (main, stream_infos, suffixes, sxs, vps, dmlh, info_md, ais, vss) =
+                    let (main, stream_infos, suffixes, sxs, vps, dmlh, info_md, ais, vss, asfs) =
                         parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
@@ -1017,6 +1065,7 @@ fn walk_riff_body(
                     metadata.extend(info_md);
                     *audio_infos = ais;
                     *video_strfs = vss;
+                    *audio_strfs = asfs;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -1215,7 +1264,9 @@ fn parse_avih(buf: &[u8]) -> Result<AviMainHeader> {
 /// audio-strh `(format_tag, sample_size)` capture (round-14
 /// candidate 2 — used by the VBR/CBR validator at `open_avi`).
 /// `audio_infos` is parallel to `streams`: `Some` for audio streams,
-/// `None` for video / data streams.
+/// `None` for video / data streams. `audio_strfs` mirrors that
+/// parallel-by-index pattern for the WAVEFORMATEX(TENSIBLE)-derived
+/// audio-strf side-info captured at parse time.
 type HdrlOutput = (
     AviMainHeader,
     Vec<StreamInfo>,
@@ -1226,6 +1277,7 @@ type HdrlOutput = (
     Vec<(String, String)>,
     Vec<Option<AudioStrhInfo>>,
     Vec<Option<VideoStrfInfo>>,
+    Vec<Option<AudioStrfInfo>>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -1248,6 +1300,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut vprps: Vec<VprpHeader> = Vec::new();
     let mut audio_infos: Vec<Option<AudioStrhInfo>> = Vec::new();
     let mut video_strfs: Vec<Option<VideoStrfInfo>> = Vec::new();
+    let mut audio_strfs: Vec<Option<AudioStrfInfo>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
 
@@ -1268,7 +1321,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx, vp, ai, vs) =
+                    let (si, suf, sx, vp, ai, vs, asi) =
                         parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1277,6 +1330,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         vprps.push(vp);
                         audio_infos.push(ai);
                         video_strfs.push(vs);
+                        audio_strfs.push(asi);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1316,6 +1370,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         info_metadata,
         audio_infos,
         video_strfs,
+        audio_strfs,
     ))
 }
 
@@ -1369,6 +1424,7 @@ type StrlOutput = (
     VprpHeader,
     Option<AudioStrhInfo>,
     Option<VideoStrfInfo>,
+    Option<AudioStrfInfo>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -1436,7 +1492,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     }
     let strh = match strh_buf {
         Some(b) => b,
-        None => return Ok((None, None, super_index, vprp, None, None)),
+        None => return Ok((None, None, super_index, vprp, None, None, None)),
     };
     let strf = strf_buf.unwrap_or_default();
     let parsed = build_stream(index, &strh, &strf, codecs)?;
@@ -1447,6 +1503,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         vprp,
         parsed.2,
         parsed.3,
+        parsed.4,
     ))
 }
 
@@ -1757,16 +1814,61 @@ pub(crate) struct AudioStrhInfo {
     pub sample_size: u32,
 }
 
-/// 4-tuple returned by [`build_stream`]: the [`StreamInfo`], the
+/// Per-audio-stream `strf` (WAVEFORMATEX / WAVEFORMATEXTENSIBLE)
+/// decoded side-data the demuxer captures at `open()` for callers
+/// that need surround channel mask, 24-in-32 container vs valid bits
+/// disambiguation, or the SubFormat GUID without re-parsing
+/// extradata. Round-75 — pairs with [`VideoStrfInfo`] for audio
+/// streams.
+///
+/// One entry per audio stream (parallel to [`AviDemuxer::streams`]
+/// for `media_type == Audio`); video / data streams have `None`. For
+/// audio streams whose `wFormatTag` was NOT
+/// [`crate::stream_format::WAVE_FORMAT_EXTENSIBLE`] (`0xFFFE`), the
+/// extensible-only fields are `None` (the legacy `WAVEFORMATEX`
+/// shape doesn't carry channel mask / SubFormat GUID); only the
+/// `wFormatTag` field is always populated.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AudioStrfInfo {
+    /// On-wire `wFormatTag` value. Always set; equal to
+    /// [`crate::stream_format::WAVE_FORMAT_EXTENSIBLE`] (`0xFFFE`)
+    /// for extensible streams and to the legacy `WAVE_FORMAT_*`
+    /// constant otherwise.
+    pub format_tag: u16,
+    /// `WAVEFORMATEXTENSIBLE.Samples.wValidBitsPerSample` for
+    /// extensible streams — the actual sample precision, which may
+    /// be less than the container size carried in
+    /// `WAVEFORMATEX.wBitsPerSample` (the canonical example is 24-bit
+    /// PCM in a 32-bit container). `None` for legacy
+    /// `WAVEFORMATEX` streams (caller should fall back to the
+    /// `WAVEFORMATEX.wBitsPerSample` value).
+    pub valid_bits_per_sample: Option<u16>,
+    /// `WAVEFORMATEXTENSIBLE.dwChannelMask` — `SPEAKER_*` bitmap
+    /// per Microsoft `mmreg.h` / Microsoft Learn § "Channel-mask
+    /// channel ordering". `None` for legacy streams (the spec
+    /// pre-dated explicit speaker assignment so the order is
+    /// channel-count-dependent).
+    pub channel_mask: Option<u32>,
+    /// `WAVEFORMATEXTENSIBLE.SubFormat` GUID — the actual codec
+    /// identifier when the legacy `wFormatTag` is the
+    /// `WAVE_FORMAT_EXTENSIBLE` escape hatch. `None` for non-
+    /// extensible streams.
+    pub subformat: Option<Guid>,
+}
+
+/// 5-tuple returned by [`build_stream`]: the [`StreamInfo`], the
 /// 2-byte chunk suffix (`dc` / `db` / `wb` / `xx`), the
 /// audio-strh `(format_tag, sample_size)` pair (`Some` for audio
-/// streams only — round-14 C2), and the video-strf BMIH side-info
-/// (`Some` for video streams only — round-19 C1+C2).
+/// streams only — round-14 C2), the video-strf BMIH side-info
+/// (`Some` for video streams only — round-19 C1+C2), and the
+/// audio-strf WAVEFORMATEX(TENSIBLE) side-info (`Some` for audio
+/// streams only — round-75 WAVEFORMATEXTENSIBLE landing).
 type BuildStreamOutput = (
     StreamInfo,
     [u8; 2],
     Option<AudioStrhInfo>,
     Option<VideoStrfInfo>,
+    Option<AudioStrfInfo>,
 );
 
 fn build_stream(
@@ -1804,6 +1906,7 @@ fn build_stream(
 
     let mut audio_info: Option<AudioStrhInfo> = None;
     let mut video_strf_info: Option<VideoStrfInfo> = None;
+    let mut audio_strf_info: Option<AudioStrfInfo> = None;
     let (media_type, codec_id, params, suffix) = match &fcc_type {
         b"vids" => {
             let bmih = if !strf.is_empty() {
@@ -1864,6 +1967,20 @@ fn build_stream(
             };
             let format_tag = wfx.as_ref().map(|w| w.format_tag).unwrap_or(0);
             let bits = wfx.as_ref().map(|w| w.bits_per_sample).unwrap_or(0);
+
+            // Round-75: WAVEFORMATEXTENSIBLE (wFormatTag == 0xFFFE) —
+            // when the `strf` payload carries the 22-byte extension,
+            // pull `wValidBitsPerSample` / `dwChannelMask` / SubFormat
+            // GUID off it. SubFormat is the canonical codec identity
+            // when the legacy `wFormatTag` is the EXTENSIBLE escape
+            // hatch per docs/container/riff/waveformatextensible/
+            // README §"What's covered".
+            let wfex = if format_tag == WAVE_FORMAT_EXTENSIBLE && !strf.is_empty() {
+                Some(parse_waveformatextensible(strf)?)
+            } else {
+                None
+            };
+
             let tag = CodecTag::wave_format(format_tag);
             let mut ctx = ProbeContext::new(&tag).header(strf);
             if let Some(w) = &wfx {
@@ -1872,9 +1989,44 @@ fn build_stream(
                     .channels(w.channels)
                     .sample_rate(w.samples_per_sec);
             }
-            let codec_id = codecs
-                .resolve_tag(&ctx)
-                .unwrap_or_else(|| audio_codec_id_fallback(format_tag, bits));
+            // Codec id resolution path:
+            // 1. Try the codec registry against `CodecTag::wave_format(format_tag)`
+            //    (legacy path). Registered codecs for `0xFFFE` could
+            //    re-dispatch via `ctx.header` — we keep that surface
+            //    so a future codec crate can claim the EXTENSIBLE tag.
+            // 2. For extensible streams, prefer the SubFormat GUID's
+            //    well-known mapping (PCM / IEEE_FLOAT / ALAW / MULAW
+            //    / ADPCM / MPEG / DRM) over the synthetic
+            //    `avi:tag_fffe` placeholder the legacy fallback would
+            //    produce — the GUID is the actual codec id.
+            // 3. Fall back to the legacy depth-aware
+            //    `audio_codec_id_fallback`.
+            let codec_id = codecs.resolve_tag(&ctx).unwrap_or_else(|| {
+                if let Some(wfe) = &wfex {
+                    // For depth-aware PCM/IEEE_FLOAT resolution, the
+                    // SubFormat's `wValidBitsPerSample` is the actual
+                    // codec precision (e.g. 24 for 24-in-32 PCM); fall
+                    // back to the WAVEFORMATEX `wBitsPerSample`
+                    // container size only when the union member is
+                    // zero (writers in the wild sometimes leave it
+                    // unset, in which case the container size is the
+                    // best available proxy).
+                    let depth = if wfe.valid_bits_per_sample > 0 {
+                        wfe.valid_bits_per_sample
+                    } else {
+                        bits
+                    };
+                    if let Some(hint) = subformat_codec_hint(&wfe.subformat, depth) {
+                        return CodecId::new(hint);
+                    }
+                    // Unknown SubFormat — synthesise an `avi:guid_<...>`
+                    // id so downstream `make_decoder` lookup fails
+                    // cleanly with a CodecNotFound naming the actual
+                    // GUID rather than the opaque `0xFFFE` tag.
+                    return CodecId::new(format!("avi:guid_{}", wfe.subformat.display()));
+                }
+                audio_codec_id_fallback(format_tag, bits)
+            });
             let mut p = CodecParameters::audio(codec_id.clone());
             // Stamp the on-wire wFormatTag onto the params for
             // round-trip preservation.
@@ -1883,7 +2035,23 @@ fn build_stream(
                 p.channels = Some(w.channels);
                 p.sample_rate = Some(w.samples_per_sec);
                 p.extradata = w.extradata.clone();
-                p.sample_format = sample_format_for(codec_id.as_str(), w.bits_per_sample);
+                // For extensible streams, prefer the SubFormat's
+                // wValidBitsPerSample for the sample-format hint —
+                // matches what the underlying codec actually decodes
+                // (24-in-32 PCM uses S24, not S32, even when the
+                // container is 32 bits). Fall back to the container
+                // size when the extension union is zero.
+                let depth_for_format = wfex
+                    .as_ref()
+                    .map(|wfe| {
+                        if wfe.valid_bits_per_sample > 0 {
+                            wfe.valid_bits_per_sample
+                        } else {
+                            w.bits_per_sample
+                        }
+                    })
+                    .unwrap_or(w.bits_per_sample);
+                p.sample_format = sample_format_for(codec_id.as_str(), depth_for_format);
                 p.bit_rate = if w.avg_bytes_per_sec > 0 {
                     Some(w.avg_bytes_per_sec as u64 * 8)
                 } else {
@@ -1899,6 +2067,17 @@ fn build_stream(
             audio_info = Some(AudioStrhInfo {
                 format_tag,
                 sample_size,
+            });
+            // Round-75: capture WAVEFORMATEX(TENSIBLE) side-info on
+            // every audio stream so the demuxer can hand callers the
+            // typed shape via [`AviDemuxer::stream_audio_strf`] /
+            // [`AviDemuxer::stream_channel_mask`] /
+            // [`AviDemuxer::stream_subformat`].
+            audio_strf_info = Some(AudioStrfInfo {
+                format_tag,
+                valid_bits_per_sample: wfex.as_ref().map(|wfe| wfe.valid_bits_per_sample),
+                channel_mask: wfex.as_ref().map(|wfe| wfe.channel_mask),
+                subformat: wfex.as_ref().map(|wfe| wfe.subformat),
             });
             (MediaType::Audio, codec_id, p, *b"wb")
         }
@@ -1940,7 +2119,7 @@ fn build_stream(
         start_time: Some(0),
         params,
     };
-    Ok((stream, suffix, audio_info, video_strf_info))
+    Ok((stream, suffix, audio_info, video_strf_info, audio_strf_info))
 }
 
 /// Synthesise a placeholder `avi:<fourcc>` codec_id when the resolver
@@ -2455,6 +2634,14 @@ pub struct AviDemuxer {
     /// by stream number; `None` for non-video streams or video streams
     /// whose `strf` payload was empty / shorter than 40 bytes.
     video_strf: Vec<Option<VideoStrfInfo>>,
+    /// Per-audio-stream WAVEFORMATEX(TENSIBLE)-derived side-info
+    /// (channel mask, valid bits per sample, SubFormat GUID) — round-75
+    /// per Microsoft `mmreg.h` §"WAVEFORMATEXTENSIBLE" and
+    /// docs/container/riff/waveformatextensible/. Indexed by stream
+    /// number; `None` for non-audio streams. For audio streams whose
+    /// `wFormatTag` was not `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`) the
+    /// extensible-only fields are `None`.
+    audio_strf: Vec<Option<AudioStrfInfo>>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -4009,6 +4196,71 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .and_then(|v| v.as_ref())
             .and_then(|vs| vs.bitfields_masks)
+    }
+
+    /// Round-75: per-audio-stream WAVEFORMATEX(TENSIBLE) typed side-info.
+    ///
+    /// Returns the captured [`AudioStrfInfo`] for an audio stream
+    /// (`format_tag` always populated; `valid_bits_per_sample` /
+    /// `channel_mask` / `subformat` populated only when the on-wire
+    /// `wFormatTag` was [`crate::stream_format::WAVE_FORMAT_EXTENSIBLE`]
+    /// — `0xFFFE` — and the strf payload carried the 22-byte
+    /// extension). `None` for non-audio streams or out-of-range
+    /// stream indexes.
+    ///
+    /// Pairs with the legacy [`oxideav_core::StreamInfo`] /
+    /// [`oxideav_core::CodecParameters`] accessors; surfaces the
+    /// per-channel-mask + actual-precision data the legacy
+    /// `WAVEFORMATEX` shape couldn't express.
+    pub fn stream_audio_strf(&self, stream_index: u32) -> Option<AudioStrfInfo> {
+        self.audio_strf.get(stream_index as usize).and_then(|v| *v)
+    }
+
+    /// Round-75 convenience: `dwChannelMask` for an extensible audio
+    /// stream. Returns `Some(mask)` only when the stream's
+    /// `wFormatTag == WAVE_FORMAT_EXTENSIBLE (0xFFFE)` and the strf
+    /// payload carried the 22-byte extension. `None` for legacy
+    /// `WAVEFORMATEX` audio streams (the spec pre-dated explicit
+    /// speaker assignment), non-audio streams, or out-of-range
+    /// stream indexes.
+    ///
+    /// Per Microsoft Learn § "Channel-mask channel ordering", the
+    /// channel-byte order in PCM frames follows the bit order of this
+    /// mask (lowest set bit first). Use the constants in
+    /// [`crate::stream_format`]'s `SPEAKER_*` namespace or the docs
+    /// table for layout interpretation.
+    pub fn stream_channel_mask(&self, stream_index: u32) -> Option<u32> {
+        self.stream_audio_strf(stream_index)
+            .and_then(|asi| asi.channel_mask)
+    }
+
+    /// Round-75 convenience: `wValidBitsPerSample` for an extensible
+    /// audio stream — the actual sample precision, which may be
+    /// smaller than `wfx.bits_per_sample` (container size, e.g. 24
+    /// valid bits in a 32-bit container). `None` for legacy
+    /// `WAVEFORMATEX` audio streams, non-audio streams, or
+    /// out-of-range stream indexes.
+    pub fn stream_valid_bits_per_sample(&self, stream_index: u32) -> Option<u16> {
+        self.stream_audio_strf(stream_index)
+            .and_then(|asi| asi.valid_bits_per_sample)
+    }
+
+    /// Round-75 convenience: `SubFormat` GUID for an extensible audio
+    /// stream — the canonical codec identifier when `wFormatTag` is
+    /// the `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`) escape hatch per
+    /// Microsoft `KSMedia.h` `KSDATAFORMAT_SUBTYPE_*`. `None` for
+    /// legacy `WAVEFORMATEX` audio streams, non-audio streams, or
+    /// out-of-range stream indexes.
+    ///
+    /// Use [`crate::stream_format::Guid::ksdataformat_tag`] to
+    /// recover the legacy `wFormatTag` when the GUID follows the
+    /// canonical KSDATAFORMAT base pattern, or
+    /// [`crate::stream_format::subformat_codec_hint`] to map the GUID
+    /// to a codec-id string for the seven documented well-known
+    /// SubFormats.
+    pub fn stream_subformat(&self, stream_index: u32) -> Option<Guid> {
+        self.stream_audio_strf(stream_index)
+            .and_then(|asi| asi.subformat)
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).

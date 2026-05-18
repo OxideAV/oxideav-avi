@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **WAVEFORMATEXTENSIBLE (`wFormatTag = 0xFFFE`) demux + mux (round 75).**
+  Implements the 22-byte `cbSize` extension that carries the
+  `Samples.wValidBitsPerSample` union member, `dwChannelMask`
+  speaker-assignment bitmap, and SubFormat GUID per Microsoft
+  `mmreg.h` § "WAVEFORMATEXTENSIBLE" and the docs Microsoft Learn
+  mirror at `docs/container/riff/waveformatextensible/`. New
+  `stream_format::WaveFormatExtensible { wfx, valid_bits_per_sample,
+  channel_mask, subformat }` struct + `parse_waveformatextensible` /
+  `write_waveformatextensible` helpers; new `stream_format::Guid`
+  newtype with `display()` (canonical
+  `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form) + `is_ksdataformat_base()`
+  / `ksdataformat_tag()` for legacy `wFormatTag` recovery; new
+  `WAVE_FORMAT_EXTENSIBLE = 0xFFFE` constant. Seven well-known
+  `KSDATAFORMAT_SUBTYPE_*` GUIDs documented in the spec table land
+  as public constants (`PCM` / `IEEE_FLOAT` / `DRM` / `ALAW` /
+  `MULAW` / `ADPCM` / `MPEG`) with depth-aware codec-id resolution
+  via `subformat_codec_hint(guid, bits)` — PCM SubFormat with 24
+  valid bits resolves to `pcm_s24le` even when the WAVEFORMATEX
+  container size is 32 (the canonical 24-in-32 carriage). Demuxer:
+  new `AviDemuxer::stream_audio_strf(stream) -> Option<AudioStrfInfo>`
+  + `stream_channel_mask` / `stream_valid_bits_per_sample` /
+  `stream_subformat` convenience accessors, plus four metadata keys
+  per extensible audio stream — `avi:auds.<n>.channel_mask`,
+  `avi:auds.<n>.valid_bits_per_sample`, `avi:auds.<n>.subformat`,
+  `avi:auds.<n>.subformat_wformat_tag`. Muxer: new
+  `AviMuxOptions::with_extensible_audio(stream_index, channel_mask,
+  valid_bps, subformat_guid)` builder; `params.tag =
+  WaveFormat(0xFFFE)` without the helper is now rejected at
+  `open_avi` with `Error::Invalid` (was previously emitting a broken
+  18-byte WAVEFORMATEX). Mux→demux round-trips 5.1 PCM (24-in-32)
+  and stereo IEEE_FLOAT byte-equal on every captured field.
 - **Top-down DIB orientation round-trip (round 19 C1).** New public
   `BitmapInfoHeader.top_down: bool` field on the parsed `strf` body
   preserves the sign of the on-wire `biHeight` per VfW `wingdi.h`

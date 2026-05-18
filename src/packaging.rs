@@ -21,6 +21,7 @@ use oxideav_core::{CodecId, CodecParameters, CodecTag, Error, MediaType, Result,
 
 use crate::stream_format::{
     write_bitmap_info_header, write_bitmap_info_header_oriented, write_waveformatex,
+    write_waveformatextensible, Guid, WAVE_FORMAT_EXTENSIBLE,
 };
 
 /// Result of building a stream-format chunk for the muxer.
@@ -55,10 +56,23 @@ pub(crate) struct StrfEntry {
 /// the spec REQUIRES positive `biHeight` for compressed FourCCs per
 /// VfW §"biHeight sign rules". For audio / non-RGB video streams it
 /// has no effect.
-pub(crate) fn build_strf(params: &CodecParameters, top_down: bool) -> Result<StrfEntry> {
+///
+/// `extensible` (round-75) is only honoured for audio streams. When
+/// `Some((channel_mask, valid_bps, subformat_guid))` the muxer emits
+/// a 40-byte `WAVEFORMATEXTENSIBLE` `strf` payload with
+/// `wFormatTag = 0xFFFE` per Microsoft `mmreg.h` §
+/// "WAVEFORMATEXTENSIBLE", regardless of `params.tag`'s
+/// `WaveFormat(...)` value (the extensible escape hatch is the whole
+/// point — the SubFormat GUID is the canonical identifier when
+/// `wFormatTag = 0xFFFE`). For video streams it has no effect.
+pub(crate) fn build_strf(
+    params: &CodecParameters,
+    top_down: bool,
+    extensible: Option<(u32, u16, Guid)>,
+) -> Result<StrfEntry> {
     match params.media_type {
         MediaType::Video => build_video_strf(params, top_down),
-        MediaType::Audio => build_audio_strf(params),
+        MediaType::Audio => build_audio_strf(params, extensible),
         _ => Err(Error::unsupported(format!(
             "avi muxer: media type {:?} not supported",
             params.media_type
@@ -193,14 +207,78 @@ fn build_video_strf(params: &CodecParameters, top_down: bool) -> Result<StrfEntr
     })
 }
 
-fn build_audio_strf(params: &CodecParameters) -> Result<StrfEntry> {
+fn build_audio_strf(
+    params: &CodecParameters,
+    extensible: Option<(u32, u16, Guid)>,
+) -> Result<StrfEntry> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("avi muxer: audio stream missing channels"))?;
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("avi muxer: audio stream missing sample_rate"))?;
+
+    // Round-75: WAVEFORMATEXTENSIBLE override. When the caller
+    // registered the stream via `with_extensible_audio`, the muxer
+    // emits a 40-byte WAVEFORMATEXTENSIBLE strf with `wFormatTag =
+    // 0xFFFE` regardless of `params.tag`. The PCM container size
+    // (`wBitsPerSample`) still comes from the codec id /
+    // sample_format so byte-stream layout stays correct; the
+    // `valid_bps` argument is the precision (which may be smaller).
+    if let Some((channel_mask, valid_bps, subformat)) = extensible {
+        let id = params.codec_id.as_str();
+        let container_bits = pcm_bits_per_sample(id, params.sample_format).unwrap_or_else(|| {
+            // Non-PCM extensible streams (rare; e.g. extensible-AC3
+            // by GUID). Round up to the nearest byte from valid_bps;
+            // for VBR codecs an 8-bit container is the sentinel
+            // legacy WAVEFORMATEX would use.
+            valid_bps.max(8).next_multiple_of(8)
+        });
+        let block_align = channels * (container_bits / 8).max(1);
+        let avg_bytes_per_sec = sample_rate * block_align as u32;
+        let strf = write_waveformatextensible(
+            channels,
+            sample_rate,
+            avg_bytes_per_sec,
+            block_align,
+            container_bits,
+            valid_bps,
+            channel_mask,
+            &subformat,
+        );
+        // PCM-family extensible streams remain CBR; non-PCM
+        // extensible streams (rare) follow the parent codec's
+        // VBR/CBR rules — but since the parent codec id determined
+        // `container_bits` above via `pcm_bits_per_sample`, the
+        // safer default is `block_align` as sample_size whenever we
+        // got a real PCM depth; otherwise fall back to 0 (VBR).
+        let sample_size = if pcm_bits_per_sample(id, params.sample_format).is_some() {
+            block_align as u32
+        } else {
+            0
+        };
+        return Ok(StrfEntry {
+            chunk_suffix: *b"wb",
+            handler_fourcc: *b"\0\0\0\0",
+            strf,
+            strh_type: *b"auds",
+            sample_size,
+            scale: 1,
+            rate: sample_rate,
+        });
+    }
+    // The remaining (legacy WAVEFORMATEX) paths reject
+    // `params.tag = WaveFormat(0xFFFE)` indirectly: `audio_format_tag`
+    // would happily stamp it, but the legacy 18-byte strf can't carry
+    // the SubFormat GUID. Callers using EXTENSIBLE must go through
+    // `with_extensible_audio` above.
     let format_tag = audio_format_tag(params)?;
+    if format_tag == WAVE_FORMAT_EXTENSIBLE {
+        return Err(Error::invalid(
+            "avi muxer: WAVE_FORMAT_EXTENSIBLE (0xFFFE) requires \
+             AviMuxOptions::with_extensible_audio(channel_mask, valid_bps, subformat_guid)",
+        ));
+    }
     let id = params.codec_id.as_str();
 
     // PCM family: choose bit_depth from sample_format (or codec_id), and
@@ -379,7 +457,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false).unwrap();
+        let entry = build_strf(&p, false, None).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         assert_eq!(entry.sample_size, 4); // 2ch × 2B
     }
@@ -390,7 +468,7 @@ mod tests {
             CodecParameters::audio(CodecId::new("mp3")).with_tag(CodecTag::wave_format(0x0055));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false).unwrap();
+        let entry = build_strf(&p, false, None).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         // First 2 bytes of the WAVEFORMATEX are the wFormatTag in LE.
         assert_eq!(&entry.strf[0..2], &0x0055u16.to_le_bytes());
@@ -401,7 +479,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("noexist"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        match build_strf(&p, false) {
+        match build_strf(&p, false, None) {
             Err(Error::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -416,7 +494,7 @@ mod tests {
             .with_tag(oxideav_core::CodecTag::fourcc(b"MJPG"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true).unwrap();
+        let entry = build_strf(&p, true, None).unwrap();
         // biHeight offset 8..12 in the BMIH; must be positive 240.
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, 240, "compressed FourCCs MUST use positive biHeight");
@@ -425,7 +503,7 @@ mod tests {
         let mut p = CodecParameters::video(CodecId::new("rgb24"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true).unwrap();
+        let entry = build_strf(&p, true, None).unwrap();
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, -240, "BI_RGB + top_down ⇒ negative biHeight");
     }
