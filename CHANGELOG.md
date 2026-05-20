@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strn` name chunk demux + mux (round 80).** Implements
+  the AVI 1.0 §"AVI Stream Headers" optional `strn` chunk per the
+  Microsoft Learn AVI RIFF File Reference (clean-room source at
+  `docs/container/riff/avi-riff-file-reference.md`): a
+  null-terminated text string describing each stream, sitting beside
+  `strh` / `strf` / `strd` inside the per-stream `strl` LIST. Demuxer:
+  new `AviDemuxer::stream_name(stream_index) -> Option<&str>` typed
+  accessor + `avi:strn.<n>` metadata key (UTF-8-lossy decode so
+  legacy Latin-1 / CP1252 capture-tool names round-trip without
+  failing the parse; multi-trailing-NUL bodies strip cleanly; an
+  empty payload — `cb=0` or `cb=1` carrying just the NUL terminator —
+  is treated as "no name" so absence stays distinguishable from an
+  empty-string name). Muxer: new
+  `AviMuxOptions::with_stream_name(stream_index, name)` builder that
+  emits one `strn` chunk per registered stream after `indx`/`vprp` in
+  the strl. The chunk body is the UTF-8 bytes of the name followed
+  by a NUL terminator, RIFF-word-padded; duplicate calls for the
+  same `stream_index` keep only the last entry (consistent with the
+  round-75 `with_extensible_audio` dedup pattern). Round-trips
+  ASCII, multi-byte UTF-8 (Japanese tested), and the no-name baseline
+  byte-for-byte. Tests in `tests/round80_strn.rs`.
+
 - **WAVEFORMATEXTENSIBLE (`wFormatTag = 0xFFFE`) demux + mux (round 75).**
   Implements the 22-byte `cbSize` extension that carries the
   `Samples.wValidBitsPerSample` union member, `dwChannelMask`

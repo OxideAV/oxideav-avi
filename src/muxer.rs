@@ -321,6 +321,17 @@ pub struct AviMuxOptions {
     ///
     /// See [`Self::with_extensible_audio`].
     pub extensible_audio_streams: Vec<(u32, u32, u16, crate::stream_format::Guid)>,
+    /// Per-stream human-readable names emitted as `strn` chunks
+    /// inside each stream's `strl` LIST per AVI 1.0 §"AVI Stream
+    /// Headers" (round-80). Each entry is `(stream_index, name)`;
+    /// the muxer writes `name` followed by a single NUL terminator
+    /// as the chunk body, even-padded with one zero byte when the
+    /// resulting length is odd (per RIFF §"data is always padded to
+    /// nearest WORD boundary"). Duplicate calls for the same stream
+    /// index replace the prior entry — see
+    /// [`Self::with_stream_name`]. Empty list (the default) preserves
+    /// pre-round-80 byte layout (no `strn` chunk emitted).
+    pub stream_names: Vec<(u32, String)>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -870,6 +881,25 @@ impl AviMuxOptions {
             .push((stream_index, channel_mask, valid_bps, subformat));
         self
     }
+
+    /// Builder helper: attach a human-readable name to `stream_index`
+    /// (round-80). The muxer emits a `strn` chunk inside that stream's
+    /// `strl` LIST per AVI 1.0 §"AVI Stream Headers"; the body is the
+    /// UTF-8 bytes of `name` followed by a single NUL terminator, with
+    /// one extra zero pad byte when the resulting length is odd per
+    /// RIFF §"data is always padded to nearest WORD boundary".
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Passing an empty name emits an empty (NUL-only) `strn`
+    /// body which the demuxer interprets as "no name" — call this
+    /// builder with a non-empty name when the intent is to round-trip
+    /// the value.
+    pub fn with_stream_name(mut self, stream_index: u32, name: impl Into<String>) -> Self {
+        let name = name.into();
+        self.stream_names.retain(|(idx, _)| *idx != stream_index);
+        self.stream_names.push((stream_index, name));
+        self
+    }
 }
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
@@ -1239,6 +1269,15 @@ impl Muxer for AviMuxer {
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, c)| c.clone());
             let indx_2field_here = indx_is_2field && with_indx;
+            // Round-80: optional `strn` chunk for this stream. The
+            // first builder entry per stream index wins (see
+            // `with_stream_name`'s retain-then-push pattern).
+            let stream_name = self
+                .options
+                .stream_names
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, n)| n.as_str());
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1248,6 +1287,7 @@ impl Muxer for AviMuxer {
                 vprp_override,
                 indx_2field_here,
                 indx_capacity,
+                stream_name,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -2534,6 +2574,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     vprp_override: Option<VprpConfig>,
     indx_2field: bool,
     indx_capacity: usize,
+    stream_name: Option<&str>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -2620,6 +2661,18 @@ fn write_strl<W: Write + Seek + ?Sized>(
     if with_vprp {
         let body = build_vprp_body(t, vprp_override);
         write_chunk(w, b"vprp", &body)?;
+    }
+
+    // AVI 1.0 §"AVI Stream Headers": optional `strn` chunk carrying a
+    // null-terminated text string describing the stream (round-80).
+    // The spec places this last among the strl children ("'strh', 'strf'
+    // [, 'strd'] [, 'strn']") so we emit it after `indx`/`vprp` to keep
+    // pre-round-80 byte layout identical when no name is configured.
+    if let Some(name) = stream_name {
+        let mut body = Vec::with_capacity(name.len() + 1);
+        body.extend_from_slice(name.as_bytes());
+        body.push(0); // NUL terminator per spec.
+        write_chunk(w, b"strn", &body)?;
     }
 
     finish_chunk(w, strl_off)?;

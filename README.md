@@ -50,6 +50,7 @@ oxideav-avi = "0.0"
 | Top-down DIB orientation (negative `biHeight`) | yes (`stream_top_down` accessor + `avi:vids.<n>.top_down` metadata; preserved across parse) | yes (`AviMuxOptions::with_top_down_video`; honoured only for `BI_RGB` per VfW §"biHeight sign rules") |
 | `BI_BITFIELDS` color masks (16/32-bpp RGB) | yes (`stream_bitfields_masks` accessor + `avi:vids.<n>.bitfields = "r=...,g=...,b=..."` metadata) | n/a |
 | `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`) — 22-byte `cbSize` extension | yes (`stream_audio_strf` / `stream_channel_mask` / `stream_valid_bits_per_sample` / `stream_subformat` accessors + `avi:auds.<n>.{channel_mask,valid_bits_per_sample,subformat,subformat_wformat_tag}` metadata; depth-aware codec-id resolution for the 7 documented `KSDATAFORMAT_SUBTYPE_*` GUIDs, incl. `pcm_s24le` for 24-in-32 container PCM) | yes (`AviMuxOptions::with_extensible_audio(stream, channel_mask, valid_bps, subformat_guid)`) |
+| Per-stream `strn` name chunk (AVI 1.0 §"AVI Stream Headers") | yes (`stream_name(stream_index)` accessor + `avi:strn.<n>` metadata; UTF-8-lossy decode; multi-trailing-NUL tolerated; empty-payload `strn` parses as `None` so absence stays distinguishable) | yes (`AviMuxOptions::with_stream_name(stream_index, name)` — last builder call per index wins; NUL terminator added) |
 
 OpenDML 2.0 muxing is opt-in via `muxer::open_with_kind` with an
 `AviKind::OpenDml(RiffSegmentLimit::OneGiB)` (or `Bytes(n)` for

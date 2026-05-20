@@ -228,6 +228,12 @@ fn open_avi_inner(
     // WAVEFORMATEXTENSIBLE landing. Parallel to `streams`: `Some`
     // for audio, `None` otherwise.
     let mut audio_strfs: Vec<Option<AudioStrfInfo>> = Vec::new();
+    // Per-stream optional name captured from the `strn` chunk per AVI
+    // 1.0 §"AVI Stream Headers" (round-80). Parallel to `streams`:
+    // `Some(name)` when the strl carried a `strn` chunk, `None`
+    // otherwise. Empty-payload strn chunks parse as `None` so the
+    // accessor distinguishes "no name declared" from "empty name".
+    let mut stream_names: Vec<Option<String>> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -245,6 +251,7 @@ fn open_avi_inner(
         &mut audio_infos,
         &mut video_strfs,
         &mut audio_strfs,
+        &mut stream_names,
         codecs,
         /* is_primary */ true,
     )?;
@@ -274,6 +281,7 @@ fn open_avi_inner(
                     &mut audio_infos,
                     &mut video_strfs,
                     &mut audio_strfs,
+                    &mut stream_names,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -569,6 +577,19 @@ fn open_avi_inner(
                     format!("avi:auds.{i}.subformat_wformat_tag"),
                     format!("0x{tag:04X}"),
                 ));
+            }
+        }
+    }
+
+    // Round-80: AVI 1.0 §"AVI Stream Headers" optional `strn` chunk
+    // — per-stream human-readable name surfaced under
+    // `avi:strn.<index>`. Only present-and-non-empty entries are
+    // surfaced so absence remains observable via the typed
+    // [`AviDemuxer::stream_name`] accessor.
+    for (i, name_opt) in stream_names.iter().enumerate() {
+        if let Some(name) = name_opt {
+            if !name.is_empty() {
+                metadata.push((format!("avi:strn.{i}"), name.clone()));
             }
         }
     }
@@ -1009,6 +1030,7 @@ fn open_avi_inner(
         sideband_data_loaded,
         video_strf: video_strfs,
         audio_strf: audio_strfs,
+        stream_names,
     })
 }
 
@@ -1034,6 +1056,7 @@ fn walk_riff_body(
     audio_infos: &mut Vec<Option<AudioStrhInfo>>,
     video_strfs: &mut Vec<Option<VideoStrfInfo>>,
     audio_strfs: &mut Vec<Option<AudioStrfInfo>>,
+    stream_names: &mut Vec<Option<String>>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -1054,8 +1077,19 @@ fn walk_riff_body(
             let body_end = (body_start + body_len as u64).min(end).min(file_len);
             match &list_type {
                 b"hdrl" if is_primary => {
-                    let (main, stream_infos, suffixes, sxs, vps, dmlh, info_md, ais, vss, asfs) =
-                        parse_hdrl(input, body_end, codecs)?;
+                    let (
+                        main,
+                        stream_infos,
+                        suffixes,
+                        sxs,
+                        vps,
+                        dmlh,
+                        info_md,
+                        ais,
+                        vss,
+                        asfs,
+                        names,
+                    ) = parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
                     *packet_chunk_suffix = suffixes;
@@ -1066,6 +1100,7 @@ fn walk_riff_body(
                     *audio_infos = ais;
                     *video_strfs = vss;
                     *audio_strfs = asfs;
+                    *stream_names = names;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -1278,6 +1313,7 @@ type HdrlOutput = (
     Vec<Option<AudioStrhInfo>>,
     Vec<Option<VideoStrfInfo>>,
     Vec<Option<AudioStrfInfo>>,
+    Vec<Option<String>>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -1301,6 +1337,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut audio_infos: Vec<Option<AudioStrhInfo>> = Vec::new();
     let mut video_strfs: Vec<Option<VideoStrfInfo>> = Vec::new();
     let mut audio_strfs: Vec<Option<AudioStrfInfo>> = Vec::new();
+    let mut stream_names: Vec<Option<String>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
 
@@ -1321,7 +1358,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx, vp, ai, vs, asi) =
+                    let (si, suf, sx, vp, ai, vs, asi, name) =
                         parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1331,6 +1368,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         audio_infos.push(ai);
                         video_strfs.push(vs);
                         audio_strfs.push(asi);
+                        stream_names.push(name);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1371,6 +1409,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         audio_infos,
         video_strfs,
         audio_strfs,
+        stream_names,
     ))
 }
 
@@ -1409,14 +1448,18 @@ fn parse_odml_list<R: ReadSeek + ?Sized>(r: &mut R, end_pos: u64) -> Result<Opti
     Ok(None)
 }
 
-/// 6-tuple returned by [`parse_strl`]: optional [`StreamInfo`],
+/// 7-tuple returned by [`parse_strl`]: optional [`StreamInfo`],
 /// optional packet-chunk suffix, [`SuperIndex`] (default-empty when
 /// no `indx`), [`VprpHeader`] (default when no `vprp`), the
 /// audio-stream's `(format_tag, sample_size)` pair when the strh
 /// declared `fccType == "auds"` (round-14 C2 — used by the VBR/CBR
-/// validator at `open_avi`), and the video-stream's BMIH-derived
+/// validator at `open_avi`), the video-stream's BMIH-derived
 /// side-info ([`VideoStrfInfo`]) when the strh declared
-/// `fccType == "vids"` (round-19 C1+C2).
+/// `fccType == "vids"` (round-19 C1+C2), the audio-stream's
+/// WAVEFORMATEX(TENSIBLE)-derived side-info ([`AudioStrfInfo`])
+/// (round-75), and the optional per-stream name captured from the
+/// `strn` chunk per AVI 1.0 §"AVI Stream Headers" (round-80; `None`
+/// when the strl had no `strn` chunk).
 type StrlOutput = (
     Option<StreamInfo>,
     Option<[u8; 2]>,
@@ -1425,6 +1468,7 @@ type StrlOutput = (
     Option<AudioStrhInfo>,
     Option<VideoStrfInfo>,
     Option<AudioStrfInfo>,
+    Option<String>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -1441,6 +1485,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     let mut strf_buf: Option<Vec<u8>> = None;
     let mut super_index = SuperIndex::default();
     let mut vprp = VprpHeader::default();
+    let mut strn_name: Option<String> = None;
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
             Some(h) => h,
@@ -1454,6 +1499,19 @@ fn parse_strl<R: ReadSeek + ?Sized>(
             b"strf" => {
                 strf_buf = Some(read_body_bounded(r, hdr.size)?);
                 skip_pad(r, hdr.size)?;
+            }
+            b"strn" => {
+                // AVI 1.0 §"AVI Stream Headers": optional null-terminated
+                // text string describing the stream. Per Microsoft Learn,
+                // the encoding is unspecified; we round-trip as UTF-8 and
+                // fall back to lossy decoding for byte sequences that
+                // aren't valid UTF-8 (legacy capture tools occasionally
+                // write Latin-1 / CP1252 stream names). The trailing NUL
+                // is stripped; an empty payload (cb=0) is treated as
+                // absent so it doesn't surface a phantom name.
+                let body = read_body_bounded(r, hdr.size)?;
+                skip_pad(r, hdr.size)?;
+                strn_name = parse_strn_body(&body);
             }
             b"indx" => {
                 // OpenDML 2.0 super-index (AVI_INDEX_OF_INDEXES).
@@ -1492,7 +1550,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     }
     let strh = match strh_buf {
         Some(b) => b,
-        None => return Ok((None, None, super_index, vprp, None, None, None)),
+        None => return Ok((None, None, super_index, vprp, None, None, None, strn_name)),
     };
     let strf = strf_buf.unwrap_or_default();
     let parsed = build_stream(index, &strh, &strf, codecs)?;
@@ -1504,7 +1562,30 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.2,
         parsed.3,
         parsed.4,
+        strn_name,
     ))
+}
+
+/// Parse a `strn` chunk body into an owned `String`.
+///
+/// Per AVI 1.0 §"AVI Stream Headers" the body is a null-terminated text
+/// string. The trailing NUL is stripped; bytes that aren't valid UTF-8
+/// are passed through `String::from_utf8_lossy` so legacy Latin-1 /
+/// CP1252 stream names don't fail the parse. An empty payload (`cb=0`)
+/// is treated as "no name" so downstream code can distinguish absent
+/// vs. empty-string names cleanly.
+fn parse_strn_body(body: &[u8]) -> Option<String> {
+    // Strip every trailing NUL (some writers pad with multiple NULs to a
+    // WORD boundary).
+    let end = body
+        .iter()
+        .rposition(|&b| b != 0)
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&body[..end]).into_owned())
 }
 
 /// Parse a `vprp` (Video Properties Header) chunk per OpenDML 2.0 §5.0.
@@ -2642,6 +2723,15 @@ pub struct AviDemuxer {
     /// `wFormatTag` was not `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`) the
     /// extensible-only fields are `None`.
     audio_strf: Vec<Option<AudioStrfInfo>>,
+    /// Per-stream human-readable name parsed from the optional `strn`
+    /// chunk inside each `strl` LIST per AVI 1.0 §"AVI Stream Headers"
+    /// (round-80). Indexed by stream number; `None` for streams that
+    /// did not carry a `strn` chunk. Surfaced via the typed
+    /// [`AviDemuxer::stream_name`] accessor in addition to the
+    /// `avi:strn.<index>` metadata key (only emitted for non-empty
+    /// names). Empty-payload `strn` chunks parse as `None` so absence
+    /// of the chunk and an empty-string body are not conflated.
+    stream_names: Vec<Option<String>>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -4261,6 +4351,25 @@ impl AviDemuxer {
     pub fn stream_subformat(&self, stream_index: u32) -> Option<Guid> {
         self.stream_audio_strf(stream_index)
             .and_then(|asi| asi.subformat)
+    }
+
+    /// Round-80: optional per-stream name parsed from the `strn` chunk
+    /// inside the stream's `strl` LIST per AVI 1.0 §"AVI Stream
+    /// Headers".
+    ///
+    /// Returns `Some(name)` when the file declared a non-empty `strn`
+    /// chunk for `stream_index`; `None` when the chunk was absent or
+    /// carried an empty (zero-length / NUL-only) payload. Encoding is
+    /// not normatively pinned by Microsoft's reference — the demuxer
+    /// passes bytes through `String::from_utf8_lossy` so legacy
+    /// Latin-1 / CP1252 names don't fail the parse.
+    ///
+    /// Pairs with [`crate::muxer::AviMuxOptions::with_stream_name`] on
+    /// the mux side for a name → strn → name round-trip.
+    pub fn stream_name(&self, stream_index: u32) -> Option<&str> {
+        self.stream_names
+            .get(stream_index as usize)
+            .and_then(|n| n.as_deref())
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).
