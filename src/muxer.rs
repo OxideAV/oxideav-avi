@@ -332,6 +332,18 @@ pub struct AviMuxOptions {
     /// [`Self::with_stream_name`]. Empty list (the default) preserves
     /// pre-round-80 byte layout (no `strn` chunk emitted).
     pub stream_names: Vec<(u32, String)>,
+    /// Per-stream opaque codec-driver configuration blobs emitted as
+    /// `strd` chunks inside each stream's `strl` LIST per AVI 1.0
+    /// §"AVI Stream Headers" (round-89). Each entry is `(stream_index,
+    /// bytes)`; the muxer writes the bytes verbatim as the chunk
+    /// body, even-padded with one zero byte when the length is odd
+    /// per RIFF §"data is always padded to nearest WORD boundary".
+    /// The spec defines this body as opaque codec-driver data — see
+    /// [`Self::with_stream_header_data`]. Duplicate calls for the
+    /// same stream index replace the prior entry. Empty list (the
+    /// default) preserves pre-round-89 byte layout (no `strd` chunk
+    /// emitted).
+    pub stream_header_data: Vec<(u32, Vec<u8>)>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -900,6 +912,36 @@ impl AviMuxOptions {
         self.stream_names.push((stream_index, name));
         self
     }
+
+    /// Builder helper: attach an opaque codec-driver configuration blob
+    /// to `stream_index` (round-89). The muxer emits a `strd` chunk
+    /// inside that stream's `strl` LIST per AVI 1.0 §"AVI Stream
+    /// Headers" (docs/container/riff/avi-riff-file-reference.md
+    /// §"AVI Stream Headers"); the body is `bytes` verbatim, with one
+    /// extra zero pad byte when the length is odd per RIFF §"data is
+    /// always padded to nearest WORD boundary".
+    ///
+    /// Per the spec: "The format and content of this chunk are defined
+    /// by the codec driver. Typically, drivers use this information
+    /// for configuration. Applications that read and write AVI files
+    /// do not need to interpret this information; they simple transfer
+    /// it to and from the driver as a memory block." The muxer
+    /// therefore performs no interpretation — callers pass whatever
+    /// bytes their codec driver expects.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Passing an empty `Vec` emits an empty (`cb=0`) `strd`
+    /// chunk which the demuxer surfaces as `Some(&[])` so empty-but-
+    /// present can be distinguished from absent. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_header_data`] for a
+    /// round-trip.
+    pub fn with_stream_header_data(mut self, stream_index: u32, bytes: impl Into<Vec<u8>>) -> Self {
+        let bytes = bytes.into();
+        self.stream_header_data
+            .retain(|(idx, _)| *idx != stream_index);
+        self.stream_header_data.push((stream_index, bytes));
+        self
+    }
 }
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
@@ -1278,6 +1320,15 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, n)| n.as_str());
+            // Round-89: optional `strd` codec-driver blob for this
+            // stream (see `with_stream_header_data`'s retain-then-push
+            // pattern).
+            let stream_header_data = self
+                .options
+                .stream_header_data
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, b)| b.as_slice());
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1288,6 +1339,7 @@ impl Muxer for AviMuxer {
                 indx_2field_here,
                 indx_capacity,
                 stream_name,
+                stream_header_data,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -2575,6 +2627,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     indx_2field: bool,
     indx_capacity: usize,
     stream_name: Option<&str>,
+    stream_header_data: Option<&[u8]>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -2663,11 +2716,26 @@ fn write_strl<W: Write + Seek + ?Sized>(
         write_chunk(w, b"vprp", &body)?;
     }
 
+    // AVI 1.0 §"AVI Stream Headers" (round-89): optional `strd`
+    // codec-driver configuration blob. "If the stream-header data
+    // ('strd') chunk is present, it follows the stream format chunk.
+    // The format and content of this chunk are defined by the codec
+    // driver." We emit it after `indx`/`vprp` (and before `strn`) to
+    // keep pre-round-89 byte layout identical when no `strd` is
+    // configured — same back-compat positioning the round-80 `strn`
+    // emit uses. The body is the caller-supplied bytes verbatim,
+    // RIFF-word-padded by `write_chunk` so an odd-length blob gets
+    // one trailing zero byte.
+    if let Some(bytes) = stream_header_data {
+        write_chunk(w, b"strd", bytes)?;
+    }
+
     // AVI 1.0 §"AVI Stream Headers": optional `strn` chunk carrying a
     // null-terminated text string describing the stream (round-80).
     // The spec places this last among the strl children ("'strh', 'strf'
-    // [, 'strd'] [, 'strn']") so we emit it after `indx`/`vprp` to keep
-    // pre-round-80 byte layout identical when no name is configured.
+    // [, 'strd'] [, 'strn']") so we emit it after `indx`/`vprp`/`strd`
+    // to keep pre-round-80 byte layout identical when no name is
+    // configured.
     if let Some(name) = stream_name {
         let mut body = Vec::with_capacity(name.len() + 1);
         body.extend_from_slice(name.as_bytes());

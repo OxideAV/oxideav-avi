@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strd` codec-driver-data chunk demux + mux (round 89).**
+  Implements the AVI 1.0 §"AVI Stream Headers" optional `strd` chunk
+  per the Microsoft Learn AVI RIFF File Reference (clean-room source
+  at `docs/container/riff/avi-riff-file-reference.md`): "If the
+  stream-header data ('strd') chunk is present, it follows the
+  stream format chunk. The format and content of this chunk are
+  defined by the codec driver. Typically, drivers use this
+  information for configuration. Applications that read and write
+  AVI files do not need to interpret this information; they simple
+  transfer it to and from the driver as a memory block." Demuxer:
+  new `AviDemuxer::stream_header_data(stream_index) -> Option<&[u8]>`
+  typed accessor returning the raw codec-driver bytes verbatim
+  (zero interpretation per spec) + `avi:strd.<n>.len` metadata key
+  reporting the body length only (the metadata Vec deliberately
+  doesn't hexdump opaque driver bytes into a String value). Empty
+  payload `strd` (`cb=0`) parses as `Some(&[])` so "no `strd` chunk
+  at all" stays distinguishable from "explicit empty driver blob".
+  Muxer: new `AviMuxOptions::with_stream_header_data(stream_index,
+  bytes)` builder emitting one `strd` chunk per registered stream
+  after `indx`/`vprp` and before `strn` in the strl LIST. The chunk
+  body is the caller-supplied bytes verbatim, RIFF word-padded with
+  one trailing zero byte when odd-length per RIFF §"data is always
+  padded to nearest WORD boundary"; duplicate calls for the same
+  `stream_index` keep only the last entry (consistent with the
+  round-80 `with_stream_name` and round-75 `with_extensible_audio`
+  dedup pattern). The no-strd file byte layout is identical to
+  pre-round-89. Round-trips arbitrary 4 / 5 (odd-length) / 8 / 12 /
+  16-byte blobs byte-for-byte across two streams; explicit
+  empty-blob round-trip surfaces `Some(&[])` and `avi:strd.0.len=0`.
+  Tests in `tests/round89_strd.rs`.
+
 - **Per-stream `strn` name chunk demux + mux (round 80).** Implements
   the AVI 1.0 §"AVI Stream Headers" optional `strn` chunk per the
   Microsoft Learn AVI RIFF File Reference (clean-room source at

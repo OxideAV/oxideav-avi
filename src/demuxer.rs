@@ -234,6 +234,15 @@ fn open_avi_inner(
     // otherwise. Empty-payload strn chunks parse as `None` so the
     // accessor distinguishes "no name declared" from "empty name".
     let mut stream_names: Vec<Option<String>> = Vec::new();
+    // Per-stream optional codec-driver `strd` blob captured from the
+    // `strd` chunk per AVI 1.0 §"AVI Stream Headers" (round-89). Parallel
+    // to `streams`: `Some(bytes)` when the strl carried a `strd` chunk,
+    // `None` otherwise. Empty-payload `strd` (cb=0) parses as
+    // `Some(Vec::new())` so an empty driver blob stays distinguishable
+    // from "no strd chunk at all". The spec defines this body as opaque
+    // codec-driver configuration bytes — the demuxer does not interpret
+    // them.
+    let mut stream_header_data: Vec<Option<Vec<u8>>> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -252,6 +261,7 @@ fn open_avi_inner(
         &mut video_strfs,
         &mut audio_strfs,
         &mut stream_names,
+        &mut stream_header_data,
         codecs,
         /* is_primary */ true,
     )?;
@@ -282,6 +292,7 @@ fn open_avi_inner(
                     &mut video_strfs,
                     &mut audio_strfs,
                     &mut stream_names,
+                    &mut stream_header_data,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -591,6 +602,24 @@ fn open_avi_inner(
             if !name.is_empty() {
                 metadata.push((format!("avi:strn.{i}"), name.clone()));
             }
+        }
+    }
+
+    // Round-89: AVI 1.0 §"AVI Stream Headers" optional `strd` chunk
+    // — opaque per-stream codec-driver configuration blob ("The format
+    // and content of this chunk are defined by the codec driver.
+    // Typically, drivers use this information for configuration.
+    // Applications that read and write AVI files do not need to
+    // interpret this information; they simple transfer it to and from
+    // the driver as a memory block."). The demuxer surfaces only the
+    // length via the metadata key `avi:strd.<index>.len = "<bytes>"`
+    // (so a downstream tool can see the chunk is present without
+    // hexdumping arbitrary driver bytes into a String); the raw bytes
+    // are accessible via the typed
+    // [`AviDemuxer::stream_header_data`] accessor.
+    for (i, sh_opt) in stream_header_data.iter().enumerate() {
+        if let Some(bytes) = sh_opt {
+            metadata.push((format!("avi:strd.{i}.len"), bytes.len().to_string()));
         }
     }
 
@@ -1031,6 +1060,7 @@ fn open_avi_inner(
         video_strf: video_strfs,
         audio_strf: audio_strfs,
         stream_names,
+        stream_header_data,
     })
 }
 
@@ -1057,6 +1087,7 @@ fn walk_riff_body(
     video_strfs: &mut Vec<Option<VideoStrfInfo>>,
     audio_strfs: &mut Vec<Option<AudioStrfInfo>>,
     stream_names: &mut Vec<Option<String>>,
+    stream_header_data: &mut Vec<Option<Vec<u8>>>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -1089,6 +1120,7 @@ fn walk_riff_body(
                         vss,
                         asfs,
                         names,
+                        strds,
                     ) = parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
@@ -1101,6 +1133,7 @@ fn walk_riff_body(
                     *video_strfs = vss;
                     *audio_strfs = asfs;
                     *stream_names = names;
+                    *stream_header_data = strds;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -1314,6 +1347,7 @@ type HdrlOutput = (
     Vec<Option<VideoStrfInfo>>,
     Vec<Option<AudioStrfInfo>>,
     Vec<Option<String>>,
+    Vec<Option<Vec<u8>>>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -1338,6 +1372,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut video_strfs: Vec<Option<VideoStrfInfo>> = Vec::new();
     let mut audio_strfs: Vec<Option<AudioStrfInfo>> = Vec::new();
     let mut stream_names: Vec<Option<String>> = Vec::new();
+    let mut stream_header_data: Vec<Option<Vec<u8>>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
 
@@ -1358,7 +1393,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx, vp, ai, vs, asi, name) =
+                    let (si, suf, sx, vp, ai, vs, asi, name, strd_bytes) =
                         parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1369,6 +1404,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         video_strfs.push(vs);
                         audio_strfs.push(asi);
                         stream_names.push(name);
+                        stream_header_data.push(strd_bytes);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1410,6 +1446,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         video_strfs,
         audio_strfs,
         stream_names,
+        stream_header_data,
     ))
 }
 
@@ -1469,6 +1506,7 @@ type StrlOutput = (
     Option<VideoStrfInfo>,
     Option<AudioStrfInfo>,
     Option<String>,
+    Option<Vec<u8>>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -1486,6 +1524,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     let mut super_index = SuperIndex::default();
     let mut vprp = VprpHeader::default();
     let mut strn_name: Option<String> = None;
+    let mut strd_bytes: Option<Vec<u8>> = None;
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
             Some(h) => h,
@@ -1512,6 +1551,27 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 let body = read_body_bounded(r, hdr.size)?;
                 skip_pad(r, hdr.size)?;
                 strn_name = parse_strn_body(&body);
+            }
+            b"strd" => {
+                // AVI 1.0 §"AVI Stream Headers" (round-89): optional
+                // codec-driver configuration blob. Per Microsoft Learn:
+                // "If the stream-header data ('strd') chunk is present,
+                // it follows the stream format chunk. The format and
+                // content of this chunk are defined by the codec
+                // driver. Typically, drivers use this information for
+                // configuration. Applications that read and write AVI
+                // files do not need to interpret this information; they
+                // simple transfer it to and from the driver as a memory
+                // block." The demuxer preserves the raw bytes verbatim
+                // (no interpretation) so a re-mux can hand them back to
+                // the same codec driver. An empty payload (`cb=0`) is
+                // captured as `Some(Vec::new())` so absence of the
+                // chunk stays distinguishable from an empty driver
+                // blob. A duplicate `strd` overwrites — the spec
+                // allows at most one per `strl`.
+                let body = read_body_bounded(r, hdr.size)?;
+                skip_pad(r, hdr.size)?;
+                strd_bytes = Some(body);
             }
             b"indx" => {
                 // OpenDML 2.0 super-index (AVI_INDEX_OF_INDEXES).
@@ -1550,7 +1610,19 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     }
     let strh = match strh_buf {
         Some(b) => b,
-        None => return Ok((None, None, super_index, vprp, None, None, None, strn_name)),
+        None => {
+            return Ok((
+                None,
+                None,
+                super_index,
+                vprp,
+                None,
+                None,
+                None,
+                strn_name,
+                strd_bytes,
+            ))
+        }
     };
     let strf = strf_buf.unwrap_or_default();
     let parsed = build_stream(index, &strh, &strf, codecs)?;
@@ -1563,6 +1635,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.3,
         parsed.4,
         strn_name,
+        strd_bytes,
     ))
 }
 
@@ -2732,6 +2805,22 @@ pub struct AviDemuxer {
     /// names). Empty-payload `strn` chunks parse as `None` so absence
     /// of the chunk and an empty-string body are not conflated.
     stream_names: Vec<Option<String>>,
+    /// Per-stream opaque codec-driver configuration blob parsed from
+    /// the optional `strd` chunk inside each `strl` LIST per AVI 1.0
+    /// §"AVI Stream Headers" (round-89). Indexed by stream number;
+    /// `None` for streams that did not carry a `strd` chunk. The
+    /// spec defines this body as opaque codec-driver data: "The
+    /// format and content of this chunk are defined by the codec
+    /// driver. Typically, drivers use this information for
+    /// configuration. Applications that read and write AVI files do
+    /// not need to interpret this information; they simple transfer
+    /// it to and from the driver as a memory block." An empty-payload
+    /// `strd` (`cb=0`) parses as `Some(Vec::new())` so an empty driver
+    /// blob stays distinguishable from "no strd chunk at all".
+    /// Surfaced via the typed [`AviDemuxer::stream_header_data`]
+    /// accessor in addition to the `avi:strd.<index>.len` metadata
+    /// key (length only, not the raw driver bytes).
+    stream_header_data: Vec<Option<Vec<u8>>>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -4370,6 +4459,27 @@ impl AviDemuxer {
         self.stream_names
             .get(stream_index as usize)
             .and_then(|n| n.as_deref())
+    }
+
+    /// Round-89: optional per-stream codec-driver configuration blob
+    /// parsed from the `strd` chunk inside the stream's `strl` LIST
+    /// per AVI 1.0 §"AVI Stream Headers" (docs/container/riff/
+    /// avi-riff-file-reference.md §"AVI Stream Headers").
+    ///
+    /// Returns `Some(bytes)` when the file declared a `strd` chunk
+    /// for `stream_index` (including a `cb=0` empty payload, which
+    /// surfaces as `Some(&[])`); `None` when the chunk was absent.
+    /// The byte slice is the raw chunk body — the spec defines its
+    /// format as codec-driver-specific opaque data, so the demuxer
+    /// performs no interpretation. Callers typically forward the
+    /// bytes verbatim to the matching codec driver.
+    ///
+    /// Pairs with [`crate::muxer::AviMuxOptions::with_stream_header_data`]
+    /// on the mux side for a `strd` round-trip.
+    pub fn stream_header_data(&self, stream_index: u32) -> Option<&[u8]> {
+        self.stream_header_data
+            .get(stream_index as usize)
+            .and_then(|h| h.as_deref())
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).
