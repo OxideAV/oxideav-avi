@@ -344,6 +344,48 @@ pub struct AviMuxOptions {
     /// default) preserves pre-round-89 byte layout (no `strd` chunk
     /// emitted).
     pub stream_header_data: Vec<(u32, Vec<u8>)>,
+    /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
+    ///
+    /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
+    /// avi-riff-file-reference.md line 197): *"Alignment for data, in
+    /// bytes. Pad the data to multiples of this value."* The spec
+    /// pairs this field with §"Other Data Chunks" line 179: *"Data
+    /// can be aligned in an AVI file by inserting 'JUNK' chunks as
+    /// needed. Applications should ignore the contents of a 'JUNK'
+    /// chunk."*
+    ///
+    /// When `Some(n)` the muxer:
+    ///
+    /// 1. Stamps `avih.dwPaddingGranularity = n` verbatim (instead of
+    ///    the legacy 0 sentinel meaning "no alignment guarantee").
+    /// 2. Before each packet chunk in `movi`, emits a `JUNK` chunk
+    ///    whose body length is the minimum value that makes the
+    ///    upcoming packet chunk's 8-byte header start at the next
+    ///    file-absolute offset divisible by `n`. The JUNK body itself
+    ///    is filled with zero bytes; the AVI spec defines its content
+    ///    as ignored by readers. The JUNK chunk header is 8 bytes
+    ///    (FourCC + size DWORD); if the natural slack is fewer than
+    ///    8 bytes the muxer rolls forward to the *next* multiple of
+    ///    `n` so the JUNK chunk itself always fits.
+    /// 3. Emits the packet chunk normally; its 8-byte header lands at
+    ///    a file-absolute offset divisible by `n`, so a media player
+    ///    doing stream-aligned reads (e.g. against a 4 KiB filesystem
+    ///    block size, or a 2 KiB CD-ROM sector) can read each chunk
+    ///    in a single aligned syscall.
+    ///
+    /// `n` must be a power of two ≥ 2 and ≤ 65536 to take effect;
+    /// other values fall back to `None` (no alignment), matching the
+    /// legacy `dwPaddingGranularity = 0` behaviour. Use
+    /// [`Self::with_padding_granularity`].
+    ///
+    /// Alignment is best-effort per packet: the muxer measures the
+    /// current file-absolute offset right before the packet header
+    /// and inserts JUNK to reach the target alignment. The same
+    /// alignment applies to every packet across every stream in
+    /// `movi`. Sideband chunks (`xxpc` palette change, `xxtx` text)
+    /// are not pre-aligned — they're outside the per-frame stream
+    /// budget and players don't seek to them via the index.
+    pub padding_granularity: Option<u32>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -942,6 +984,23 @@ impl AviMuxOptions {
         self.stream_header_data.push((stream_index, bytes));
         self
     }
+
+    /// Builder helper: enable stream-aligned packet emission with
+    /// `n`-byte granularity (round-92). See
+    /// [`Self::padding_granularity`] for semantics. `n` must be a
+    /// power of two in `[2, 65536]`; other values reset the field to
+    /// `None` (no padding, the legacy `avih.dwPaddingGranularity = 0`
+    /// behaviour). The common useful values are 512 (filesystem
+    /// sector), 2048 (CD-ROM sector), and 4096 (modern filesystem
+    /// page).
+    pub fn with_padding_granularity(mut self, n: u32) -> Self {
+        self.padding_granularity = if (2..=65536).contains(&n) && n.is_power_of_two() {
+            Some(n)
+        } else {
+            None
+        };
+        self
+    }
 }
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
@@ -1285,7 +1344,11 @@ impl Muxer for AviMuxer {
 
         // hdrl LIST with avih + strl*.
         let hdrl_size_off = begin_list(self.output.as_mut(), &LIST, b"hdrl")?;
-        let avih = build_avih(&self.tracks, self.options.avih_flags_override);
+        let avih = build_avih(
+            &self.tracks,
+            self.options.avih_flags_override,
+            self.options.padding_granularity,
+        );
         write_chunk(self.output.as_mut(), b"avih", &avih)?;
         // For OpenDML, embed the super-index in the FIRST stream's strl
         // (typically video). For Avi10, no super-index.
@@ -1470,6 +1533,27 @@ impl Muxer for AviMuxer {
             } else if needs_close_for_packets || needs_close_for_bytes {
                 self.close_rec_cluster()?;
                 self.open_rec_cluster()?;
+            }
+        }
+
+        // Round-92: stream-aligned remux. If the caller asked for an
+        // `avih.dwPaddingGranularity` of `n`, prepend a `JUNK` chunk
+        // sized so the upcoming packet chunk's 8-byte header starts at
+        // a file-absolute offset divisible by `n`. The JUNK body is
+        // zero-filled; the AVI 1.0 reference (§"Other Data Chunks")
+        // says applications must ignore its content. Sideband chunks
+        // (`xxpc` / `xxtx` / `ix##` index emit / `rec ` open) are not
+        // pre-aligned — only frame chunks honour the alignment.
+        if let Some(n) = self.options.padding_granularity {
+            // Measure pos before + after so `rec_bytes_in_cluster` (when
+            // a `LIST rec ` cluster is open) still reflects the cluster's
+            // true on-disk body size. JUNK chunks are accounted into the
+            // cluster the same way packet chunks are.
+            let before = self.output.stream_position()?;
+            self.emit_padding_junk_for(packet.data.len(), n)?;
+            let after = self.output.stream_position()?;
+            if self.rec_open_size_off.is_some() {
+                self.rec_bytes_in_cluster += after.saturating_sub(before);
             }
         }
 
@@ -2155,6 +2239,70 @@ impl AviMuxer {
         Ok(())
     }
 
+    /// Emit a single `JUNK` chunk sized so the next 8-byte chunk
+    /// header lands at a file-absolute offset divisible by `granularity`
+    /// (round-92). Helper for [`AviMuxer::write_packet`]'s stream-aligned
+    /// remux path.
+    ///
+    /// Per AVI 1.0 §"Other Data Chunks": *"Data can be aligned in an
+    /// AVI file by inserting 'JUNK' chunks as needed."* The JUNK chunk
+    /// shape is the standard RIFF chunk: `'JUNK' <le32 size> <size
+    /// bytes>`; a single pad byte follows when `size` is odd.
+    ///
+    /// `payload_len` is the upcoming packet's body byte count; it is
+    /// reserved here for future spec-extension use (e.g. aligning the
+    /// chunk's *data* rather than its header, which the spec leaves
+    /// ambiguous — this implementation aligns the header per the
+    /// industry convention).
+    ///
+    /// Algorithm:
+    /// 1. Read the current file-absolute write position.
+    /// 2. Compute the smallest multiple-of-`granularity` value `>=
+    ///    current_pos + 8` (the JUNK chunk header itself takes 8
+    ///    bytes, so we can't insert zero-length JUNK to "pad nothing").
+    /// 3. The JUNK body length is `target - current_pos - 8`. Body is
+    ///    zero-initialised. If `target - current_pos - 8` is odd, the
+    ///    extra RIFF word-pad byte still goes inside `dwSize` so the
+    ///    file position lands exactly at `target`.
+    ///
+    /// When the current position is already aligned and the chunk
+    /// could be emitted as-is, the JUNK is skipped entirely — no
+    /// zero-length JUNK is written, which avoids polluting the index
+    /// with empty chunks.
+    fn emit_padding_junk_for(&mut self, _payload_len: usize, granularity: u32) -> Result<()> {
+        let n = granularity as u64;
+        let cur = self.output.stream_position()?;
+        let aligned_now = (cur % n) == 0;
+        if aligned_now {
+            return Ok(());
+        }
+        // Smallest multiple of n that's >= cur + 8 (JUNK chunk header
+        // itself takes 8 bytes). If cur + 8 is already a multiple of
+        // n, that's our target; otherwise round up.
+        let needed = cur + 8;
+        let target = needed.div_ceil(n) * n;
+        let body_len = (target - cur - 8) as u32;
+        // Per RIFF: body's `dwSize` excludes any odd-pad byte. To make
+        // the file position land exactly at `target` we choose an even
+        // body length whenever `target - cur - 8` is even; for odd
+        // slack we write `body_len - 1` bytes of body, then RIFF's
+        // word-pad byte makes the file position exactly `target`.
+        let body_size_field = body_len & !1u32; // round down to even
+        crate::riff::write_chunk_header(self.output.as_mut(), b"JUNK", body_size_field)?;
+        let total_to_write = body_len as u64; // bytes after the 8-byte header
+        let zeros = [0u8; 256];
+        let mut remaining = total_to_write;
+        while remaining > 0 {
+            let chunk = remaining.min(zeros.len() as u64) as usize;
+            self.output.write_all(&zeros[..chunk])?;
+            remaining -= chunk as u64;
+        }
+        // Sanity: writer is now at exactly `target`. Asserted via the
+        // mux-roundtrip test rather than here so a release build is
+        // lean.
+        Ok(())
+    }
+
     /// Stamp `payload_offset` onto the next [`oxideav_core::Muxer::write_packet`]
     /// call so the corresponding `ix##` `AVISTDINDEX_ENTRY.dwOffsetField2`
     /// (per OpenDML 2.0 §3.0 "AVI Field Index Chunk") points at the
@@ -2566,7 +2714,16 @@ pub const DEFAULT_AVIH_FLAGS: u32 = 0x0000_0810;
 /// AVIMAINHEADER (56 bytes): dwMicroSecPerFrame, dwMaxBytesPerSec,
 /// dwPaddingGranularity, dwFlags, dwTotalFrames, dwInitialFrames, dwStreams,
 /// dwSuggestedBufferSize, dwWidth, dwHeight, dwReserved[4].
-fn build_avih(tracks: &[TrackState], flags_override: Option<u32>) -> Vec<u8> {
+///
+/// Round-92: `padding_granularity` stamps `avih.dwPaddingGranularity`
+/// from `AviMuxOptions::padding_granularity` (None → 0, the legacy
+/// "no alignment guarantee" sentinel; Some(n) → n, matching the JUNK
+/// chunk alignment the muxer also emits in `movi`).
+fn build_avih(
+    tracks: &[TrackState],
+    flags_override: Option<u32>,
+    padding_granularity: Option<u32>,
+) -> Vec<u8> {
     let (video_micro_per_frame, width, height) = tracks
         .iter()
         .find(|t| &t.entry.strh_type == b"vids")
@@ -2591,7 +2748,7 @@ fn build_avih(tracks: &[TrackState], flags_override: Option<u32>) -> Vec<u8> {
     let mut body = Vec::with_capacity(56);
     body.extend_from_slice(&video_micro_per_frame.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // MaxBytesPerSec
-    body.extend_from_slice(&0u32.to_le_bytes()); // PaddingGranularity
+    body.extend_from_slice(&padding_granularity.unwrap_or(0).to_le_bytes()); // PaddingGranularity
     body.extend_from_slice(&flags.to_le_bytes());
     body.extend_from_slice(&total_frames.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // InitialFrames

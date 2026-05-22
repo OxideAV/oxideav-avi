@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`avih.dwPaddingGranularity` + JUNK-aligned packet emission (round 92).**
+  Implements AVI 1.0 §"AVIMAINHEADER" line 197: *"Alignment for data,
+  in bytes. Pad the data to multiples of this value."* paired with
+  §"Other Data Chunks" line 179: *"Data can be aligned in an AVI file
+  by inserting 'JUNK' chunks as needed."* (clean-room source at
+  `docs/container/riff/avi-riff-file-reference.md`). New muxer builder
+  `AviMuxOptions::with_padding_granularity(n)` stamps the granularity
+  into `avih.dwPaddingGranularity` and, before every packet chunk in
+  `movi`, emits a `JUNK` chunk sized so the upcoming chunk's 8-byte
+  header lands at a file-absolute offset divisible by `n`. The JUNK
+  body is zero-filled; per spec readers ignore its content. `n` must
+  be a power of two in `[2, 65536]` — other values reset the field to
+  the legacy `None` / `dwPaddingGranularity = 0` behaviour. Typical
+  values: 512 (filesystem sector), 2048 (CD-ROM sector), 4096 (modern
+  filesystem page). Demuxer round-trip: new
+  `AviDemuxer::padding_granularity() -> u32` accessor returns the
+  parsed value; same data surfaces under the `avi:padding_granularity`
+  metadata key (omitted entirely when the value is the legacy 0
+  sentinel so absence is observable). The demuxer's existing
+  embedded-`JUNK` walker (round 3 originals) handles the inserted
+  chunks transparently; packets round-trip byte-equal through the
+  padded layout regardless of granularity. Six new tests
+  (`tests/round92_padding_granularity.rs`) cover avih round-trip,
+  per-packet alignment promise at 16 / 64 / 512 / 2048 / 4096-byte
+  granularities, payload byte-equality through the JUNK layout,
+  the no-opt baseline (no JUNK chunks emitted, accessor returns 0,
+  metadata key absent), builder validation (only powers of two in
+  `[2, 65536]` take effect — other values fall back to None), and
+  the legacy `dwPaddingGranularity = 0` "no key in metadata" path.
+
 - **Per-stream `strd` codec-driver-data chunk demux + mux (round 89).**
   Implements the AVI 1.0 §"AVI Stream Headers" optional `strd` chunk
   per the Microsoft Learn AVI RIFF File Reference (clean-room source

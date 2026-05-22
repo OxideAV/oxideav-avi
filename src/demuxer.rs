@@ -377,6 +377,17 @@ fn open_avi_inner(
                 h.max_bytes_per_sec.to_string(),
             ));
         }
+        // Round-92: surface `dwPaddingGranularity` so a downstream
+        // tool can detect a stream-aligned remux and (e.g.) avoid
+        // re-aligning on a subsequent transcode. Zero (the legacy
+        // sentinel) is omitted from the metadata Vec so the key is
+        // observable only when the muxer actually opted in.
+        if h.padding_granularity > 0 {
+            metadata.push((
+                "avi:padding_granularity".into(),
+                h.padding_granularity.to_string(),
+            ));
+        }
     }
     // Truncated-head signal: capture-card crash dumps, copy-aborted
     // recordings. The demuxer is best-effort for this case (see
@@ -1052,6 +1063,7 @@ fn open_avi_inner(
         text_chunk_counts,
         avih_flags: avih.as_ref().map(|h| h.flags).unwrap_or(0),
         avih_suggested_buffer_size: avih.as_ref().map(|h| h.suggested_buffer_size).unwrap_or(0),
+        avih_padding_granularity: avih.as_ref().map(|h| h.padding_granularity).unwrap_or(0),
         vprps,
         dmlh_total_frames,
         palette_change_data,
@@ -1298,6 +1310,12 @@ struct AviMainHeader {
     suggested_buffer_size: u32,
     width: u32,
     height: u32,
+    /// `dwPaddingGranularity` per AVI 1.0 §"AVIMAINHEADER" (offset 8).
+    /// Round-92: captured so [`AviDemuxer::padding_granularity`] can
+    /// surface the alignment value the muxer used. Zero (the legacy
+    /// sentinel) means "no alignment guarantee" — files predating the
+    /// stream-aligned remux path leave this 0.
+    padding_granularity: u32,
 }
 
 /// Parse the AVIMAINHEADER body (should be 56 bytes).
@@ -1308,7 +1326,8 @@ fn parse_avih(buf: &[u8]) -> Result<AviMainHeader> {
     Ok(AviMainHeader {
         micro_sec_per_frame: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
         max_bytes_per_sec: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-        // dwPaddingGranularity at offset 8 is ignored.
+        // dwPaddingGranularity (offset 8) — round-92 captures this.
+        padding_granularity: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
         flags: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
         total_frames: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
         initial_frames: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
@@ -2744,6 +2763,14 @@ pub struct AviDemuxer {
     /// surfaces under the `avi:suggested_buffer_size` metadata key);
     /// zero when the file had no parsable `avih`.
     avih_suggested_buffer_size: u32,
+    /// Raw `dwPaddingGranularity` from `AVIMAINHEADER` (round-92).
+    /// Reflects the muxer's stream-alignment promise from AVI 1.0
+    /// §"AVIMAINHEADER" (line 197): *"Alignment for data, in bytes.
+    /// Pad the data to multiples of this value."* `0` (the legacy
+    /// sentinel) means "no alignment" — files predating round-92
+    /// leave this 0. Surfaced via [`AviDemuxer::padding_granularity`]
+    /// and the `avi:padding_granularity` metadata key.
+    avih_padding_granularity: u32,
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -4220,6 +4247,25 @@ impl AviDemuxer {
     /// the `avi:flags` hex-string metadata key.
     pub fn avih_flags(&self) -> AvihFlags {
         AvihFlags::from_bits(self.avih_flags)
+    }
+
+    /// `AVIMAINHEADER.dwPaddingGranularity` per AVI 1.0 §"AVIMAINHEADER"
+    /// (round-92).
+    ///
+    /// Returns the alignment-in-bytes value the muxer promised for
+    /// `movi` packet chunks, or `0` (the legacy sentinel) when the
+    /// file declared no alignment guarantee. A typical stream-aligned
+    /// remux carries 512 / 2048 / 4096 here; the spec says *"Pad the
+    /// data to multiples of this value"* and pairs this field with
+    /// `JUNK` chunk insertion per §"Other Data Chunks".
+    ///
+    /// Round-trips byte-equal with
+    /// [`crate::muxer::AviMuxOptions::with_padding_granularity`]. Same
+    /// data also surfaces under the `avi:padding_granularity`
+    /// metadata key (omitted entirely when the value is 0 so absence
+    /// of the key is observable).
+    pub fn padding_granularity(&self) -> u32 {
+        self.avih_padding_granularity
     }
 
     /// Per-packet idx1 flags accessor (round-6 candidate 1).
