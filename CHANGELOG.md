@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CBR-audio `ix##` standard-index block-alignment validator (round 96).**
+  Implements a reader-side cross-check from OpenDML 2.0 §3.0 ("AVI
+  Standard Index Chunk", clean-room source
+  `docs/container/riff/opendml-avi-2.0.pdf`): each
+  `AVISTDINDEX_ENTRY.dwSize` is the byte length of the indexed data
+  chunk, so for a constant-bit-rate audio stream (PCM / A-law / µ-law /
+  IMA-ADPCM) every indexed chunk must hold a whole number of
+  `WAVEFORMATEX.nBlockAlign` sample blocks (`dwSize % nBlockAlign == 0`).
+  New `AviDemuxer::cbr_audio_block_alignment_violations() ->
+  Vec<BlockAlignViolation>` walks every `ix##` standard index, correlates
+  each to its stream via the `dwChunkId` ASCII digits, and returns one
+  `BlockAlignViolation { stream_index, entry_index, dw_size, block_align }`
+  per offending entry (the `entry_index` is the per-stream ordinal counted
+  across every `ix##` chunk in file order). VBR streams, video / data
+  streams, and CBR streams whose `nBlockAlign` is 0 or 1 are skipped;
+  AVI 1.0 files with no `ix##` chunks return an empty Vec. The check is
+  informational and never affects `open()` — it complements the coarse
+  round-14 VBR/CBR `dwSampleSize` invariant (enforced at open time) with a
+  finer, index-level companion callers invoke when they want to trust
+  `ix##` offsets for sample-accurate audio seeking. `AudioStrhInfo` gains
+  a `block_align` field carrying the parsed `nBlockAlign`. Four new tests
+  (`tests/round96_block_align.rs`) cover aligned (no violation),
+  misaligned (exactly one flagged entry with correct `stream_index` /
+  `entry_index` / `dw_size` / `block_align`), VBR (never flagged), and
+  AVI-1.0-no-`ix##` (empty) cases, driving real multi-segment OpenDML
+  output through the muxer.
+
 - **`avih.dwPaddingGranularity` + JUNK-aligned packet emission (round 92).**
   Implements AVI 1.0 §"AVIMAINHEADER" line 197: *"Alignment for data,
   in bytes. Pad the data to multiples of this value."* paired with

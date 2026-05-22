@@ -331,6 +331,24 @@ fn open_avi_inner(
         }
     }
 
+    // Round-96: derive the per-stream CBR-audio `nBlockAlign` lookup
+    // for the `ix##` standard-index block-alignment validator. Only
+    // streams the sample-size invariant pins as CBR (PCM / A-law /
+    // µ-law / IMA-ADPCM) with a nonzero `nBlockAlign` get a
+    // `Some(block_align)`; everything else is `None`. Built here while
+    // `audio_infos` is still in scope (it's parallel to `streams`).
+    let audio_cbr_block_aligns: Vec<Option<u16>> = audio_infos
+        .iter()
+        .map(|ai| {
+            ai.and_then(|info| match classify_audio_sample_size(info.format_tag) {
+                // `Some(false)` ⇒ CBR; only validate when nBlockAlign is
+                // meaningful (>1; a 1-byte block can never be misaligned).
+                Some(false) if info.block_align > 1 => Some(info.block_align),
+                _ => None,
+            })
+        })
+        .collect();
+
     if movi_segments.is_empty() {
         return Err(Error::invalid("AVI: missing movi list"));
     }
@@ -1058,6 +1076,7 @@ fn open_avi_inner(
         idx_table,
         super_indexes,
         std_indexes,
+        audio_cbr_block_aligns,
         idx1_flags_per_stream,
         palette_change_counts,
         text_chunk_counts,
@@ -1985,6 +2004,13 @@ fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
 pub(crate) struct AudioStrhInfo {
     pub format_tag: u16,
     pub sample_size: u32,
+    /// `WAVEFORMATEX.nBlockAlign` — the byte size of one sample block
+    /// (`nChannels * wBitsPerSample / 8` for PCM). For CBR audio every
+    /// indexed data chunk must contain a whole number of these blocks,
+    /// which the round-96 `ix##` standard-index validator
+    /// ([`AviDemuxer::cbr_audio_block_alignment_violations`]) checks.
+    /// Zero when the stream carried no parsable WAVEFORMATEX.
+    pub block_align: u16,
 }
 
 /// Per-audio-stream `strf` (WAVEFORMATEX / WAVEFORMATEXTENSIBLE)
@@ -2027,6 +2053,42 @@ pub struct AudioStrfInfo {
     /// `WAVE_FORMAT_EXTENSIBLE` escape hatch. `None` for non-
     /// extensible streams.
     pub subformat: Option<Guid>,
+}
+
+/// One CBR-audio `ix##` standard-index entry whose `dwSize` is not a
+/// whole multiple of the stream's `WAVEFORMATEX.nBlockAlign`
+/// (round-96).
+///
+/// Per OpenDML 2.0 §3.0 ("AVI Standard Index Chunk") each
+/// `AVISTDINDEX_ENTRY.dwSize` is the byte length of the indexed data
+/// chunk. For a constant-bit-rate audio stream (PCM / A-law / µ-law /
+/// IMA-ADPCM) every data chunk holds a whole number of `nBlockAlign`
+/// sample blocks, so `dwSize % nBlockAlign == 0` must hold. A nonzero
+/// remainder means the index points at a partial sample block — the
+/// file's index disagrees with its own WAVEFORMATEX and a consumer
+/// that trusts the index will mis-frame the audio.
+///
+/// Returned (possibly empty) by
+/// [`AviDemuxer::cbr_audio_block_alignment_violations`]. The
+/// validator is purely informational — it never fails `open()` (the
+/// AVI 1.0 sample-size invariant at `open()` already rejects the
+/// gross VBR/CBR mismatch; this is a finer, index-level check callers
+/// opt into).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockAlignViolation {
+    /// Stream number (from the two ASCII digits of the `ix##` chunk's
+    /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
+    pub stream_index: u32,
+    /// Zero-based position of the offending entry within that stream's
+    /// `ix##` standard-index entries, counted in file order across
+    /// every `ix##` chunk that indexes this stream.
+    pub entry_index: usize,
+    /// The entry's `dwSize` (keyframe bit already cleared) — the
+    /// indexed data chunk's declared byte length.
+    pub dw_size: u32,
+    /// The stream's `WAVEFORMATEX.nBlockAlign` the size was checked
+    /// against.
+    pub block_align: u16,
 }
 
 /// 5-tuple returned by [`build_stream`]: the [`StreamInfo`], the
@@ -2240,6 +2302,11 @@ fn build_stream(
             audio_info = Some(AudioStrhInfo {
                 format_tag,
                 sample_size,
+                // nBlockAlign from the parsed WAVEFORMATEX (0 when the
+                // strf had no parsable WAVEFORMATEX — e.g. a 0-byte
+                // strf). The round-96 ix## block-alignment validator
+                // uses this for CBR streams.
+                block_align: wfx.as_ref().map(|w| w.block_align).unwrap_or(0),
             });
             // Round-75: capture WAVEFORMATEX(TENSIBLE) side-info on
             // every audio stream so the demuxer can hand callers the
@@ -2718,6 +2785,16 @@ pub struct AviDemuxer {
     /// present. Combined with `super_indexes` to drive seek for
     /// OpenDML files with no `idx1`.
     std_indexes: Vec<StdIndex>,
+    /// Per-stream `WAVEFORMATEX.nBlockAlign` for CBR audio streams
+    /// (round-96). Parallel to `streams`: `Some(block_align)` only for
+    /// audio streams the AVI 1.0 sample-size invariant pins as CBR
+    /// (PCM / A-law / µ-law / IMA-ADPCM, see
+    /// [`classify_audio_sample_size`]) whose WAVEFORMATEX carried a
+    /// nonzero `nBlockAlign`; `None` for video / data streams, VBR
+    /// audio, and CBR audio whose `nBlockAlign` was zero (nothing to
+    /// validate against). Drives
+    /// [`AviDemuxer::cbr_audio_block_alignment_violations`].
+    audio_cbr_block_aligns: Vec<Option<u16>>,
     /// Per-stream idx1-flags lookup table (round-8 candidate 1).
     ///
     /// Built once at `open()` from `idx_table`: outer index is
@@ -4353,6 +4430,77 @@ impl AviDemuxer {
     /// future-proof).
     pub fn dmlh_total_frames(&self) -> Option<u64> {
         self.dmlh_total_frames.map(|v| v as u64)
+    }
+
+    /// Cross-check every CBR-audio `ix##` standard-index entry's
+    /// `dwSize` against the stream's `WAVEFORMATEX.nBlockAlign`
+    /// (round-96).
+    ///
+    /// Per OpenDML 2.0 §3.0 ("AVI Standard Index Chunk") each
+    /// `AVISTDINDEX_ENTRY.dwSize` is the byte length of the indexed
+    /// data chunk. A constant-bit-rate audio stream (PCM / A-law /
+    /// µ-law / IMA-ADPCM, per the AVI 1.0 sample-size invariant in
+    /// [`classify_audio_sample_size`]) stores a whole number of
+    /// `nBlockAlign` sample blocks per chunk, so a conformant index
+    /// satisfies `dwSize % nBlockAlign == 0` for every entry. This
+    /// method returns one [`BlockAlignViolation`] per entry that
+    /// breaks the rule.
+    ///
+    /// The check is scoped to OpenDML standard indexes (`ix##`), which
+    /// are the only place the entry size is recorded independently of
+    /// the chunk header — a legacy `idx1`-only AVI 1.0 file has no
+    /// `ix##` chunks and yields an empty Vec. VBR streams, video /
+    /// data streams, and CBR streams whose WAVEFORMATEX carried a
+    /// `nBlockAlign` of 0 or 1 are skipped (nothing to validate
+    /// against). An empty return means "no `ix##`-indexed CBR-audio
+    /// misalignment found", which includes the common case of a file
+    /// with no standard indexes at all.
+    ///
+    /// This validator is informational and never affects `open()`:
+    /// the coarse VBR/CBR sample-size invariant is already enforced at
+    /// open time (or skipped via `open_lenient`); this is the finer,
+    /// index-level companion a caller invokes when it wants to trust
+    /// `ix##` offsets for sample-accurate audio seeking.
+    pub fn cbr_audio_block_alignment_violations(&self) -> Vec<BlockAlignViolation> {
+        let mut out = Vec::new();
+        // Per-stream running entry ordinal so `entry_index` counts
+        // across every ix## chunk for that stream in file order
+        // (mirrors `field2_offset_for_packet`'s per-stream walk).
+        let mut seen_per_stream: Vec<usize> = vec![0; self.audio_cbr_block_aligns.len()];
+        for ix in &self.std_indexes {
+            let stream = match parse_stream_index(&ix.chunk_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let block_align = match self
+                .audio_cbr_block_aligns
+                .get(stream as usize)
+                .copied()
+                .flatten()
+            {
+                Some(ba) => ba,
+                // Not a CBR audio stream with a meaningful nBlockAlign.
+                None => continue,
+            };
+            let base = seen_per_stream
+                .get(stream as usize)
+                .copied()
+                .unwrap_or_default();
+            for (local, entry) in ix.entries.iter().enumerate() {
+                if entry.dw_size % block_align as u32 != 0 {
+                    out.push(BlockAlignViolation {
+                        stream_index: stream,
+                        entry_index: base + local,
+                        dw_size: entry.dw_size,
+                        block_align,
+                    });
+                }
+            }
+            if let Some(slot) = seen_per_stream.get_mut(stream as usize) {
+                *slot = base.saturating_add(ix.entries.len());
+            }
+        }
+        out
     }
 
     /// Per-stream `vprp` `VIDEO_FIELD_DESC` records (round-9
