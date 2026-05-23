@@ -4661,6 +4661,36 @@ impl AviDemuxer {
         }
     }
 
+    /// Round-104: per-stream `vprp` active frame aspect ratio, unpacked.
+    ///
+    /// Returns the OpenDML 2.0 §5.0 *"Active Frame Aspect Ratio"*
+    /// (`dwFrameAspectRatio`) as a numeric `(x, y)` pair — the high WORD
+    /// is the x term, the low WORD the y term, so `0x0004_0003` decodes
+    /// to `(4, 3)` and `0x0010_0009` to `(16, 9)`. This is the typed
+    /// companion to the `avi:vprp.<index>.frame_aspect_ratio` metadata
+    /// key (which formats the same value as the human-readable string
+    /// `"x:y"`); callers wanting to compute a pixel aspect ratio from
+    /// the frame width/height — *"This value can be used with the frame
+    /// width and height to calculate the pixel aspect ratio"* per
+    /// §5.0 — get the two WORDs without parsing the metadata string.
+    ///
+    /// Returns `None` when the stream carries no `vprp` chunk (presence
+    /// gated on `nbFieldPerFrame > 0`, matching the metadata surface) or
+    /// when its `dwFrameAspectRatio` is `0` (left unspecified by the
+    /// writer — the metadata surface omits the key in that case too, so
+    /// absence stays observable). The pair round-trips a muxer-emitted
+    /// ratio set via [`crate::muxer::VprpConfig::with_aspect`] /
+    /// [`crate::muxer::VprpConfig::with_frame_aspect_ratio`].
+    pub fn vprp_frame_aspect_ratio(&self, stream_index: u32) -> Option<(u16, u16)> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 || vp.frame_aspect_ratio == 0 {
+            return None;
+        }
+        let x = (vp.frame_aspect_ratio >> 16) as u16;
+        let y = (vp.frame_aspect_ratio & 0xFFFF) as u16;
+        Some((x, y))
+    }
+
     /// Round-19 candidate 1: per-video-stream top-down DIB flag.
     ///
     /// Returns `Some(true)` when the stream's BMIH carried a negative

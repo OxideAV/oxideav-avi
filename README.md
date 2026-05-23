@@ -35,7 +35,7 @@ oxideav-avi = "0.0"
 | OpenDML 2.0 `ix##` per-segment std-index in `movi` | yes (parse) | yes (segment-tail emit + opt-in mid-`movi` periodic flush via `AviMuxOptions::with_mid_movi_index`) |
 | `idx1`-from-`ix##` synthesis (AVI 1.0 reader compat) | n/a | yes (`AviMuxOptions::synthesise_idx1_from_ix(true)` rebuilds primary segment's `idx1` from per-packet `ix##` records) |
 | OpenDML 2.0 `LIST odml dmlh` extended header     | yes (parse) | yes (emit) |
-| OpenDML 2.0 `vprp` Video Properties Header       | yes (parse) | yes (NTSC/PAL/SECAM presets + custom aspect) |
+| OpenDML 2.0 `vprp` Video Properties Header       | yes (parse + `avi:vprp.<n>.*` metadata + typed `vprp_field_descs` per-field rects + typed `vprp_frame_aspect_ratio` returning the §5.0 `dwFrameAspectRatio` unpacked as a numeric `(x, y)` pair) | yes (NTSC/PAL/SECAM presets + custom aspect) |
 | OpenDML 2.0 `AVI_INDEX_2FIELD` interlaced std-index | yes (parse + metadata surface + per-packet `field2_offset_for_packet` accessor) | yes (`open_avi` + `set_field2_offset`) |
 | OpenDML 2.0 super-index overflow signalling      | yes (`avi:indx.<n>.overflow_entries`) | yes (`AviMuxer::truncated_super_index_segments()`) |
 | VBR audio framing via `Packet.duration`          | n/a   | yes (drives `strh.dwLength` for non-PCM) |

@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `vprp` active-frame-aspect-ratio accessor (round 104).**
+  New `AviDemuxer::vprp_frame_aspect_ratio(stream_index) -> Option<(u16,
+  u16)>` returns the OpenDML 2.0 §5.0 *"Active Frame Aspect Ratio"*
+  (`dwFrameAspectRatio`) unpacked into a numeric `(x, y)` pair — the high
+  WORD is the x term, the low WORD the y term, so the on-disk
+  `0x0004_0003` decodes to `(4, 3)` and `0x0010_0009` to `(16, 9)`
+  (clean-room source `docs/container/riff/opendml-avi-2.0.pdf`, §5.0
+  "Source and Header Information Storage" → "Video Properties Header
+  (vprp)" → "Active Frame Aspect Ratio": *"The aspect ratio is stored as
+  a DWORD value with a word each storing the x:y ratio… This value can be
+  used with the frame width and height to calculate the pixel aspect
+  ratio"*). This is the typed companion to the existing
+  `avi:vprp.<index>.frame_aspect_ratio` metadata key (which formats the
+  same field as the human-readable string `"x:y"`); callers computing a
+  pixel aspect ratio from the active frame dimensions now get the two
+  WORDs directly instead of re-parsing the metadata string. Returns
+  `None` when the stream carries no `vprp` chunk (presence gated on
+  `nbFieldPerFrame > 0`, matching the metadata surface), when its
+  `dwFrameAspectRatio` is `0` (writer left it unspecified — the metadata
+  surface omits the key in that case too, so absence stays observable),
+  or for an out-of-range stream index. The pair round-trips a
+  muxer-emitted ratio set via `VprpConfig::with_aspect` /
+  `VprpConfig::with_frame_aspect_ratio`. Joins the round-9
+  `vprp_field_descs` typed accessor so both the per-field-rect tail and
+  the scalar aspect ratio are reachable without walking metadata strings.
+  Four new tests (`tests/round104_vprp_aspect.rs`) cover a custom 16:9
+  round-trip (with typed-pair ↔ metadata-string agreement), the NTSC
+  preset's 4:3 default, an AVI-1.0 no-`vprp` stream (and out-of-range
+  index) returning `None`, and a byte-patched zero-`dwFrameAspectRatio`
+  `vprp` returning `None` while the chunk is otherwise present.
+
 - **OpenDML super-index `dwDuration` accessor + `dmlh` cross-check
   (round 101).** Surfaces the per-segment `_avisuperindex_entry.dwDuration`
   field — *"time span in stream ticks"* per OpenDML 2.0 §"AVI Super Index
