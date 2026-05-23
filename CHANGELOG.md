@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenDML super-index `dwDuration` accessor + `dmlh` cross-check
+  (round 101).** Surfaces the per-segment `_avisuperindex_entry.dwDuration`
+  field — *"time span in stream ticks"* per OpenDML 2.0 §"AVI Super Index
+  Chunk" (clean-room source `docs/container/riff/opendml-avi-2.0.pdf`) —
+  which the demuxer parsed since round 9 but never exposed. New
+  `AviDemuxer::super_index_segment_durations(stream_index) -> Vec<u32>`
+  returns the values in segment order, and
+  `AviDemuxer::super_index_duration_violations() -> Vec<SuperIndexDurationViolation>`
+  cross-checks them: for a one-tick-per-frame video stream the per-segment
+  durations partition the file's total frame count, so their sum must equal
+  the §5.0 `dmlh.dwTotalFrames` extended-header value (the real frame total
+  across every `RIFF AVIX` segment, vs. `avih.dwTotalFrames`'s primary-only
+  count). One `SuperIndexDurationViolation { stream_index,
+  super_index_duration_total, dmlh_total_frames }` is returned per video
+  stream whose sum disagrees. The check fires only when both counts are
+  independently recorded (a non-empty `indx` super-index for the stream
+  **and** a `dmlh` for the file); audio/data streams (whose ticks need not
+  be one-per-frame), super-index-less files, and `dmlh`-less files are
+  skipped. Like the round-96 block-alignment validator it is purely
+  informational and never affects `open()`. Two supporting fixes make the
+  cross-check exact: (1) the muxer now writes the **indexed** stream's
+  per-segment frame count into `dwDuration` instead of the all-stream
+  packet total (which over-counted video+audio files); (2) `parse_indx`
+  now retains the legitimate `qwOffset == 0` primary-segment entry within
+  `nEntriesInUse` (the OpenDML "unused entry" sentinel only applies to
+  slots *beyond* `nEntriesInUse`; the primary `RIFF AVI ` segment starts
+  at file offset 0 so its recorded RIFF offset is 0). Seeking is
+  unaffected — it resolves chunk locations via the in-`movi` `ix##` scan,
+  never the super-index `qwOffset`. Four new tests
+  (`tests/round101_super_index_duration.rs`) cover video+audio durations
+  summing to `dmlh` (the multi-stream case the old all-stream count would
+  have tripped), video-only, a byte-patched-`dmlh` mismatch flagged on the
+  video stream, and the AVI-1.0 no-super-index/no-`dmlh` empty case.
+
 - **CBR-audio `ix##` standard-index block-alignment validator (round 96).**
   Implements a reader-side cross-check from OpenDML 2.0 §3.0 ("AVI
   Standard Index Chunk", clean-room source

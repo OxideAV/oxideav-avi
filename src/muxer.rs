@@ -1186,6 +1186,7 @@ pub fn open_avi(
         dmlh_total_frames_off: None,
         segments: Vec::new(),
         current_segment_packets: 0,
+        current_segment_indexed_packets: 0,
         rec_open_size_off: None,
         rec_packets_in_cluster: 0,
         rec_bytes_in_cluster: 0,
@@ -1216,10 +1217,21 @@ struct SegmentRecord {
     /// the entire RIFF chunk including the 8-byte RIFF header").
     total_size: u64,
     /// Number of packets (frames) carried in this segment's `movi`
-    /// LIST. Becomes `dwDuration` in the indx entry. We sum across
-    /// all streams; for single-stream MagicYUV / video files this is
-    /// the per-stream frame count, which matches OpenDML's intent.
+    /// LIST, summed across all streams. Retained for diagnostics; the
+    /// super-index `dwDuration` uses [`Self::indexed_packet_count`]
+    /// instead (round-101).
+    #[allow(dead_code)]
     packet_count: u32,
+    /// Number of packets carried in this segment's `movi` LIST for the
+    /// indexed stream (stream 0). Becomes `dwDuration` in the `indx`
+    /// super-index entry per OpenDML 2.0 §"AVI Super Index Chunk" —
+    /// "time span in stream ticks" of the chunks the segment's `ix##`
+    /// indexes. For a one-tick-per-frame video stream this is the
+    /// segment's frame count, matching OpenDML's intent even when the
+    /// file carries additional audio / data streams (round-101 fixes
+    /// the previous all-stream sum, which over-counted multi-stream
+    /// files).
+    indexed_packet_count: u32,
 }
 
 /// Concrete AVI muxer. Returned by [`open_avi`] for callers that
@@ -1272,6 +1284,15 @@ pub struct AviMuxer {
     /// Number of packets written into the current open segment's
     /// `movi` LIST. Reset when a new segment is opened.
     current_segment_packets: u32,
+    /// Number of packets written into the current open segment's `movi`
+    /// LIST for the **indexed** stream (stream 0 — the one that carries
+    /// the `indx` super-index). Reset when a new segment is opened.
+    /// Becomes the super-index entry's `dwDuration` per OpenDML 2.0
+    /// §"AVI Super Index Chunk" ("time span in stream ticks" of the
+    /// chunks indexed by that segment's `ix##`), which for a
+    /// one-tick-per-frame video stream is that stream's per-segment
+    /// frame count — *not* the all-stream packet total. Round-101.
+    current_segment_indexed_packets: u32,
     /// File offset of the `LIST rec ` size field for the currently
     /// open cluster (when [`AviMuxOptions::rec_cluster_packets`] is
     /// `Some`). `None` between clusters.
@@ -1463,6 +1484,7 @@ impl Muxer for AviMuxer {
         // which — by convention, we make them relative to 'movi'.
         self.movi_start_off = self.movi_size_off + 4; // skip past size → 'movi' fourcc
         self.current_segment_packets = 0;
+        self.current_segment_indexed_packets = 0;
         self.rec_open_size_off = None;
         self.rec_packets_in_cluster = 0;
         self.header_written = true;
@@ -1675,6 +1697,14 @@ impl Muxer for AviMuxer {
         t.sample_count += sample_count_of_packet(&t.stream, &t.entry, size, packet.duration);
 
         self.current_segment_packets += 1;
+        // Track the indexed stream's per-segment frame count separately
+        // so the `indx` super-index `dwDuration` reflects that stream's
+        // span (OpenDML 2.0 §"AVI Super Index Chunk") rather than the
+        // all-stream packet total (round-101). The super-index is always
+        // emitted on stream 0 in `write_header`.
+        if idx == 0 {
+            self.current_segment_indexed_packets += 1;
+        }
         if self.options.rec_cluster_packets.is_some() || self.options.rec_cluster_bytes.is_some() {
             self.rec_packets_in_cluster += 1;
             // Track on-disk bytes added to the cluster body: 8-byte
@@ -1794,6 +1824,7 @@ impl Muxer for AviMuxer {
                     riff_offset: riff_start,
                     total_size: total_size - riff_start,
                     packet_count: self.current_segment_packets,
+                    indexed_packet_count: self.current_segment_indexed_packets,
                 });
             }
         } else {
@@ -1807,6 +1838,7 @@ impl Muxer for AviMuxer {
                 riff_offset: riff_start,
                 total_size: total_size - riff_start,
                 packet_count: self.current_segment_packets,
+                indexed_packet_count: self.current_segment_indexed_packets,
             });
         }
 
@@ -2131,6 +2163,7 @@ impl AviMuxer {
             riff_offset: riff_start,
             total_size: after_riff - riff_start,
             packet_count: self.current_segment_packets,
+            indexed_packet_count: self.current_segment_indexed_packets,
         });
         Ok(())
     }
@@ -2210,6 +2243,7 @@ impl AviMuxer {
         self.movi_size_off = begin_list(self.output.as_mut(), &LIST, b"movi")?;
         self.movi_start_off = self.movi_size_off + 4;
         self.current_segment_packets = 0;
+        self.current_segment_indexed_packets = 0;
         self.rec_open_size_off = None;
         self.rec_packets_in_cluster = 0;
         self.rec_bytes_in_cluster = 0;
@@ -2669,8 +2703,12 @@ impl AviMuxer {
             // dwSize: total RIFF byte length per spec/06 §6.1.
             let dw_size = seg.total_size.min(u32::MAX as u64) as u32;
             self.output.write_all(&dw_size.to_le_bytes())?;
-            // dwDuration: per-segment frame count.
-            self.output.write_all(&seg.packet_count.to_le_bytes())?;
+            // dwDuration: the indexed stream's per-segment frame count
+            // (OpenDML 2.0 §"AVI Super Index Chunk" — the time span of
+            // the chunks this segment's `ix##` indexes), not the
+            // all-stream packet total (round-101).
+            self.output
+                .write_all(&seg.indexed_packet_count.to_le_bytes())?;
         }
         self.output.seek(SeekFrom::Start(end_pos))?;
         Ok(())

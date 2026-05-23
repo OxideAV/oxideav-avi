@@ -1822,12 +1822,21 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
             body[base + 14],
             body[base + 15],
         ]);
-        // Skip zero-offset slots — those are unused capacity (the muxer
-        // reserves a fixed number of slots and back-patches only the
-        // ones it filled).
-        if qw_offset == 0 {
-            continue;
-        }
+        // Retain every slot within `nEntriesInUse`. Per OpenDML 2.0
+        // §"AVI Super Index Chunk" the spec marks `qwOffset == 0` as the
+        // "unused entry" sentinel, but unused slots live *beyond*
+        // `nEntriesInUse` (writers preallocate a fixed table and bump
+        // `nEntriesInUse` only for filled slots), so a zero offset
+        // *within* the used range is a real segment — most commonly the
+        // primary `RIFF AVI ` segment, which starts at file offset 0 and
+        // therefore has `qwOffset == 0` when a writer (this crate's muxer
+        // included) records the segment's RIFF offset. We keep its
+        // `dwDuration` so [`AviDemuxer::super_index_segment_durations`]
+        // and the round-101 cross-check see the complete per-segment
+        // partition. Seeking never dereferences `qw_offset` (the in-`movi`
+        // `ix##` scan in `scan_ix_in_movi` resolves the real chunk
+        // locations — see [`SuperIndexEntry`]), so retaining a zero-offset
+        // entry is inert for the seek path. Round-101.
         entries.push(SuperIndexEntry {
             qw_offset,
             dw_size,
@@ -2089,6 +2098,41 @@ pub struct BlockAlignViolation {
     /// The stream's `WAVEFORMATEX.nBlockAlign` the size was checked
     /// against.
     pub block_align: u16,
+}
+
+/// One super-index whose per-segment `dwDuration` total disagrees with
+/// the file's `dmlh.dwTotalFrames` (round-101).
+///
+/// Per OpenDML 2.0 §"AVI Super Index Chunk" each `_avisuperindex_entry`
+/// carries a `dwDuration` field — *"time span in stream ticks"* — for
+/// the chunks indexed by the `ix##` standard index that entry points
+/// at. The same spec's §5.0 ("Extended AVI Header") defines
+/// `dmlh.dwTotalFrames` as *"the real size of the AVI file"* — the
+/// total frame count across **every** `RIFF AVIX` segment (whereas
+/// `avih.dwTotalFrames` counts only the primary segment). Because the
+/// super-index entries partition the file segment-by-segment, the sum
+/// of a one-tick-per-frame video stream's per-segment `dwDuration`
+/// values must equal `dmlh.dwTotalFrames`. A mismatch means the
+/// super-index disagrees with the extended header about how many frames
+/// the file holds — a consumer that trusts one for total-duration math
+/// and the other for per-segment seeking will land off by the
+/// difference.
+///
+/// Returned (possibly empty) by
+/// [`AviDemuxer::super_index_duration_violations`]. The validator is
+/// purely informational — it never fails `open()`, and it only fires
+/// for video streams that carry **both** a non-empty `indx` super-index
+/// and a `dmlh` extended header (the only configuration where the two
+/// counts are independently recorded and therefore comparable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperIndexDurationViolation {
+    /// Stream number whose `indx` super-index was checked.
+    pub stream_index: u32,
+    /// Sum of the stream's per-segment `_avisuperindex_entry.dwDuration`
+    /// values (saturating at `u64::MAX`).
+    pub super_index_duration_total: u64,
+    /// The file's `dmlh.dwTotalFrames` the total was compared against.
+    pub dmlh_total_frames: u64,
 }
 
 /// 5-tuple returned by [`build_stream`]: the [`StreamInfo`], the
@@ -4498,6 +4542,97 @@ impl AviDemuxer {
             }
             if let Some(slot) = seen_per_stream.get_mut(stream as usize) {
                 *slot = base.saturating_add(ix.entries.len());
+            }
+        }
+        out
+    }
+
+    /// Per-segment `_avisuperindex_entry.dwDuration` values from a
+    /// stream's `indx` super-index (round-101).
+    ///
+    /// Per OpenDML 2.0 §"AVI Super Index Chunk", each super-index entry
+    /// points at one `ix##` standard index covering one `RIFF AVIX`
+    /// segment and records that segment's `dwDuration` — *"time span in
+    /// stream ticks"*. This returns those values in segment order (one
+    /// per used super-index entry; entries with `qwOffset == 0`, the
+    /// spec's "unused entry" sentinel, are dropped at parse time and so
+    /// never appear here).
+    ///
+    /// Returns an empty `Vec` when the stream carries no `indx`
+    /// super-index (the common AVI-1.0 / single-`RIFF` case), when
+    /// `stream_index` is out of range, or when the super-index declared
+    /// zero used entries. Callers wanting to validate the totals against
+    /// the extended header should prefer
+    /// [`AviDemuxer::super_index_duration_violations`].
+    pub fn super_index_segment_durations(&self, stream_index: u32) -> Vec<u32> {
+        match self.super_indexes.get(stream_index as usize) {
+            Some(sx) => sx.entries.iter().map(|e| e.dw_duration).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Cross-check each stream's `indx` super-index `dwDuration` total
+    /// against the file's `dmlh.dwTotalFrames` (round-101).
+    ///
+    /// Per OpenDML 2.0 §"AVI Super Index Chunk" every
+    /// `_avisuperindex_entry.dwDuration` is the per-segment frame span
+    /// in stream ticks, and §5.0 ("Extended AVI Header") defines
+    /// `dmlh.dwTotalFrames` as the file's real total frame count across
+    /// all `RIFF AVIX` segments. For a one-tick-per-frame video stream —
+    /// the canonical OpenDML video case, and exactly what this crate's
+    /// muxer emits — the super-index entries partition that total, so
+    /// `sum(dwDuration) == dmlh.dwTotalFrames` must hold. This method
+    /// returns one [`SuperIndexDurationViolation`] per video stream
+    /// whose sum disagrees.
+    ///
+    /// The check only fires when **both** independently-recorded counts
+    /// are present: a non-empty `indx` super-index for the stream **and**
+    /// a `dmlh` extended header for the file. Streams without a
+    /// super-index, files without a `dmlh`, and non-video streams (whose
+    /// `dwDuration` ticks need not be one-per-frame) are skipped and
+    /// yield no violation. An empty return therefore means "every video
+    /// super-index that can be compared agrees with `dmlh`", which
+    /// includes the common case of a file that records only one of the
+    /// two.
+    ///
+    /// Like [`AviDemuxer::cbr_audio_block_alignment_violations`], this
+    /// validator is purely informational: it never affects `open()`. It
+    /// complements the existing `avi:indx.<n>.overflow_entries` signal
+    /// (which flags a super-index with more segments than reserved
+    /// slots) with a value-level consistency check between the index and
+    /// the extended header.
+    pub fn super_index_duration_violations(&self) -> Vec<SuperIndexDurationViolation> {
+        let mut out = Vec::new();
+        let Some(dmlh) = self.dmlh_total_frames else {
+            // No extended header to compare against.
+            return out;
+        };
+        let dmlh_total = dmlh as u64;
+        for (i, sx) in self.super_indexes.iter().enumerate() {
+            if sx.entries.is_empty() {
+                continue;
+            }
+            // Scope to video streams: their per-segment dwDuration is the
+            // frame count, the same unit dmlh.dwTotalFrames carries.
+            // Audio super-index ticks are sample/block spans, not frames.
+            let is_video = self
+                .streams
+                .get(i)
+                .map(|s| matches!(s.params.media_type, MediaType::Video))
+                .unwrap_or(false);
+            if !is_video {
+                continue;
+            }
+            let total: u64 = sx
+                .entries
+                .iter()
+                .fold(0u64, |acc, e| acc.saturating_add(e.dw_duration as u64));
+            if total != dmlh_total {
+                out.push(SuperIndexDurationViolation {
+                    stream_index: i as u32,
+                    super_index_duration_total: total,
+                    dmlh_total_frames: dmlh_total,
+                });
             }
         }
         out
