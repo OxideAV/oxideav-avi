@@ -386,6 +386,25 @@ pub struct AviMuxOptions {
     /// are not pre-aligned — they're outside the per-frame stream
     /// budget and players don't seek to them via the index.
     pub padding_granularity: Option<u32>,
+    /// Digitization-date text emitted as an `IDIT` chunk inside
+    /// `LIST hdrl` (round-107).
+    ///
+    /// `IDIT` is a member of the RIFF *Hdrl Tags* namespace
+    /// (`DateTimeOriginal`) per
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html` §"RIFF
+    /// Hdrl Tags" — capture hardware records the capture / digitization
+    /// timestamp there. When `Some(s)` the muxer writes an `IDIT` chunk
+    /// (direct child of `LIST hdrl`, after the strls / `LIST odml` /
+    /// nested `LIST INFO`) whose body is the UTF-8 bytes of `s` followed
+    /// by a single NUL terminator, even-padded with one zero byte when
+    /// the resulting length is odd per RIFF §"data is always padded to
+    /// nearest WORD boundary". `None` (the default) emits no `IDIT`
+    /// chunk, preserving pre-round-107 byte layout. The staged docs do
+    /// not pin a canonical on-disk text format, so the muxer writes the
+    /// caller's string verbatim and the demuxer surfaces it verbatim —
+    /// the round-trip is byte-faithful regardless of the chosen format.
+    /// See [`Self::with_digitization_date`].
+    pub digitization_date: Option<String>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1001,6 +1020,29 @@ impl AviMuxOptions {
         };
         self
     }
+
+    /// Builder helper: stamp a digitization-date `IDIT` chunk into
+    /// `LIST hdrl` (round-107). See [`Self::digitization_date`] for
+    /// placement and byte-layout semantics.
+    ///
+    /// `IDIT` is the RIFF *Hdrl Tags* `DateTimeOriginal` field per
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html`. The
+    /// staged docs do not pin a canonical text format; pass whatever
+    /// timestamp string the consuming workflow expects (e.g. the
+    /// `asctime` form `"Wed Jan 02 02:03:55 2002"` capture hardware
+    /// emits, or an ISO-8601 `"2002-01-02T02:03:55"`). The string is
+    /// written verbatim (plus a NUL terminator) and round-trips
+    /// byte-faithfully through
+    /// [`crate::demuxer::AviDemuxer::digitization_date`].
+    ///
+    /// Duplicate calls replace the prior value. Passing an empty string
+    /// emits a NUL-only `IDIT` body, which the demuxer reads back as
+    /// `None` (no usable timestamp) — call this with a non-empty string
+    /// when the intent is to round-trip a value.
+    pub fn with_digitization_date(mut self, date: impl Into<String>) -> Self {
+        self.digitization_date = Some(date.into());
+        self
+    }
 }
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
@@ -1458,6 +1500,19 @@ impl Muxer for AviMuxer {
         let want_info = !self.options.info_entries.is_empty();
         if want_info && !self.options.info_top_level {
             write_info_list(self.output.as_mut(), &self.options.info_entries)?;
+        }
+        // Round-107: emit the `IDIT` digitization-date chunk inside
+        // `hdrl` (RIFF *Hdrl Tags* namespace, `DateTimeOriginal`, per
+        // docs/container/riff/metadata/exiftool-riff-tags.html). Placed
+        // after the strls / `LIST odml` / nested `LIST INFO` so existing
+        // strl offsets stay stable for `patch_post_counts`. Body is the
+        // caller's UTF-8 string + a NUL terminator (RIFF word-pad
+        // applied by `write_chunk` for odd lengths). The demuxer
+        // (`parse_hdrl`'s `b"IDIT"` arm) reads it back verbatim.
+        if let Some(ref date) = self.options.digitization_date {
+            let mut body = date.as_bytes().to_vec();
+            body.push(0);
+            write_chunk(self.output.as_mut(), b"IDIT", &body)?;
         }
         finish_chunk(self.output.as_mut(), hdrl_size_off)?;
         // Round-11 candidate 1: emit `LIST INFO` as a SIBLING of

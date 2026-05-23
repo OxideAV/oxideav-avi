@@ -243,6 +243,11 @@ fn open_avi_inner(
     // codec-driver configuration bytes — the demuxer does not interpret
     // them.
     let mut stream_header_data: Vec<Option<Vec<u8>>> = Vec::new();
+    // Round-107: the optional `IDIT` digitization-date text chunk inside
+    // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
+    // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
+    // chunk with a non-empty (after NUL/whitespace trim) body.
+    let mut digitization_date: Option<String> = None;
 
     walk_riff_body(
         &mut *input,
@@ -262,6 +267,7 @@ fn open_avi_inner(
         &mut audio_strfs,
         &mut stream_names,
         &mut stream_header_data,
+        &mut digitization_date,
         codecs,
         /* is_primary */ true,
     )?;
@@ -293,6 +299,7 @@ fn open_avi_inner(
                     &mut audio_strfs,
                     &mut stream_names,
                     &mut stream_header_data,
+                    &mut digitization_date,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -425,6 +432,17 @@ fn open_avi_inner(
     // `avi:total_frames_all_segments` carries the OpenDML truth.
     if let Some(total) = dmlh_total_frames {
         metadata.push(("avi:total_frames_all_segments".into(), total.to_string()));
+    }
+
+    // Round-107: surface the `IDIT` digitization-date string under
+    // `avi:idit` when the `hdrl` carried a (non-empty) `IDIT` chunk.
+    // The key is omitted entirely when no IDIT chunk was present so its
+    // absence is observable in the metadata Vec (mirroring the
+    // `avi:strn.<index>` / `avi:padding_granularity` conventions). The
+    // value is the trimmed text verbatim — the staged docs do not pin a
+    // canonical format, so no normalisation is applied here.
+    if let Some(ref idit) = digitization_date {
+        metadata.push(("avi:idit".into(), idit.clone()));
     }
 
     // OpenDML 2.0 §5.0 vprp: surface signal-shape descriptors per
@@ -1092,6 +1110,7 @@ fn open_avi_inner(
         audio_strf: audio_strfs,
         stream_names,
         stream_header_data,
+        digitization_date,
     })
 }
 
@@ -1119,6 +1138,7 @@ fn walk_riff_body(
     audio_strfs: &mut Vec<Option<AudioStrfInfo>>,
     stream_names: &mut Vec<Option<String>>,
     stream_header_data: &mut Vec<Option<Vec<u8>>>,
+    digitization_date: &mut Option<String>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -1152,6 +1172,7 @@ fn walk_riff_body(
                         asfs,
                         names,
                         strds,
+                        idit,
                     ) = parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
@@ -1165,6 +1186,7 @@ fn walk_riff_body(
                     *audio_strfs = asfs;
                     *stream_names = names;
                     *stream_header_data = strds;
+                    *digitization_date = idit;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -1386,6 +1408,7 @@ type HdrlOutput = (
     Vec<Option<AudioStrfInfo>>,
     Vec<Option<String>>,
     Vec<Option<Vec<u8>>>,
+    Option<String>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -1413,6 +1436,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut stream_header_data: Vec<Option<Vec<u8>>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
+    let mut digitization_date: Option<String> = None;
 
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
@@ -1420,6 +1444,24 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
             None => break,
         };
         match &hdr.id {
+            // Round-107: `IDIT` digitization-date chunk, a direct child
+            // of `LIST hdrl` (a sibling of `avih` / `strl` / `LIST odml`
+            // / `LIST INFO`). Per the RIFF *Hdrl Tags* namespace
+            // (`docs/container/riff/metadata/exiftool-riff-tags.html`
+            // §"RIFF Hdrl Tags": `'IDIT'` → `DateTimeOriginal`) it
+            // carries the capture / digitization timestamp as a text
+            // string. The on-disk text format is writer-defined and not
+            // pinned by the staged docs (capture hardware commonly emits
+            // a C `asctime`-style "Wed Jan 02 02:03:55 2002" while other
+            // tools use ISO-8601), so the body is surfaced verbatim as a
+            // trimmed UTF-8-lossy string and left for the caller to
+            // interpret — exactly the conservative treatment the `strn`
+            // stream-name chunk gets.
+            b"IDIT" => {
+                let body = read_body_bounded(r, hdr.size)?;
+                digitization_date = parse_idit_body(&body);
+                skip_pad(r, hdr.size)?;
+            }
             b"avih" => {
                 let body = read_body_bounded(r, hdr.size)?;
                 main = parse_avih(&body)?;
@@ -1485,7 +1527,39 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         audio_strfs,
         stream_names,
         stream_header_data,
+        digitization_date,
     ))
+}
+
+/// Parse an `IDIT` chunk body into an owned digitization-date string
+/// (round-107).
+///
+/// `IDIT` lives directly inside `LIST hdrl` and carries the capture /
+/// digitization timestamp as text per the RIFF *Hdrl Tags* namespace
+/// (`docs/container/riff/metadata/exiftool-riff-tags.html` §"RIFF Hdrl
+/// Tags": `'IDIT'` → `DateTimeOriginal`). The staged docs do not pin a
+/// canonical byte format for the field, so this parser is deliberately
+/// format-agnostic: it strips trailing NUL / whitespace bytes (capture
+/// hardware frequently terminates the C `asctime` form with a `'\n'`
+/// and/or a NUL, and pads to a WORD boundary with extra NULs) and
+/// passes the remainder through `String::from_utf8_lossy` so legacy
+/// Latin-1 / CP1252 bytes don't fail the parse. An empty payload
+/// (`cb=0`) — or a body that is all NUL / whitespace — yields `None` so
+/// "no IDIT chunk" stays distinguishable from "an IDIT chunk with a
+/// non-empty timestamp".
+fn parse_idit_body(body: &[u8]) -> Option<String> {
+    // Strip every trailing NUL and ASCII whitespace byte (space, tab,
+    // CR, LF, form-feed, vertical-tab) — asctime-style writers append a
+    // newline + NUL; the RIFF WORD-pad may add a further NUL.
+    let end = body
+        .iter()
+        .rposition(|&b| b != 0 && !b.is_ascii_whitespace())
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&body[..end]).into_owned())
 }
 
 /// Parse a `LIST odml` body for the `dmlh` extended-header chunk.
@@ -2969,6 +3043,17 @@ pub struct AviDemuxer {
     /// accessor in addition to the `avi:strd.<index>.len` metadata
     /// key (length only, not the raw driver bytes).
     stream_header_data: Vec<Option<Vec<u8>>>,
+    /// Digitization-date text from the optional `IDIT` chunk inside
+    /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
+    /// Tags* namespace (`DateTimeOriginal`) per
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html`. `None`
+    /// when the file carried no `IDIT` chunk (or only an empty / all-
+    /// whitespace one). The string is the chunk body with trailing
+    /// NUL / whitespace stripped and decoded UTF-8-lossy; the on-disk
+    /// text format is writer-defined and not normalised. Surfaced via
+    /// the typed [`AviDemuxer::digitization_date`] accessor in addition
+    /// to the `avi:idit` metadata key.
+    digitization_date: Option<String>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -4839,6 +4924,32 @@ impl AviDemuxer {
         self.stream_header_data
             .get(stream_index as usize)
             .and_then(|h| h.as_deref())
+    }
+
+    /// Digitization-date string from the optional `IDIT` chunk inside
+    /// `LIST hdrl` (round-107).
+    ///
+    /// `IDIT` is a member of the RIFF *Hdrl Tags* namespace
+    /// (`DateTimeOriginal`) per
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html` §"RIFF
+    /// Hdrl Tags". Capture hardware writes the capture / digitization
+    /// timestamp here; the on-disk text format is writer-defined and
+    /// **not** pinned by the staged docs (an `asctime`-style "Wed Jan 02
+    /// 02:03:55 2002" is common from VfW capture filters, while other
+    /// tools emit ISO-8601), so the returned string is the chunk body
+    /// verbatim with only trailing NUL / ASCII-whitespace bytes
+    /// stripped and decoded UTF-8-lossy. No date parsing or
+    /// normalisation is performed — the caller decides how to interpret
+    /// the timestamp.
+    ///
+    /// Returns `None` when the file carried no `IDIT` chunk, or when the
+    /// chunk body was empty / all-NUL / all-whitespace (so a present-
+    /// but-empty chunk reads the same as an absent one). The same value
+    /// surfaces under the `avi:idit` metadata key (also omitted when
+    /// absent), and round-trips a muxer-emitted date set via
+    /// [`crate::muxer::AviMuxOptions::with_digitization_date`].
+    pub fn digitization_date(&self) -> Option<&str> {
+        self.digitization_date.as_deref()
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).

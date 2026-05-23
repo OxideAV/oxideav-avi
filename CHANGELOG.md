@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`IDIT` digitization-date chunk parse + emit + round-trip (round
+  107).** Implements the `IDIT` *Hdrl Tag* — a direct child chunk of
+  `LIST hdrl` (a sibling of `avih` / `strl` / `LIST odml` / `LIST
+  INFO`) — that carries the capture / digitization timestamp as text.
+  Clean-room source: `docs/container/riff/metadata/exiftool-riff-tags.html`
+  §"RIFF Hdrl Tags" maps `'IDIT'` → `DateTimeOriginal`, listing it
+  alongside `ISMP` (TimeCode) and `LIST odml` as the recognised direct
+  children of `hdrl`. Demuxer side: `parse_hdrl` now handles the
+  `b"IDIT"` chunk and the new `AviDemuxer::digitization_date() ->
+  Option<&str>` accessor surfaces it (same value under the `avi:idit`
+  metadata key). The staged docs do **not** pin a canonical on-disk text
+  format — capture hardware commonly emits a C `asctime`-style "Wed Jan
+  02 02:03:55 2002" (often with a trailing newline + NUL) while other
+  tools use ISO-8601 — so the parser is deliberately format-agnostic:
+  it strips trailing NUL / ASCII-whitespace bytes and decodes
+  UTF-8-lossy, returning the timestamp verbatim for the caller to
+  interpret (no date parsing or normalisation). An empty / all-NUL /
+  all-whitespace body yields `None` so a present-but-empty chunk reads
+  the same as an absent one (mirroring the round-80 `strn` convention);
+  the `avi:idit` key is omitted entirely when absent so its non-presence
+  is observable. Muxer side: `AviMuxOptions::with_digitization_date(date)`
+  (last call wins) emits an `IDIT` chunk inside `hdrl` after the strls /
+  `LIST odml` / nested `LIST INFO` so existing strl offsets stay stable
+  for `patch_post_counts`; the body is the caller's string + a NUL
+  terminator (RIFF word-pad applied for odd lengths). The round-trip is
+  byte-faithful regardless of the chosen text format. Seven new tests
+  (`tests/round107_idit.rs`) cover an asctime round-trip (accessor +
+  metadata key), an ISO-8601 round-trip (format-agnosticism), a no-IDIT
+  baseline (accessor `None`, no `avi:idit` key, smaller file), an
+  empty-string body parsing as `None`, builder dedup, a hand-rolled
+  fixture whose IDIT body carries a trailing newline + multi-NUL padding
+  (peeled to the bare timestamp), and a hand-rolled all-whitespace body
+  parsing as `None`.
+
 - **Typed `vprp` active-frame-aspect-ratio accessor (round 104).**
   New `AviDemuxer::vprp_frame_aspect_ratio(stream_index) -> Option<(u16,
   u16)>` returns the OpenDML 2.0 §5.0 *"Active Frame Aspect Ratio"*
