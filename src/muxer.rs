@@ -405,6 +405,25 @@ pub struct AviMuxOptions {
     /// the round-trip is byte-faithful regardless of the chosen format.
     /// See [`Self::with_digitization_date`].
     pub digitization_date: Option<String>,
+    /// SMPTE-timecode text emitted as an `ISMP` chunk inside
+    /// `LIST hdrl` (round-112).
+    ///
+    /// `ISMP` is a member of the RIFF *Hdrl Tags* namespace (`TimeCode`)
+    /// per `docs/container/riff/metadata/exiftool-riff-tags.html` §"RIFF
+    /// Hdrl Tags" — it sits directly alongside `IDIT` and records the
+    /// SMPTE timecode of the file's first frame. When `Some(s)` the
+    /// muxer writes an `ISMP` chunk (direct child of `LIST hdrl`, after
+    /// the strls / `LIST odml` / nested `LIST INFO` / any `IDIT`) whose
+    /// body is the UTF-8 bytes of `s` followed by a single NUL
+    /// terminator, even-padded with one zero byte when the resulting
+    /// length is odd per RIFF §"data is always padded to nearest WORD
+    /// boundary". `None` (the default) emits no `ISMP` chunk, preserving
+    /// pre-round-112 byte layout. The staged docs do not pin a canonical
+    /// on-disk text format, so the muxer writes the caller's string
+    /// verbatim and the demuxer surfaces it verbatim — the round-trip is
+    /// byte-faithful regardless of the chosen format.
+    /// See [`Self::with_smpte_timecode`].
+    pub smpte_timecode: Option<String>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1043,6 +1062,30 @@ impl AviMuxOptions {
         self.digitization_date = Some(date.into());
         self
     }
+
+    /// Builder helper: stamp a SMPTE-timecode `ISMP` chunk into
+    /// `LIST hdrl` (round-112). See [`Self::smpte_timecode`] for
+    /// placement and byte-layout semantics.
+    ///
+    /// `ISMP` is the RIFF *Hdrl Tags* `TimeCode` field per
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html`, the
+    /// sibling of the `IDIT` `DateTimeOriginal` field. The staged docs
+    /// do not pin a canonical text format; pass whatever timecode string
+    /// the consuming workflow expects (e.g. the SMPTE non-drop-frame
+    /// colon form `"01:00:00:00"`, the drop-frame semicolon form
+    /// `"01:00:00;02"`, or a fractional `"01:00:00.50"`). The string is
+    /// written verbatim (plus a NUL terminator) and round-trips
+    /// byte-faithfully through
+    /// [`crate::demuxer::AviDemuxer::smpte_timecode`].
+    ///
+    /// Duplicate calls replace the prior value. Passing an empty string
+    /// emits a NUL-only `ISMP` body, which the demuxer reads back as
+    /// `None` (no usable timecode) — call this with a non-empty string
+    /// when the intent is to round-trip a value.
+    pub fn with_smpte_timecode(mut self, timecode: impl Into<String>) -> Self {
+        self.smpte_timecode = Some(timecode.into());
+        self
+    }
 }
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
@@ -1513,6 +1556,19 @@ impl Muxer for AviMuxer {
             let mut body = date.as_bytes().to_vec();
             body.push(0);
             write_chunk(self.output.as_mut(), b"IDIT", &body)?;
+        }
+        // Round-112: emit the `ISMP` SMPTE-timecode chunk inside `hdrl`
+        // (RIFF *Hdrl Tags* namespace, `TimeCode`, per
+        // docs/container/riff/metadata/exiftool-riff-tags.html). Placed
+        // after the strls / `LIST odml` / nested `LIST INFO` / `IDIT` so
+        // existing strl offsets stay stable for `patch_post_counts`.
+        // Body is the caller's UTF-8 string + a NUL terminator (RIFF
+        // word-pad applied by `write_chunk` for odd lengths). The
+        // demuxer (`parse_hdrl`'s `b"ISMP"` arm) reads it back verbatim.
+        if let Some(ref timecode) = self.options.smpte_timecode {
+            let mut body = timecode.as_bytes().to_vec();
+            body.push(0);
+            write_chunk(self.output.as_mut(), b"ISMP", &body)?;
         }
         finish_chunk(self.output.as_mut(), hdrl_size_off)?;
         // Round-11 candidate 1: emit `LIST INFO` as a SIBLING of

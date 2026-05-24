@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ISMP` SMPTE-timecode chunk parse + emit + round-trip (round
+  112).** Implements the `ISMP` *Hdrl Tag* — the other direct child of
+  `LIST hdrl` documented alongside `IDIT` in the RIFF *Hdrl Tags*
+  namespace — that carries the file's first-frame SMPTE timecode as text.
+  Clean-room source: `docs/container/riff/metadata/exiftool-riff-tags.html`
+  §"RIFF Hdrl Tags" maps `'ISMP'` → `TimeCode`, listing it directly
+  beside `'IDIT'` (`DateTimeOriginal`) and `LIST odml` as the recognised
+  direct children of `hdrl`. Demuxer side: `parse_hdrl` now handles the
+  `b"ISMP"` chunk and the new `AviDemuxer::smpte_timecode() ->
+  Option<&str>` accessor surfaces it (same value under the `avi:ismp`
+  metadata key). The staged docs do **not** pin a canonical on-disk text
+  format — capture pipelines write the SMPTE non-drop-frame colon form
+  "HH:MM:SS:FF", the drop-frame semicolon form "HH:MM:SS;FF", or a
+  fractional "HH:MM:SS.ss" — so the parser is deliberately
+  format-agnostic (mirroring the round-107 `IDIT` treatment): it strips
+  trailing NUL / ASCII-whitespace bytes and decodes UTF-8-lossy,
+  returning the timecode verbatim for the caller to interpret (no
+  timecode parsing or normalisation). An empty / all-NUL / all-whitespace
+  body yields `None` so a present-but-empty chunk reads the same as an
+  absent one; the `avi:ismp` key is omitted entirely when absent so its
+  non-presence is observable. Muxer side:
+  `AviMuxOptions::with_smpte_timecode(tc)` (last call wins) emits an
+  `ISMP` chunk inside `hdrl` after the strls / `LIST odml` / nested
+  `LIST INFO` / any `IDIT` so existing strl offsets stay stable for
+  `patch_post_counts`; the body is the caller's string + a NUL terminator
+  (RIFF word-pad applied for odd lengths). The round-trip is byte-faithful
+  regardless of the chosen text format, and `ISMP` + `IDIT` coexist
+  independently in the same file. Eight new tests
+  (`tests/round112_ismp.rs`) cover a SMPTE non-drop-frame round-trip
+  (accessor + metadata key), a drop-frame round-trip
+  (format-agnosticism), a no-ISMP baseline (accessor `None`, no
+  `avi:ismp` key, smaller file), an empty-string body parsing as `None`,
+  builder dedup, ISMP + IDIT coexistence, a hand-rolled fixture whose
+  ISMP body carries a trailing newline + multi-NUL padding (peeled to the
+  bare timecode), and a hand-rolled all-whitespace body parsing as `None`.
+
 - **`IDIT` digitization-date chunk parse + emit + round-trip (round
   107).** Implements the `IDIT` *Hdrl Tag* — a direct child chunk of
   `LIST hdrl` (a sibling of `avih` / `strl` / `LIST odml` / `LIST

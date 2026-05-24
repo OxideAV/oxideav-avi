@@ -248,6 +248,11 @@ fn open_avi_inner(
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
     // chunk with a non-empty (after NUL/whitespace trim) body.
     let mut digitization_date: Option<String> = None;
+    // Round-112: the optional `ISMP` SMPTE-timecode text chunk inside
+    // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `TimeCode`).
+    // `None` until/unless the primary RIFF's `hdrl` carries an `ISMP`
+    // chunk with a non-empty (after NUL/whitespace trim) body.
+    let mut smpte_timecode: Option<String> = None;
 
     walk_riff_body(
         &mut *input,
@@ -268,6 +273,7 @@ fn open_avi_inner(
         &mut stream_names,
         &mut stream_header_data,
         &mut digitization_date,
+        &mut smpte_timecode,
         codecs,
         /* is_primary */ true,
     )?;
@@ -300,6 +306,7 @@ fn open_avi_inner(
                     &mut stream_names,
                     &mut stream_header_data,
                     &mut digitization_date,
+                    &mut smpte_timecode,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -443,6 +450,18 @@ fn open_avi_inner(
     // canonical format, so no normalisation is applied here.
     if let Some(ref idit) = digitization_date {
         metadata.push(("avi:idit".into(), idit.clone()));
+    }
+
+    // Round-112: surface the `ISMP` SMPTE-timecode string under
+    // `avi:ismp` when the `hdrl` carried a (non-empty) `ISMP` chunk.
+    // Like `avi:idit` the key is omitted entirely when no `ISMP` chunk
+    // was present so its absence is observable in the metadata Vec
+    // (mirroring the `avi:strn.<index>` / `avi:padding_granularity`
+    // conventions). The value is the trimmed text verbatim — the
+    // staged docs do not pin a canonical SMPTE-timecode format string,
+    // so no normalisation is applied here.
+    if let Some(ref ismp) = smpte_timecode {
+        metadata.push(("avi:ismp".into(), ismp.clone()));
     }
 
     // OpenDML 2.0 §5.0 vprp: surface signal-shape descriptors per
@@ -1111,6 +1130,7 @@ fn open_avi_inner(
         stream_names,
         stream_header_data,
         digitization_date,
+        smpte_timecode,
     })
 }
 
@@ -1139,6 +1159,7 @@ fn walk_riff_body(
     stream_names: &mut Vec<Option<String>>,
     stream_header_data: &mut Vec<Option<Vec<u8>>>,
     digitization_date: &mut Option<String>,
+    smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -1173,6 +1194,7 @@ fn walk_riff_body(
                         names,
                         strds,
                         idit,
+                        ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
@@ -1187,6 +1209,7 @@ fn walk_riff_body(
                     *stream_names = names;
                     *stream_header_data = strds;
                     *digitization_date = idit;
+                    *smpte_timecode = ismp;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -1409,6 +1432,7 @@ type HdrlOutput = (
     Vec<Option<String>>,
     Vec<Option<Vec<u8>>>,
     Option<String>,
+    Option<String>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -1437,6 +1461,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
+    let mut smpte_timecode: Option<String> = None;
 
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
@@ -1460,6 +1485,23 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
             b"IDIT" => {
                 let body = read_body_bounded(r, hdr.size)?;
                 digitization_date = parse_idit_body(&body);
+                skip_pad(r, hdr.size)?;
+            }
+            // Round-112: `ISMP` SMPTE-timecode chunk, the other direct
+            // child of `LIST hdrl` documented alongside `IDIT` in the
+            // RIFF *Hdrl Tags* namespace
+            // (`docs/container/riff/metadata/exiftool-riff-tags.html`
+            // §"RIFF Hdrl Tags": `'ISMP'` → `TimeCode`). The on-disk
+            // text format is writer-defined and not pinned by the
+            // staged docs (capture filters commonly emit the SMPTE
+            // "HH:MM:SS:FF" or "HH:MM:SS;FF" drop-frame form while
+            // other tools use a fractional "HH:MM:SS.ss"); the body is
+            // surfaced verbatim as a trimmed UTF-8-lossy string and
+            // left for the caller to interpret — the same conservative
+            // treatment `IDIT` and the per-stream `strn` chunks get.
+            b"ISMP" => {
+                let body = read_body_bounded(r, hdr.size)?;
+                smpte_timecode = parse_ismp_body(&body);
                 skip_pad(r, hdr.size)?;
             }
             b"avih" => {
@@ -1528,6 +1570,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_names,
         stream_header_data,
         digitization_date,
+        smpte_timecode,
     ))
 }
 
@@ -1551,6 +1594,37 @@ fn parse_idit_body(body: &[u8]) -> Option<String> {
     // Strip every trailing NUL and ASCII whitespace byte (space, tab,
     // CR, LF, form-feed, vertical-tab) — asctime-style writers append a
     // newline + NUL; the RIFF WORD-pad may add a further NUL.
+    let end = body
+        .iter()
+        .rposition(|&b| b != 0 && !b.is_ascii_whitespace())
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&body[..end]).into_owned())
+}
+
+/// Parse an `ISMP` chunk body into an owned SMPTE-timecode string
+/// (round-112).
+///
+/// `ISMP` is the sibling of [`parse_idit_body`]'s `IDIT` in the RIFF
+/// *Hdrl Tags* namespace: both are documented as direct children of
+/// `LIST hdrl` in
+/// `docs/container/riff/metadata/exiftool-riff-tags.html` §"RIFF Hdrl
+/// Tags" (`'ISMP'` → `TimeCode`). The staged docs do not pin a canonical
+/// byte format for the SMPTE timecode either — capture pipelines emit
+/// either the colon form (`"HH:MM:SS:FF"` non-drop-frame), the
+/// semicolon form (`"HH:MM:SS;FF"` drop-frame), or a fractional
+/// `"HH:MM:SS.ss"` — so this parser mirrors `parse_idit_body`'s
+/// conservative treatment: strip trailing NUL / ASCII-whitespace bytes
+/// (covering both writer-appended `'\n'` / NUL terminators and the
+/// RIFF WORD-pad NUL) and pass the remainder through
+/// `String::from_utf8_lossy` so legacy Latin-1 / CP1252 bytes don't
+/// fail the parse. An empty payload (`cb=0`) — or a body that is all
+/// NUL / whitespace — yields `None` so "no ISMP chunk" stays
+/// distinguishable from "an ISMP chunk with a non-empty timecode".
+fn parse_ismp_body(body: &[u8]) -> Option<String> {
     let end = body
         .iter()
         .rposition(|&b| b != 0 && !b.is_ascii_whitespace())
@@ -3054,6 +3128,17 @@ pub struct AviDemuxer {
     /// the typed [`AviDemuxer::digitization_date`] accessor in addition
     /// to the `avi:idit` metadata key.
     digitization_date: Option<String>,
+    /// SMPTE-timecode text from the optional `ISMP` chunk inside
+    /// `LIST hdrl` (round-112). `ISMP` is a member of the RIFF *Hdrl
+    /// Tags* namespace (`TimeCode`) per
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html`, sitting
+    /// directly beside `IDIT`. `None` when the file carried no `ISMP`
+    /// chunk (or only an empty / all-whitespace one). The string is the
+    /// chunk body with trailing NUL / whitespace stripped and decoded
+    /// UTF-8-lossy; the on-disk text format is writer-defined and not
+    /// normalised. Surfaced via the typed [`AviDemuxer::smpte_timecode`]
+    /// accessor in addition to the `avi:ismp` metadata key.
+    smpte_timecode: Option<String>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -4950,6 +5035,33 @@ impl AviDemuxer {
     /// [`crate::muxer::AviMuxOptions::with_digitization_date`].
     pub fn digitization_date(&self) -> Option<&str> {
         self.digitization_date.as_deref()
+    }
+
+    /// SMPTE-timecode string from the optional `ISMP` chunk inside
+    /// `LIST hdrl` (round-112).
+    ///
+    /// `ISMP` is a member of the RIFF *Hdrl Tags* namespace (`TimeCode`)
+    /// per `docs/container/riff/metadata/exiftool-riff-tags.html` §"RIFF
+    /// Hdrl Tags", sitting directly alongside the `IDIT`
+    /// digitization-date chunk. Capture hardware writes the SMPTE
+    /// timecode of the first frame here; the on-disk text format is
+    /// writer-defined and **not** pinned by the staged docs (the SMPTE
+    /// non-drop-frame `"HH:MM:SS:FF"` colon form is common, while
+    /// drop-frame writers use a `';'` before the frame field and some
+    /// tools emit a fractional `"HH:MM:SS.ss"`), so the returned string
+    /// is the chunk body verbatim with only trailing NUL /
+    /// ASCII-whitespace bytes stripped and decoded UTF-8-lossy. No
+    /// timecode parsing or normalisation is performed — the caller
+    /// decides how to interpret the value.
+    ///
+    /// Returns `None` when the file carried no `ISMP` chunk, or when the
+    /// chunk body was empty / all-NUL / all-whitespace (so a present-
+    /// but-empty chunk reads the same as an absent one). The same value
+    /// surfaces under the `avi:ismp` metadata key (also omitted when
+    /// absent), and round-trips a muxer-emitted timecode set via
+    /// [`crate::muxer::AviMuxOptions::with_smpte_timecode`].
+    pub fn smpte_timecode(&self) -> Option<&str> {
+        self.smpte_timecode.as_deref()
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).
