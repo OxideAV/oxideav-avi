@@ -344,6 +344,19 @@ pub struct AviMuxOptions {
     /// default) preserves pre-round-89 byte layout (no `strd` chunk
     /// emitted).
     pub stream_header_data: Vec<(u32, Vec<u8>)>,
+    /// Per-stream `strh.rcFrame` destination-rectangle overrides
+    /// (round-115). Each entry is `(stream_index, [left, top, right,
+    /// bottom])` and replaces the muxer's default `rcFrame` for that
+    /// stream in the 56-byte AVISTREAMHEADER per AVI 1.0
+    /// §"AVISTREAMHEADER". The default rect is `0,0,width,height` for
+    /// video streams and all-zero for non-video streams; an override lets
+    /// a caller place a text or video stream at an arbitrary sub-rectangle
+    /// inside the movie rectangle (`avih.dwWidth` × `dwHeight`) — e.g. a
+    /// picture-in-picture second video stream, or a subtitle overlay box.
+    /// Duplicate calls for the same stream index replace the prior entry —
+    /// see [`Self::with_stream_frame_rect`]. Empty list (the default)
+    /// preserves the pre-round-115 byte layout.
+    pub stream_frame_rects: Vec<(u32, [i16; 4])>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1023,6 +1036,39 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: override the `strh.rcFrame` destination rectangle
+    /// for `stream_index` (round-115). The four signed WORDs are written
+    /// little-endian in `[left, top, right, bottom]` order at byte offset
+    /// 48 of the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
+    ///
+    /// Per the spec the rect positions a text or video stream within the
+    /// movie rectangle (`avih.dwWidth` × `dwHeight`); units are pixels and
+    /// the origin is the movie rectangle's upper-left corner. Without an
+    /// override the muxer writes `0,0,width,height` for video streams and
+    /// all-zero for non-video streams; this builder lets a caller place a
+    /// picture-in-picture second video stream or a subtitle overlay box at
+    /// an arbitrary sub-rectangle.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_frame_rect`] for a round-trip;
+    /// note the demuxer maps an all-zero rect back to `None`, so an
+    /// override of `0,0,0,0` reads as "no rect" on re-demux.
+    pub fn with_stream_frame_rect(
+        mut self,
+        stream_index: u32,
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    ) -> Self {
+        self.stream_frame_rects
+            .retain(|(idx, _)| *idx != stream_index);
+        self.stream_frame_rects
+            .push((stream_index, [left, top, right, bottom]));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -1498,6 +1544,14 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, b)| b.as_slice());
+            // Round-115: optional `strh.rcFrame` override for this stream
+            // (see `with_stream_frame_rect`'s retain-then-push pattern).
+            let frame_rect_override = self
+                .options
+                .stream_frame_rects
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, r)| *r);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1509,6 +1563,7 @@ impl Muxer for AviMuxer {
                 indx_capacity,
                 stream_name,
                 stream_header_data,
+                frame_rect_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -2934,6 +2989,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     indx_capacity: usize,
     stream_name: Option<&str>,
     stream_header_data: Option<&[u8]>,
+    frame_rect_override: Option<[i16; 4]>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -2952,9 +3008,17 @@ fn write_strl<W: Write + Seek + ?Sized>(
     strh.extend_from_slice(&0u32.to_le_bytes()); // suggested_buffer_size (patched)
     strh.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // quality = -1 (default)
     strh.extend_from_slice(&t.entry.sample_size.to_le_bytes());
-    // rcFrame: left, top, right, bottom (i16 each). Use 0,0,width,height
-    // for video; zeros for audio.
-    if &t.entry.strh_type == b"vids" {
+    // rcFrame: left, top, right, bottom (i16 each) at byte offset 48 of
+    // the 56-byte AVISTREAMHEADER. A round-115
+    // `AviMuxOptions::with_stream_frame_rect` override (when present) wins
+    // for any stream type; otherwise the legacy default is
+    // `0,0,width,height` for video streams and all-zero for non-video.
+    if let Some([l, t_, r, b]) = frame_rect_override {
+        strh.extend_from_slice(&l.to_le_bytes());
+        strh.extend_from_slice(&t_.to_le_bytes());
+        strh.extend_from_slice(&r.to_le_bytes());
+        strh.extend_from_slice(&b.to_le_bytes());
+    } else if &t.entry.strh_type == b"vids" {
         let w_val = t.stream.params.width.unwrap_or(0) as i16;
         let h_val = t.stream.params.height.unwrap_or(0) as i16;
         strh.extend_from_slice(&0i16.to_le_bytes());

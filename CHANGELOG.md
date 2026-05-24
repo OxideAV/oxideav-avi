@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`strh.rcFrame` destination-rectangle parse + emit + round-trip
+  (round 115).** Surfaces the `rcFrame` field of the 56-byte
+  AVISTREAMHEADER — the last documented `strh` field, sitting at byte
+  offset 48 as four little-endian signed WORDs in
+  `[left, top, right, bottom]` order. Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md` §"AVISTREAMHEADER"
+  (`rcFrame` row): *"Destination rectangle for a text or video stream
+  within the movie rectangle specified by the dwWidth and dwHeight
+  members of the AVI main header structure … typically used in support
+  of multiple video streams … Units for this member are pixels. The
+  upper-left corner of the destination rectangle is relative to the
+  upper-left corner of the movie rectangle."* The muxer already wrote
+  `rcFrame` (the default `0,0,width,height` for video, all-zero for
+  non-video) but the demuxer dropped it, so a muxer-set rect was lost on
+  re-demux; this round closes that round-trip. Demuxer side: `build_stream`
+  now reads the four WORDs (when the strh is the full 56-byte form; the
+  accepted short 48-byte form carries no `rcFrame`) and the new
+  `AviDemuxer::stream_frame_rect(stream_index) -> Option<(i16, i16, i16,
+  i16)>` accessor surfaces it (same value under the
+  `avi:strh.<index>.frame_rect = "left,top,right,bottom"` metadata key).
+  The all-zero "whole movie rectangle" writer default maps to `None` so a
+  default / unspecified rect reads the same as an absent one (mirroring
+  the round-80 `strn` / round-107 `IDIT` "empty == absent" convention);
+  the metadata key is omitted entirely when absent so its non-presence is
+  observable. Muxer side: `AviMuxOptions::with_stream_frame_rect(stream_index,
+  left, top, right, bottom)` (last call per index wins) overrides the
+  default rect for any stream type — letting a caller place a
+  picture-in-picture second video stream or a subtitle overlay box at an
+  arbitrary sub-rectangle inside the movie rectangle. The override is
+  written verbatim, so a `0,0,0,0` override reads back as `None` on
+  re-demux. Ten new tests (`tests/round115_rcframe.rs`) cover a custom
+  video-rect round-trip (accessor + metadata key), the default
+  `0,0,width,height` video rect surfacing while the audio stream's
+  all-zero rect parses as `None`, an override on a non-video stream, an
+  explicit all-zero override reading as `None`, negative coordinates
+  surviving the i16 round-trip, builder dedup, a hand-rolled non-zero
+  `rcFrame` decode, a hand-rolled all-zero `rcFrame` parsing as `None`, a
+  hand-rolled short 48-byte strh (no `rcFrame` field) parsing as `None`,
+  and an out-of-range stream index returning `None`.
+
 - **`ISMP` SMPTE-timecode chunk parse + emit + round-trip (round
   112).** Implements the `ISMP` *Hdrl Tag* — the other direct child of
   `LIST hdrl` documented alongside `IDIT` in the RIFF *Hdrl Tags*

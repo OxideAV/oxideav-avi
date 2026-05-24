@@ -243,6 +243,14 @@ fn open_avi_inner(
     // codec-driver configuration bytes — the demuxer does not interpret
     // them.
     let mut stream_header_data: Vec<Option<Vec<u8>>> = Vec::new();
+    // Per-stream `strh.rcFrame` destination rectangle captured from the
+    // 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-115).
+    // Parallel to `streams`: `Some([left, top, right, bottom])` when the
+    // strh declared a non-zero rect, `None` when it was absent (48-byte
+    // header) or the all-zero "whole movie rectangle" writer default, so
+    // the accessor distinguishes "explicit sub-rectangle" from "default /
+    // unspecified".
+    let mut stream_frame_rects: Vec<Option<[i16; 4]>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -272,6 +280,7 @@ fn open_avi_inner(
         &mut audio_strfs,
         &mut stream_names,
         &mut stream_header_data,
+        &mut stream_frame_rects,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -305,6 +314,7 @@ fn open_avi_inner(
                     &mut audio_strfs,
                     &mut stream_names,
                     &mut stream_header_data,
+                    &mut stream_frame_rects,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -686,6 +696,23 @@ fn open_avi_inner(
     for (i, sh_opt) in stream_header_data.iter().enumerate() {
         if let Some(bytes) = sh_opt {
             metadata.push((format!("avi:strd.{i}.len"), bytes.len().to_string()));
+        }
+    }
+
+    // Round-115: AVI 1.0 §"AVISTREAMHEADER" `rcFrame` destination
+    // rectangle. Surfaced as `avi:strh.<index>.frame_rect =
+    // "left,top,right,bottom"` for every stream whose 56-byte strh
+    // declared a non-zero rect (the all-zero "whole movie rectangle"
+    // default is `None` in `stream_frame_rects` so the key is omitted —
+    // its absence stays observable, mirroring the `avi:strn` / `avi:strd`
+    // conventions). The raw four-WORD tuple is also reachable via the
+    // typed [`AviDemuxer::stream_frame_rect`] accessor.
+    for (i, rc_opt) in stream_frame_rects.iter().enumerate() {
+        if let Some([l, t, r, b]) = rc_opt {
+            metadata.push((
+                format!("avi:strh.{i}.frame_rect"),
+                format!("{l},{t},{r},{b}"),
+            ));
         }
     }
 
@@ -1129,6 +1156,7 @@ fn open_avi_inner(
         audio_strf: audio_strfs,
         stream_names,
         stream_header_data,
+        stream_frame_rects,
         digitization_date,
         smpte_timecode,
     })
@@ -1158,6 +1186,7 @@ fn walk_riff_body(
     audio_strfs: &mut Vec<Option<AudioStrfInfo>>,
     stream_names: &mut Vec<Option<String>>,
     stream_header_data: &mut Vec<Option<Vec<u8>>>,
+    stream_frame_rects: &mut Vec<Option<[i16; 4]>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1193,6 +1222,7 @@ fn walk_riff_body(
                         asfs,
                         names,
                         strds,
+                        rcframes,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1208,6 +1238,7 @@ fn walk_riff_body(
                     *audio_strfs = asfs;
                     *stream_names = names;
                     *stream_header_data = strds;
+                    *stream_frame_rects = rcframes;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1431,6 +1462,7 @@ type HdrlOutput = (
     Vec<Option<AudioStrfInfo>>,
     Vec<Option<String>>,
     Vec<Option<Vec<u8>>>,
+    Vec<Option<[i16; 4]>>,
     Option<String>,
     Option<String>,
 );
@@ -1458,6 +1490,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut audio_strfs: Vec<Option<AudioStrfInfo>> = Vec::new();
     let mut stream_names: Vec<Option<String>> = Vec::new();
     let mut stream_header_data: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut stream_frame_rects: Vec<Option<[i16; 4]>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1515,7 +1548,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx, vp, ai, vs, asi, name, strd_bytes) =
+                    let (si, suf, sx, vp, ai, vs, asi, name, strd_bytes, rc_frame) =
                         parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1527,6 +1560,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         audio_strfs.push(asi);
                         stream_names.push(name);
                         stream_header_data.push(strd_bytes);
+                        stream_frame_rects.push(rc_frame);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1569,6 +1603,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         audio_strfs,
         stream_names,
         stream_header_data,
+        stream_frame_rects,
         digitization_date,
         smpte_timecode,
     ))
@@ -1693,6 +1728,7 @@ type StrlOutput = (
     Option<AudioStrfInfo>,
     Option<String>,
     Option<Vec<u8>>,
+    Option<[i16; 4]>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -1807,6 +1843,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 strn_name,
                 strd_bytes,
+                None,
             ))
         }
     };
@@ -1822,6 +1859,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.4,
         strn_name,
         strd_bytes,
+        parsed.5,
     ))
 }
 
@@ -2283,19 +2321,23 @@ pub struct SuperIndexDurationViolation {
     pub dmlh_total_frames: u64,
 }
 
-/// 5-tuple returned by [`build_stream`]: the [`StreamInfo`], the
+/// 6-tuple returned by [`build_stream`]: the [`StreamInfo`], the
 /// 2-byte chunk suffix (`dc` / `db` / `wb` / `xx`), the
 /// audio-strh `(format_tag, sample_size)` pair (`Some` for audio
 /// streams only — round-14 C2), the video-strf BMIH side-info
-/// (`Some` for video streams only — round-19 C1+C2), and the
+/// (`Some` for video streams only — round-19 C1+C2), the
 /// audio-strf WAVEFORMATEX(TENSIBLE) side-info (`Some` for audio
-/// streams only — round-75 WAVEFORMATEXTENSIBLE landing).
+/// streams only — round-75 WAVEFORMATEXTENSIBLE landing), and the
+/// `strh.rcFrame` destination rectangle `[left, top, right, bottom]`
+/// (`Some` when non-zero — round-115; the all-zero default is mapped
+/// to `None` so an unspecified rect reads the same as an absent one).
 type BuildStreamOutput = (
     StreamInfo,
     [u8; 2],
     Option<AudioStrhInfo>,
     Option<VideoStrfInfo>,
     Option<AudioStrfInfo>,
+    Option<[i16; 4]>,
 );
 
 fn build_stream(
@@ -2330,6 +2372,35 @@ fn build_stream(
     let rate = u32::from_le_bytes([strh[24], strh[25], strh[26], strh[27]]).max(1);
     let length = u32::from_le_bytes([strh[32], strh[33], strh[34], strh[35]]);
     let sample_size = u32::from_le_bytes([strh[44], strh[45], strh[46], strh[47]]);
+
+    // `rcFrame` (round-115): the AVISTREAMHEADER destination rectangle at
+    // byte offset 48, four little-endian signed WORDs in
+    // `[left, top, right, bottom]` order. Per AVI 1.0 §"AVISTREAMHEADER"
+    // (docs/container/riff/avi-riff-file-reference.md, `rcFrame` row): the
+    // "destination rectangle for a text or video stream within the movie
+    // rectangle specified by the dwWidth and dwHeight members of the AVI
+    // main header structure … used in support of multiple video streams …
+    // Units for this member are pixels. The upper-left corner of the
+    // destination rectangle is relative to the upper-left corner of the
+    // movie rectangle." The full 56-byte header carries it; truncated
+    // 48-byte headers (the minimum we accept above) simply leave it absent.
+    // The canonical "whole movie rectangle" writer default is all-zero
+    // (0,0,0,0) — mapped to `None` here so an unspecified rect reads the
+    // same as an absent one, mirroring the round-80 `strn` / round-107
+    // `IDIT` "empty == absent" convention.
+    let rc_frame: Option<[i16; 4]> = if strh.len() >= 56 {
+        let left = i16::from_le_bytes([strh[48], strh[49]]);
+        let top = i16::from_le_bytes([strh[50], strh[51]]);
+        let right = i16::from_le_bytes([strh[52], strh[53]]);
+        let bottom = i16::from_le_bytes([strh[54], strh[55]]);
+        if left == 0 && top == 0 && right == 0 && bottom == 0 {
+            None
+        } else {
+            Some([left, top, right, bottom])
+        }
+    } else {
+        None
+    };
 
     let mut audio_info: Option<AudioStrhInfo> = None;
     let mut video_strf_info: Option<VideoStrfInfo> = None;
@@ -2551,7 +2622,14 @@ fn build_stream(
         start_time: Some(0),
         params,
     };
-    Ok((stream, suffix, audio_info, video_strf_info, audio_strf_info))
+    Ok((
+        stream,
+        suffix,
+        audio_info,
+        video_strf_info,
+        audio_strf_info,
+        rc_frame,
+    ))
 }
 
 /// Synthesise a placeholder `avi:<fourcc>` codec_id when the resolver
@@ -3117,6 +3195,18 @@ pub struct AviDemuxer {
     /// accessor in addition to the `avi:strd.<index>.len` metadata
     /// key (length only, not the raw driver bytes).
     stream_header_data: Vec<Option<Vec<u8>>>,
+    /// Per-stream `strh.rcFrame` destination rectangle from the 56-byte
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-115). Indexed
+    /// by stream number; `Some([left, top, right, bottom])` when the strh
+    /// declared a non-zero rect, `None` when the header was the short
+    /// 48-byte form (no `rcFrame`) or carried the all-zero "whole movie
+    /// rectangle" writer default. The rect positions a text or video
+    /// stream within the movie rectangle (`avih.dwWidth` × `dwHeight`);
+    /// units are pixels and the origin is the movie rectangle's upper-left
+    /// corner. Surfaced via the typed [`AviDemuxer::stream_frame_rect`]
+    /// accessor in addition to the `avi:strh.<index>.frame_rect` metadata
+    /// key (`"left,top,right,bottom"`).
+    stream_frame_rects: Vec<Option<[i16; 4]>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -5009,6 +5099,36 @@ impl AviDemuxer {
         self.stream_header_data
             .get(stream_index as usize)
             .and_then(|h| h.as_deref())
+    }
+
+    /// `strh.rcFrame` destination rectangle for a stream, as the tuple
+    /// `(left, top, right, bottom)` (round-115).
+    ///
+    /// Per AVI 1.0 §"AVISTREAMHEADER" (`rcFrame` field in
+    /// `docs/container/riff/avi-riff-file-reference.md`): "Destination
+    /// rectangle for a text or video stream within the movie rectangle
+    /// specified by the dwWidth and dwHeight members of the AVI main
+    /// header structure. The `rcFrame` member is typically used in support
+    /// of multiple video streams. … Units for this member are pixels. The
+    /// upper-left corner of the destination rectangle is relative to the
+    /// upper-left corner of the movie rectangle." The four values are
+    /// signed WORDs read little-endian in `[left, top, right, bottom]`
+    /// order off byte offset 48 of the 56-byte AVISTREAMHEADER.
+    ///
+    /// Returns `None` when the stream's strh was the short 48-byte form
+    /// (no `rcFrame`), when the rect was the all-zero "whole movie
+    /// rectangle" writer default (so a default rect reads the same as an
+    /// absent one — mirroring the `strn` / `IDIT` "empty == absent"
+    /// convention), or for an out-of-range stream index. The same value
+    /// surfaces as the `avi:strh.<index>.frame_rect` metadata key
+    /// (`"left,top,right,bottom"`; also omitted when absent), and
+    /// round-trips a muxer-emitted rect set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_frame_rect`].
+    pub fn stream_frame_rect(&self, stream_index: u32) -> Option<(i16, i16, i16, i16)> {
+        self.stream_frame_rects
+            .get(stream_index as usize)
+            .and_then(|r| r.as_ref())
+            .map(|&[l, t, r, b]| (l, t, r, b))
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside
