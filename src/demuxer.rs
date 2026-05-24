@@ -251,6 +251,15 @@ fn open_avi_inner(
     // the accessor distinguishes "explicit sub-rectangle" from "default /
     // unspecified".
     let mut stream_frame_rects: Vec<Option<[i16; 4]>> = Vec::new();
+    // Round-119: per-stream `strh.wLanguage` LANGID captured from byte
+    // offset 14 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
+    // Parallel to `streams`: `Some(langid)` when the strh declared a
+    // non-zero language tag, `None` when it carried the `0`
+    // ("LANG_NEUTRAL / SUBLANG_NEUTRAL", the writer-skips-it default)
+    // so the accessor distinguishes "explicit language tag" from
+    // "unspecified / absent" — mirroring the round-115 `rcFrame` and
+    // round-80 `strn` convention.
+    let mut stream_languages: Vec<Option<u16>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -281,6 +290,7 @@ fn open_avi_inner(
         &mut stream_names,
         &mut stream_header_data,
         &mut stream_frame_rects,
+        &mut stream_languages,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -315,6 +325,7 @@ fn open_avi_inner(
                     &mut stream_names,
                     &mut stream_header_data,
                     &mut stream_frame_rects,
+                    &mut stream_languages,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -713,6 +724,24 @@ fn open_avi_inner(
                 format!("avi:strh.{i}.frame_rect"),
                 format!("{l},{t},{r},{b}"),
             ));
+        }
+    }
+
+    // Round-119: AVI 1.0 §"AVISTREAMHEADER" `wLanguage` field. Surfaced
+    // as `avi:strh.<index>.language = "<u16>"` for every stream whose
+    // strh declared a non-zero LANGID. The `0`
+    // ("LANG_NEUTRAL / SUBLANG_NEUTRAL") writer default is `None` in
+    // `stream_languages` so the key is omitted — its absence stays
+    // observable, mirroring the `avi:strn` / `avi:strh.<n>.frame_rect`
+    // conventions. The raw 16-bit value is also reachable via the typed
+    // [`AviDemuxer::stream_language`] accessor; the staged docs do not
+    // pin a registry (Microsoft conventions decode it as a LANGID
+    // `(LANG_PRIMARY, SUBLANG)` pair, but non-MS writers may pack
+    // different values), so callers interpret the integer per their
+    // workflow rather than the demuxer normalising it.
+    for (i, lang_opt) in stream_languages.iter().enumerate() {
+        if let Some(lang) = lang_opt {
+            metadata.push((format!("avi:strh.{i}.language"), lang.to_string()));
         }
     }
 
@@ -1157,6 +1186,7 @@ fn open_avi_inner(
         stream_names,
         stream_header_data,
         stream_frame_rects,
+        stream_languages,
         digitization_date,
         smpte_timecode,
     })
@@ -1187,6 +1217,7 @@ fn walk_riff_body(
     stream_names: &mut Vec<Option<String>>,
     stream_header_data: &mut Vec<Option<Vec<u8>>>,
     stream_frame_rects: &mut Vec<Option<[i16; 4]>>,
+    stream_languages: &mut Vec<Option<u16>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1223,6 +1254,7 @@ fn walk_riff_body(
                         names,
                         strds,
                         rcframes,
+                        langs,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1239,6 +1271,7 @@ fn walk_riff_body(
                     *stream_names = names;
                     *stream_header_data = strds;
                     *stream_frame_rects = rcframes;
+                    *stream_languages = langs;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1463,6 +1496,7 @@ type HdrlOutput = (
     Vec<Option<String>>,
     Vec<Option<Vec<u8>>>,
     Vec<Option<[i16; 4]>>,
+    Vec<Option<u16>>,
     Option<String>,
     Option<String>,
 );
@@ -1491,6 +1525,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut stream_names: Vec<Option<String>> = Vec::new();
     let mut stream_header_data: Vec<Option<Vec<u8>>> = Vec::new();
     let mut stream_frame_rects: Vec<Option<[i16; 4]>> = Vec::new();
+    let mut stream_languages: Vec<Option<u16>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1548,7 +1583,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx, vp, ai, vs, asi, name, strd_bytes, rc_frame) =
+                    let (si, suf, sx, vp, ai, vs, asi, name, strd_bytes, rc_frame, lang) =
                         parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1561,6 +1596,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_names.push(name);
                         stream_header_data.push(strd_bytes);
                         stream_frame_rects.push(rc_frame);
+                        stream_languages.push(lang);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1604,6 +1640,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_names,
         stream_header_data,
         stream_frame_rects,
+        stream_languages,
         digitization_date,
         smpte_timecode,
     ))
@@ -1729,6 +1766,7 @@ type StrlOutput = (
     Option<String>,
     Option<Vec<u8>>,
     Option<[i16; 4]>,
+    Option<u16>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -1844,6 +1882,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 strn_name,
                 strd_bytes,
                 None,
+                None,
             ))
         }
     };
@@ -1860,6 +1899,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         strn_name,
         strd_bytes,
         parsed.5,
+        parsed.6,
     ))
 }
 
@@ -2327,10 +2367,13 @@ pub struct SuperIndexDurationViolation {
 /// streams only — round-14 C2), the video-strf BMIH side-info
 /// (`Some` for video streams only — round-19 C1+C2), the
 /// audio-strf WAVEFORMATEX(TENSIBLE) side-info (`Some` for audio
-/// streams only — round-75 WAVEFORMATEXTENSIBLE landing), and the
+/// streams only — round-75 WAVEFORMATEXTENSIBLE landing), the
 /// `strh.rcFrame` destination rectangle `[left, top, right, bottom]`
 /// (`Some` when non-zero — round-115; the all-zero default is mapped
-/// to `None` so an unspecified rect reads the same as an absent one).
+/// to `None` so an unspecified rect reads the same as an absent one),
+/// and the `strh.wLanguage` LANGID (`Some` when non-zero — round-119;
+/// `0` is the documented "unspecified" sentinel and surfaces as `None`
+/// so the absence stays observable).
 type BuildStreamOutput = (
     StreamInfo,
     [u8; 2],
@@ -2338,6 +2381,7 @@ type BuildStreamOutput = (
     Option<VideoStrfInfo>,
     Option<AudioStrfInfo>,
     Option<[i16; 4]>,
+    Option<u16>,
 );
 
 fn build_stream(
@@ -2372,6 +2416,25 @@ fn build_stream(
     let rate = u32::from_le_bytes([strh[24], strh[25], strh[26], strh[27]]).max(1);
     let length = u32::from_le_bytes([strh[32], strh[33], strh[34], strh[35]]);
     let sample_size = u32::from_le_bytes([strh[44], strh[45], strh[46], strh[47]]);
+
+    // `wLanguage` (round-119): a 16-bit LANGID at byte offset 14 of the
+    // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    // (docs/container/riff/avi-riff-file-reference.md, `wLanguage` row):
+    // *"Language tag (BCP 47 / RFC 1766 / similar; AVI does not normatively
+    // pin a registry)."* Microsoft conventions populate this with a
+    // Win32 LANGID — `LANG_PRIMARY << 0 | SUBLANG << 10` — while non-MS
+    // writers may pack different values; the demuxer surfaces the raw
+    // 16-bit DWORD verbatim and leaves interpretation to the caller. The
+    // `0` ("LANG_NEUTRAL / SUBLANG_NEUTRAL", the default writer-skips-it
+    // value) is mapped to `None` so an unspecified language reads the
+    // same as an absent one — mirroring the round-115 `rcFrame` and
+    // round-80 `strn` "default == absent" convention.
+    let language_raw = u16::from_le_bytes([strh[14], strh[15]]);
+    let language: Option<u16> = if language_raw == 0 {
+        None
+    } else {
+        Some(language_raw)
+    };
 
     // `rcFrame` (round-115): the AVISTREAMHEADER destination rectangle at
     // byte offset 48, four little-endian signed WORDs in
@@ -2629,6 +2692,7 @@ fn build_stream(
         video_strf_info,
         audio_strf_info,
         rc_frame,
+        language,
     ))
 }
 
@@ -3207,6 +3271,21 @@ pub struct AviDemuxer {
     /// accessor in addition to the `avi:strh.<index>.frame_rect` metadata
     /// key (`"left,top,right,bottom"`).
     stream_frame_rects: Vec<Option<[i16; 4]>>,
+    /// Per-stream `strh.wLanguage` LANGID from byte offset 14 of the
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-119).
+    /// Indexed by stream number; `Some(langid)` when the strh declared a
+    /// non-zero language tag, `None` when it carried the `0`
+    /// ("LANG_NEUTRAL / SUBLANG_NEUTRAL", the writer-skips-it default)
+    /// so an unspecified language reads the same as an absent one. The
+    /// staged docs (`docs/container/riff/avi-riff-file-reference.md`,
+    /// `wLanguage` row in AVISTREAMHEADER) note that AVI does **not**
+    /// normatively pin a registry; Microsoft writers populate the field
+    /// with a Win32 LANGID while other writers may pack different values
+    /// — the demuxer surfaces the raw 16-bit DWORD verbatim and leaves
+    /// interpretation to the caller. Surfaced via the typed
+    /// [`AviDemuxer::stream_language`] accessor in addition to the
+    /// `avi:strh.<index>.language` metadata key.
+    stream_languages: Vec<Option<u16>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -5129,6 +5208,36 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .and_then(|r| r.as_ref())
             .map(|&[l, t, r, b]| (l, t, r, b))
+    }
+
+    /// `strh.wLanguage` LANGID for a stream, as the raw 16-bit value
+    /// read little-endian off byte offset 14 of the AVISTREAMHEADER
+    /// (round-119).
+    ///
+    /// Per AVI 1.0 §"AVISTREAMHEADER" (`wLanguage` field in
+    /// `docs/container/riff/avi-riff-file-reference.md`): "Language
+    /// tag (BCP 47 / RFC 1766 / similar; AVI does not normatively pin
+    /// a registry)." Microsoft writers populate the field with a
+    /// Win32 LANGID — the low 10 bits a `LANG_*` primary language id
+    /// and the upper 6 bits a `SUBLANG_*` dialect id — while other
+    /// writers may pack different values. The demuxer surfaces the
+    /// raw 16-bit DWORD verbatim and leaves interpretation to the
+    /// caller; no LANGID decoding or BCP-47 normalisation is
+    /// performed.
+    ///
+    /// Returns `None` when the strh carried the `0`
+    /// ("LANG_NEUTRAL / SUBLANG_NEUTRAL", the writer-skips-it
+    /// default) so an unspecified language reads the same as an
+    /// absent one (mirroring the `strn` / `IDIT` / `rcFrame`
+    /// "default == absent" convention), or for an out-of-range stream
+    /// index. The same value surfaces as the
+    /// `avi:strh.<index>.language` metadata key (also omitted when
+    /// absent), and round-trips a muxer-emitted LANGID set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_language`].
+    pub fn stream_language(&self, stream_index: u32) -> Option<u16> {
+        self.stream_languages
+            .get(stream_index as usize)
+            .and_then(|l| *l)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside

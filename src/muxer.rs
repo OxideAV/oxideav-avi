@@ -357,6 +357,26 @@ pub struct AviMuxOptions {
     /// see [`Self::with_stream_frame_rect`]. Empty list (the default)
     /// preserves the pre-round-115 byte layout.
     pub stream_frame_rects: Vec<(u32, [i16; 4])>,
+    /// Per-stream `strh.wLanguage` LANGID overrides (round-119). Each
+    /// entry is `(stream_index, langid)` and stamps the given 16-bit
+    /// value into byte offset 14 of that stream's 56-byte
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`wLanguage` row
+    /// in `docs/container/riff/avi-riff-file-reference.md`: *"Language
+    /// tag (BCP 47 / RFC 1766 / similar; AVI does not normatively pin
+    /// a registry)."*). Without an override the muxer writes `0`
+    /// ("LANG_NEUTRAL / SUBLANG_NEUTRAL", the writer-skips-it default
+    /// that the demuxer maps back to `None`); this builder lets a
+    /// caller stamp a non-zero LANGID — Microsoft writers conventionally
+    /// pack a Win32 LANGID (low 10 bits = `LANG_*` primary, upper 6
+    /// bits = `SUBLANG_*` dialect; e.g. `0x0409` = `LANG_ENGLISH /
+    /// SUBLANG_ENGLISH_US`, `0x0411` = `LANG_JAPANESE /
+    /// SUBLANG_DEFAULT`), but the muxer writes whatever 16-bit value
+    /// the caller supplies verbatim and does not validate against any
+    /// registry. Duplicate calls for the same stream index replace the
+    /// prior entry — see [`Self::with_stream_language`]. Empty list
+    /// (the default) preserves the pre-round-119 byte layout
+    /// (`wLanguage = 0`).
+    pub stream_languages: Vec<(u32, u16)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1069,6 +1089,31 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp a `wLanguage` LANGID into the 56-byte
+    /// AVISTREAMHEADER for `stream_index` (round-119). The 16-bit value
+    /// is written little-endian at byte offset 14 of the strh per AVI
+    /// 1.0 §"AVISTREAMHEADER" (`wLanguage` row).
+    ///
+    /// Per the spec the field is a language tag (BCP 47 / RFC 1766 /
+    /// similar) but the staged docs note that AVI does **not**
+    /// normatively pin a registry. Microsoft writers conventionally
+    /// pack a Win32 LANGID; the muxer writes whatever 16-bit value the
+    /// caller supplies verbatim and does not validate against any
+    /// registry. Passing `0` is equivalent to omitting the override —
+    /// the demuxer maps the all-zero default back to `None` so a stamp
+    /// of `0` reads as "no language tag" on re-demux.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_language`] for a round-trip
+    /// of any non-zero LANGID.
+    pub fn with_stream_language(mut self, stream_index: u32, langid: u16) -> Self {
+        self.stream_languages
+            .retain(|(idx, _)| *idx != stream_index);
+        self.stream_languages.push((stream_index, langid));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -1552,6 +1597,17 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, r)| *r);
+            // Round-119: optional `strh.wLanguage` LANGID override for
+            // this stream (see `with_stream_language`'s retain-then-push
+            // pattern). `None` keeps the legacy `0`
+            // ("LANG_NEUTRAL / SUBLANG_NEUTRAL") default the demuxer
+            // maps back to `None`.
+            let language_override = self
+                .options
+                .stream_languages
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, l)| *l);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1564,6 +1620,7 @@ impl Muxer for AviMuxer {
                 stream_name,
                 stream_header_data,
                 frame_rect_override,
+                language_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -2990,6 +3047,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     stream_name: Option<&str>,
     stream_header_data: Option<&[u8]>,
     frame_rect_override: Option<[i16; 4]>,
+    language_override: Option<u16>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -2999,7 +3057,15 @@ fn write_strl<W: Write + Seek + ?Sized>(
     strh.extend_from_slice(&t.entry.handler_fourcc); // fccHandler
     strh.extend_from_slice(&0u32.to_le_bytes()); // flags
     strh.extend_from_slice(&0u16.to_le_bytes()); // priority
-    strh.extend_from_slice(&0u16.to_le_bytes()); // language
+
+    // wLanguage (round-119): an `AviMuxOptions::with_stream_language`
+    // override (when present) stamps the LANGID at byte offset 14 per
+    // AVI 1.0 §"AVISTREAMHEADER"; otherwise the legacy default is `0`
+    // ("LANG_NEUTRAL / SUBLANG_NEUTRAL", which the demuxer maps back
+    // to `None`). The 16-bit value is written verbatim; no registry
+    // validation.
+    strh.extend_from_slice(&language_override.unwrap_or(0).to_le_bytes());
+
     strh.extend_from_slice(&0u32.to_le_bytes()); // initial_frames
     strh.extend_from_slice(&t.entry.scale.to_le_bytes());
     strh.extend_from_slice(&t.entry.rate.to_le_bytes());
