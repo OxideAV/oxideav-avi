@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-avi/compare/v0.0.6...v0.0.7) - 2026-05-24
+
+### Other
+
+- make round104 vprp temp-file names collision-proof
+- strh.rcFrame destination rectangle parse + emit (round 115)
+- ISMP SMPTE-timecode chunk parse + emit (round 112)
+- IDIT digitization-date chunk parse + emit (round 107)
+- typed frame-aspect-ratio accessor (round 104)
+- OpenDML super-index dwDuration accessor + dmlh cross-check
+- CBR-audio ix## standard-index block-alignment validator
+- avih.dwPaddingGranularity + JUNK-aligned packet emission
+- per-stream `strd` codec-driver data chunk (AVI 1.0)
+- per-stream `strn` name chunk (AVI 1.0 §"AVI Stream Headers")
+- WAVEFORMATEXTENSIBLE (wFormatTag 0xFFFE) demux + mux
+- top-down DIB round-trip + BI_BITFIELDS color-mask exposure
+
 ### Added
 
 - **`strh.rcFrame` destination-rectangle parse + emit + round-trip
