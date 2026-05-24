@@ -62,8 +62,18 @@ fn synthesize_payload(seed: u32, base_len: usize) -> Vec<u8> {
 /// Write a one-video-stream OpenDML AVI with the supplied mux options,
 /// returning the raw file bytes.
 fn write_opendml(stream: &StreamInfo, opts: AviMuxOptions) -> Vec<u8> {
+    // A per-process atomic counter guarantees a unique temp path even when
+    // two tests run concurrently and land on the same wall-clock
+    // nanosecond — without it, parallel tests collided on the timestamp
+    // and one read another's (or a freshly-removed) file, surfacing as
+    // intermittent `open().unwrap()` panics / wrong-aspect assertions on
+    // higher-core CI runners.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!(
-        "oxideav-avi-r104-{}.avi",
+        "oxideav-avi-r104-{}-{}-{}.avi",
+        std::process::id(),
+        seq,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
