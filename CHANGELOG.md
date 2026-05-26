@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **File-global `avih.dwInitialFrames` parse + emit + round-trip
+  (round 157).** Surfaces the `dwInitialFrames` interleave-skew field
+  at byte offset 16 of the 56-byte AVIMAINHEADER body (byte 24 of the
+  `avih` chunk). Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md` Appendix A
+  (`dwInitialFrames` row, line 200): *"Initial frame for interleaved
+  files. Noninterleaved files should specify zero. If creating
+  interleaved files, specify the number of frames in the file prior to
+  the initial frame of the AVI sequence."* The muxer already wrote `0`
+  here since round 3; this round adds the typed
+  `AviDemuxer::initial_frames() -> Option<u32>` accessor (mapping the
+  `0` "noninterleaved file" sentinel to `None` so an unspecified skew
+  reads the same as an absent one, mirroring the round-153 per-stream
+  `strh.dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame`
+  / round-80 `strn` "default == absent" convention), the
+  `avi:initial_frames` metadata key (omitted entirely when the value
+  is `0`, like `avi:padding_granularity`), and the
+  `AviMuxOptions::with_initial_frames(n)` builder that stamps any
+  32-bit value verbatim at body offset 16. The new field is the
+  file-global counterpart of the per-stream `strh.dwInitialFrames`
+  (round 153); the two DWORDs are independent per spec and round-trip
+  without bleeding into each other. Covered by 8 new tests in
+  `tests/round157_avih_initial_frames.rs`: mux→demux round-trip,
+  default-baseline (zero == absent), builder idempotency,
+  explicit-zero override, all-ones round-trip, file-global vs
+  per-stream independence (3 sub-scenarios), and hand-rolled fixtures
+  (non-zero + all-zero) controlling the exact `avih` bytes at offset
+  16.
 - **Per-stream `strh.dwInitialFrames` parse + emit + round-trip
   (round 153).** Surfaces the `dwInitialFrames` interleave-skew field at
   byte offset 16 of the 56-byte AVISTREAMHEADER. Clean-room source:

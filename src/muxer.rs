@@ -443,6 +443,32 @@ pub struct AviMuxOptions {
     /// are not pre-aligned — they're outside the per-frame stream
     /// budget and players don't seek to them via the index.
     pub padding_granularity: Option<u32>,
+    /// Optional `avih.dwInitialFrames` override (round-157). `None`
+    /// (the default) keeps the legacy `0` value the muxer has
+    /// emitted since round-3, which AVI 1.0 §"AVIMAINHEADER" line
+    /// 200 documents as the "noninterleaved file" sentinel:
+    /// *"Initial frame for interleaved files. Noninterleaved files
+    /// should specify zero. If creating interleaved files, specify
+    /// the number of frames in the file prior to the initial frame
+    /// of the AVI sequence."* `Some(n)` stamps `n` verbatim into the
+    /// 32-bit DWORD at byte offset 16 of the 56-byte AVIMAINHEADER
+    /// body (i.e. byte 24 of the `avih` chunk).
+    ///
+    /// File-global counterpart of the per-stream
+    /// [`Self::stream_initial_frames`] override (round-153, at byte
+    /// offset 16 of each AVISTREAMHEADER). The two fields are
+    /// independent — Microsoft writers typically stamp the
+    /// per-stream value with the leading-frame count and leave the
+    /// file-global one at `0`, but the spec allows either to carry
+    /// the skew so the muxer exposes both. The muxer writes whatever
+    /// 32-bit value the caller supplies verbatim and performs no
+    /// validation against any per-stream `dwLength` / `dwRate`.
+    ///
+    /// Pairs with the round-157 demuxer accessor
+    /// [`crate::demuxer::AviDemuxer::initial_frames`] (and the
+    /// `avi:initial_frames` metadata key) for a builder→writer→
+    /// demuxer round-trip. Use [`Self::with_initial_frames`].
+    pub initial_frames: Option<u32>,
     /// Digitization-date text emitted as an `IDIT` chunk inside
     /// `LIST hdrl` (round-107).
     ///
@@ -1187,6 +1213,30 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp the file-global `avih.dwInitialFrames`
+    /// interleave skew (round-157). See [`Self::initial_frames`] for
+    /// semantics. The muxer writes `n` verbatim into the 32-bit
+    /// DWORD at byte offset 16 of the 56-byte AVIMAINHEADER body
+    /// (byte 24 of the `avih` chunk).
+    ///
+    /// Per AVI 1.0 §"AVIMAINHEADER" (line 200,
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A):
+    /// *"Initial frame for interleaved files. Noninterleaved files
+    /// should specify zero. If creating interleaved files, specify
+    /// the number of frames in the file prior to the initial frame
+    /// of the AVI sequence."* Passing `0` is equivalent to omitting
+    /// the override — the demuxer maps the all-zero default back to
+    /// `None` so a stamp of `0` reads as "no skew" on re-demux.
+    ///
+    /// File-global counterpart of the per-stream
+    /// [`Self::with_stream_initial_frames`] (round-153). Pairs with
+    /// [`crate::demuxer::AviDemuxer::initial_frames`] for a
+    /// round-trip of any non-zero skew.
+    pub fn with_initial_frames(mut self, n: u32) -> Self {
+        self.initial_frames = Some(n);
+        self
+    }
+
     /// Builder helper: stamp a digitization-date `IDIT` chunk into
     /// `LIST hdrl` (round-107). See [`Self::digitization_date`] for
     /// placement and byte-layout semantics.
@@ -1601,6 +1651,7 @@ impl Muxer for AviMuxer {
             &self.tracks,
             self.options.avih_flags_override,
             self.options.padding_granularity,
+            self.options.initial_frames,
         );
         write_chunk(self.output.as_mut(), b"avih", &avih)?;
         // For OpenDML, embed the super-index in the FIRST stream's strl
@@ -3048,10 +3099,16 @@ pub const DEFAULT_AVIH_FLAGS: u32 = 0x0000_0810;
 /// from `AviMuxOptions::padding_granularity` (None → 0, the legacy
 /// "no alignment guarantee" sentinel; Some(n) → n, matching the JUNK
 /// chunk alignment the muxer also emits in `movi`).
+///
+/// Round-157: `initial_frames` stamps `avih.dwInitialFrames`
+/// (byte offset 16 of the body) from `AviMuxOptions::initial_frames`
+/// (None → 0, the legacy "noninterleaved file" sentinel per AVI 1.0
+/// §"AVIMAINHEADER" line 200; Some(n) → n verbatim).
 fn build_avih(
     tracks: &[TrackState],
     flags_override: Option<u32>,
     padding_granularity: Option<u32>,
+    initial_frames: Option<u32>,
 ) -> Vec<u8> {
     let (video_micro_per_frame, width, height) = tracks
         .iter()
@@ -3080,7 +3137,13 @@ fn build_avih(
     body.extend_from_slice(&padding_granularity.unwrap_or(0).to_le_bytes()); // PaddingGranularity
     body.extend_from_slice(&flags.to_le_bytes());
     body.extend_from_slice(&total_frames.to_le_bytes());
-    body.extend_from_slice(&0u32.to_le_bytes()); // InitialFrames
+    // Round-157: `dwInitialFrames` (body offset 16). The pre-round-157
+    // default was hard-coded `0` ("noninterleaved file" per AVI 1.0
+    // §"AVIMAINHEADER" line 200, which the demuxer maps back to
+    // `None`). `AviMuxOptions::with_initial_frames(n)` lets a caller
+    // stamp a non-zero file-global skew here without disturbing the
+    // per-stream `strh.dwInitialFrames` field (round-153).
+    body.extend_from_slice(&initial_frames.unwrap_or(0).to_le_bytes()); // InitialFrames
     body.extend_from_slice(&streams.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // SuggestedBufferSize
     body.extend_from_slice(&width.to_le_bytes());

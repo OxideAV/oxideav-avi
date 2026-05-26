@@ -458,6 +458,18 @@ fn open_avi_inner(
                 h.padding_granularity.to_string(),
             ));
         }
+        // Round-157: surface the file-global `avih.dwInitialFrames` so a
+        // downstream tool can detect an interleaved-file leading-frame
+        // skew without re-parsing the AVIMAINHEADER. The `0` writer
+        // default ("noninterleaved file" per AVI 1.0 §"AVIMAINHEADER"
+        // line 200: *"Noninterleaved files should specify zero"*) is
+        // omitted from the metadata Vec so the key is observable only
+        // when the muxer actually opted in, mirroring the
+        // `avi:padding_granularity` / `avi:strh.<n>.initial_frames`
+        // conventions.
+        if h.initial_frames > 0 {
+            metadata.push(("avi:initial_frames".into(), h.initial_frames.to_string()));
+        }
     }
     // Truncated-head signal: capture-card crash dumps, copy-aborted
     // recordings. The demuxer is best-effort for this case (see
@@ -1215,6 +1227,7 @@ fn open_avi_inner(
         avih_flags: avih.as_ref().map(|h| h.flags).unwrap_or(0),
         avih_suggested_buffer_size: avih.as_ref().map(|h| h.suggested_buffer_size).unwrap_or(0),
         avih_padding_granularity: avih.as_ref().map(|h| h.padding_granularity).unwrap_or(0),
+        avih_initial_frames: avih.as_ref().map(|h| h.initial_frames).unwrap_or(0),
         vprps,
         dmlh_total_frames,
         palette_change_data,
@@ -1475,7 +1488,16 @@ struct AviMainHeader {
     max_bytes_per_sec: u32,
     flags: u32,
     total_frames: u32,
-    #[allow(dead_code)]
+    /// `dwInitialFrames` per AVI 1.0 §"AVIMAINHEADER" (offset 16 of
+    /// the body, i.e. byte 20 of the chunk including the 4-byte cb).
+    /// Round-157: the file-global counterpart of the per-stream
+    /// [`crate::demuxer::AviDemuxer::stream_initial_frames`] DWORD
+    /// (round-153). The spec: *"Initial frame for interleaved files.
+    /// Noninterleaved files should specify zero. If creating
+    /// interleaved files, specify the number of frames in the file
+    /// prior to the initial frame of the AVI sequence."* Captured
+    /// here so [`AviDemuxer::initial_frames`] can surface it without
+    /// re-parsing the file.
     initial_frames: u32,
     streams: u32,
     suggested_buffer_size: u32,
@@ -3274,6 +3296,19 @@ pub struct AviDemuxer {
     /// leave this 0. Surfaced via [`AviDemuxer::padding_granularity`]
     /// and the `avi:padding_granularity` metadata key.
     avih_padding_granularity: u32,
+    /// Raw `dwInitialFrames` from `AVIMAINHEADER` (round-157). The
+    /// file-global counterpart of the per-stream
+    /// [`Self::stream_initial_frames`] DWORD (round-153). Per AVI 1.0
+    /// §"AVIMAINHEADER" (line 200): *"Initial frame for interleaved
+    /// files. Noninterleaved files should specify zero. If creating
+    /// interleaved files, specify the number of frames in the file
+    /// prior to the initial frame of the AVI sequence."* `0` is the
+    /// documented "noninterleaved / unspecified" sentinel, mapped to
+    /// `None` by [`AviDemuxer::initial_frames`] so an unspecified
+    /// skew reads the same as an absent one (mirroring the per-stream
+    /// round-153 / round-119 / round-115 / round-80 "default ==
+    /// absent" convention).
+    avih_initial_frames: u32,
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -4837,6 +4872,40 @@ impl AviDemuxer {
     /// of the key is observable).
     pub fn padding_granularity(&self) -> u32 {
         self.avih_padding_granularity
+    }
+
+    /// `AVIMAINHEADER.dwInitialFrames` per AVI 1.0 §"AVIMAINHEADER"
+    /// (round-157).
+    ///
+    /// Returns the file-global interleave-skew DWORD from byte
+    /// offset 16 of the 56-byte AVIMAINHEADER body, or `None` when
+    /// the file declared the documented "noninterleaved file"
+    /// sentinel (`dwInitialFrames == 0`). Per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A:
+    /// *"Initial frame for interleaved files. Noninterleaved files
+    /// should specify zero. If creating interleaved files, specify
+    /// the number of frames in the file prior to the initial frame
+    /// of the AVI sequence."*
+    ///
+    /// This is the file-global counterpart of the per-stream
+    /// [`Self::stream_initial_frames`] DWORD (round-153, at byte
+    /// offset 16 of each AVISTREAMHEADER). The two fields are
+    /// independent — Microsoft writers typically stamp the
+    /// per-stream value with the leading-frame count and leave the
+    /// file-global one at `0`, but the spec allows either to carry
+    /// the skew and the demuxer surfaces both verbatim.
+    ///
+    /// Round-trips byte-equal with
+    /// [`crate::muxer::AviMuxOptions::with_initial_frames`]. Same
+    /// data also surfaces under the `avi:initial_frames` metadata
+    /// key (omitted entirely when the value is 0 so absence of the
+    /// key is observable).
+    pub fn initial_frames(&self) -> Option<u32> {
+        if self.avih_initial_frames == 0 {
+            None
+        } else {
+            Some(self.avih_initial_frames)
+        }
     }
 
     /// Per-packet idx1 flags accessor (round-6 candidate 1).
