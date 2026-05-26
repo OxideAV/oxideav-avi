@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-stream `strh.dwInitialFrames` parse + emit + round-trip
+  (round 153).** Surfaces the `dwInitialFrames` interleave-skew field at
+  byte offset 16 of the 56-byte AVISTREAMHEADER. Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md` §"AVISTREAMHEADER"
+  (`dwInitialFrames` row): *"How far audio data is skewed ahead of the
+  video frames in interleaved files. Typically, this is about 0.75
+  seconds. If creating interleaved files, set the value of this member
+  to the number of frames in the file prior to the initial frame of the
+  AVI sequence in this member."* AVIMAINHEADER §`dwInitialFrames` adds:
+  *"Initial frame for interleaved files. Noninterleaved files should
+  specify zero."* The muxer already wrote `0` here for every stream;
+  this round adds the typed `AviDemuxer::stream_initial_frames(stream)
+  -> Option<u32>` accessor returning the raw 32-bit value from byte
+  offset 16, the `avi:strh.<n>.initial_frames` metadata key (omitted
+  when zero so absence stays observable, mirroring the round-119
+  `wLanguage` / round-115 `rcFrame` / round-80 `strn` "default ==
+  absent" convention), and the
+  `AviMuxOptions::with_stream_initial_frames(stream_index, frames)`
+  builder that stamps any 32-bit value verbatim. The unit is the
+  stream's own `dwRate` / `dwScale` tick (typically frames for video,
+  blocks for audio); no rate-conversion or validation against the
+  per-stream `dwLength`. Covered by 10 new tests in
+  `tests/round153_initial_frames.rs`: mux→demux round-trip on video and
+  audio streams, default baseline, builder dedup, explicit-zero
+  override, per-stream independence, out-of-range index, all-ones
+  round-trip, and hand-rolled fixtures (non-zero + all-zero) controlling
+  the exact strh bytes.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-avi/compare/v0.0.6...v0.0.7) - 2026-05-24
 
 ### Other

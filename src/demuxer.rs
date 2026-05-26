@@ -260,6 +260,21 @@ fn open_avi_inner(
     // "unspecified / absent" — mirroring the round-115 `rcFrame` and
     // round-80 `strn` convention.
     let mut stream_languages: Vec<Option<u16>> = Vec::new();
+    // Round-153: per-stream `strh.dwInitialFrames` captured from byte
+    // offset 16 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    // (`docs/container/riff/avi-riff-file-reference.md`, `dwInitialFrames`
+    // row): *"How far audio data is skewed ahead of the video frames in
+    // interleaved files. Typically, this is about 0.75 seconds. If
+    // creating interleaved files, set the value of this member to the
+    // number of frames in the file prior to the initial frame of the
+    // AVI sequence."* Parallel to `streams`: `Some(frames)` when the
+    // strh declared a non-zero skew, `None` when it carried the `0`
+    // writer default ("noninterleaved file" per AVIMAINHEADER §
+    // `dwInitialFrames`: *"Noninterleaved files should specify zero"*)
+    // so an unspecified skew reads the same as an absent one, mirroring
+    // the round-119 `wLanguage` / round-115 `rcFrame` "default == absent"
+    // convention.
+    let mut stream_initial_frames: Vec<Option<u32>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -291,6 +306,7 @@ fn open_avi_inner(
         &mut stream_header_data,
         &mut stream_frame_rects,
         &mut stream_languages,
+        &mut stream_initial_frames,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -326,6 +342,7 @@ fn open_avi_inner(
                     &mut stream_header_data,
                     &mut stream_frame_rects,
                     &mut stream_languages,
+                    &mut stream_initial_frames,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -742,6 +759,28 @@ fn open_avi_inner(
     for (i, lang_opt) in stream_languages.iter().enumerate() {
         if let Some(lang) = lang_opt {
             metadata.push((format!("avi:strh.{i}.language"), lang.to_string()));
+        }
+    }
+
+    // Round-153: AVI 1.0 §"AVISTREAMHEADER" `dwInitialFrames` field at
+    // byte offset 16 of the strh. Surfaced as
+    // `avi:strh.<index>.initial_frames = "<u32>"` for every stream whose
+    // strh declared a non-zero skew. The `0` writer default
+    // ("noninterleaved file" per AVIMAINHEADER §`dwInitialFrames`:
+    // *"Noninterleaved files should specify zero"*) is `None` in
+    // `stream_initial_frames` so the key is omitted — its absence stays
+    // observable, mirroring the `avi:strh.<n>.language` / `frame_rect`
+    // conventions. The raw 32-bit value is also reachable via the typed
+    // [`AviDemuxer::stream_initial_frames`] accessor; per AVI 1.0
+    // §"AVISTREAMHEADER" (`dwInitialFrames` row in
+    // `docs/container/riff/avi-riff-file-reference.md`) the value is
+    // "how far audio data is skewed ahead of the video frames in
+    // interleaved files" — the demuxer surfaces the raw u32 verbatim
+    // and leaves interpretation (in stream ticks per the stream's
+    // `dwRate`/`dwScale`) to the caller.
+    for (i, init_opt) in stream_initial_frames.iter().enumerate() {
+        if let Some(init) = init_opt {
+            metadata.push((format!("avi:strh.{i}.initial_frames"), init.to_string()));
         }
     }
 
@@ -1187,6 +1226,7 @@ fn open_avi_inner(
         stream_header_data,
         stream_frame_rects,
         stream_languages,
+        stream_initial_frames,
         digitization_date,
         smpte_timecode,
     })
@@ -1218,6 +1258,7 @@ fn walk_riff_body(
     stream_header_data: &mut Vec<Option<Vec<u8>>>,
     stream_frame_rects: &mut Vec<Option<[i16; 4]>>,
     stream_languages: &mut Vec<Option<u16>>,
+    stream_initial_frames: &mut Vec<Option<u32>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1255,6 +1296,7 @@ fn walk_riff_body(
                         strds,
                         rcframes,
                         langs,
+                        initial_frames_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1272,6 +1314,7 @@ fn walk_riff_body(
                     *stream_header_data = strds;
                     *stream_frame_rects = rcframes;
                     *stream_languages = langs;
+                    *stream_initial_frames = initial_frames_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1497,6 +1540,7 @@ type HdrlOutput = (
     Vec<Option<Vec<u8>>>,
     Vec<Option<[i16; 4]>>,
     Vec<Option<u16>>,
+    Vec<Option<u32>>,
     Option<String>,
     Option<String>,
 );
@@ -1526,6 +1570,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut stream_header_data: Vec<Option<Vec<u8>>> = Vec::new();
     let mut stream_frame_rects: Vec<Option<[i16; 4]>> = Vec::new();
     let mut stream_languages: Vec<Option<u16>> = Vec::new();
+    let mut stream_initial_frames: Vec<Option<u32>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1583,8 +1628,20 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let body_start = r.stream_position()?;
                 let body_end = body_start + body_len as u64;
                 if &list_type == b"strl" {
-                    let (si, suf, sx, vp, ai, vs, asi, name, strd_bytes, rc_frame, lang) =
-                        parse_strl(r, body_end, streams.len() as u32, codecs)?;
+                    let (
+                        si,
+                        suf,
+                        sx,
+                        vp,
+                        ai,
+                        vs,
+                        asi,
+                        name,
+                        strd_bytes,
+                        rc_frame,
+                        lang,
+                        initial_frames,
+                    ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
                         suffixes.push(suf.unwrap_or(*b"xx"));
@@ -1597,6 +1654,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_header_data.push(strd_bytes);
                         stream_frame_rects.push(rc_frame);
                         stream_languages.push(lang);
+                        stream_initial_frames.push(initial_frames);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1641,6 +1699,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_header_data,
         stream_frame_rects,
         stream_languages,
+        stream_initial_frames,
         digitization_date,
         smpte_timecode,
     ))
@@ -1767,6 +1826,7 @@ type StrlOutput = (
     Option<Vec<u8>>,
     Option<[i16; 4]>,
     Option<u16>,
+    Option<u32>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -1883,6 +1943,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 strd_bytes,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -1900,6 +1961,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         strd_bytes,
         parsed.5,
         parsed.6,
+        parsed.7,
     ))
 }
 
@@ -2361,7 +2423,7 @@ pub struct SuperIndexDurationViolation {
     pub dmlh_total_frames: u64,
 }
 
-/// 6-tuple returned by [`build_stream`]: the [`StreamInfo`], the
+/// 8-tuple returned by [`build_stream`]: the [`StreamInfo`], the
 /// 2-byte chunk suffix (`dc` / `db` / `wb` / `xx`), the
 /// audio-strh `(format_tag, sample_size)` pair (`Some` for audio
 /// streams only — round-14 C2), the video-strf BMIH side-info
@@ -2371,9 +2433,13 @@ pub struct SuperIndexDurationViolation {
 /// `strh.rcFrame` destination rectangle `[left, top, right, bottom]`
 /// (`Some` when non-zero — round-115; the all-zero default is mapped
 /// to `None` so an unspecified rect reads the same as an absent one),
-/// and the `strh.wLanguage` LANGID (`Some` when non-zero — round-119;
+/// the `strh.wLanguage` LANGID (`Some` when non-zero — round-119;
 /// `0` is the documented "unspecified" sentinel and surfaces as `None`
-/// so the absence stays observable).
+/// so the absence stays observable), and the `strh.dwInitialFrames`
+/// skew (`Some` when non-zero — round-153; `0` is the documented
+/// "noninterleaved file" sentinel per AVIMAINHEADER §`dwInitialFrames`
+/// and surfaces as `None` so an unspecified skew reads the same as an
+/// absent one).
 type BuildStreamOutput = (
     StreamInfo,
     [u8; 2],
@@ -2382,6 +2448,7 @@ type BuildStreamOutput = (
     Option<AudioStrfInfo>,
     Option<[i16; 4]>,
     Option<u16>,
+    Option<u32>,
 );
 
 fn build_stream(
@@ -2434,6 +2501,30 @@ fn build_stream(
         None
     } else {
         Some(language_raw)
+    };
+
+    // `dwInitialFrames` (round-153): a u32 at byte offset 16 of the
+    // 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwInitialFrames`
+    // row in `docs/container/riff/avi-riff-file-reference.md`): *"How
+    // far audio data is skewed ahead of the video frames in
+    // interleaved files. Typically, this is about 0.75 seconds. If
+    // creating interleaved files, set the value of this member to the
+    // number of frames in the file prior to the initial frame of the
+    // AVI sequence in this member."* AVIMAINHEADER §`dwInitialFrames`
+    // adds: *"Initial frame for interleaved files. Noninterleaved
+    // files should specify zero."* — i.e. `0` is the documented
+    // "unspecified / noninterleaved" sentinel, mapped here to `None`
+    // so an absent skew reads the same as a default one (mirroring
+    // the round-119 `wLanguage` / round-80 `strn` /  round-107 `IDIT`
+    // "default == absent" convention). The demuxer surfaces the raw
+    // u32 verbatim; the spec defines the unit as the stream's own
+    // (`dwRate` / `dwScale`) tick rate, but the demuxer does not
+    // convert.
+    let initial_frames_raw = u32::from_le_bytes([strh[16], strh[17], strh[18], strh[19]]);
+    let initial_frames: Option<u32> = if initial_frames_raw == 0 {
+        None
+    } else {
+        Some(initial_frames_raw)
     };
 
     // `rcFrame` (round-115): the AVISTREAMHEADER destination rectangle at
@@ -2693,6 +2784,7 @@ fn build_stream(
         audio_strf_info,
         rc_frame,
         language,
+        initial_frames,
     ))
 }
 
@@ -3286,6 +3378,25 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::stream_language`] accessor in addition to the
     /// `avi:strh.<index>.language` metadata key.
     stream_languages: Vec<Option<u16>>,
+    /// Per-stream `strh.dwInitialFrames` from byte offset 16 of the
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-153).
+    /// Indexed by stream number; `Some(frames)` when the strh declared
+    /// a non-zero skew, `None` when it carried the `0` writer default
+    /// ("noninterleaved file" per AVIMAINHEADER §`dwInitialFrames`:
+    /// *"Noninterleaved files should specify zero"*) so an unspecified
+    /// skew reads the same as an absent one. Per AVI 1.0 §"AVISTREAMHEADER"
+    /// (`dwInitialFrames` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`): *"How far
+    /// audio data is skewed ahead of the video frames in interleaved
+    /// files. Typically, this is about 0.75 seconds. If creating
+    /// interleaved files, set the value of this member to the number
+    /// of frames in the file prior to the initial frame of the AVI
+    /// sequence."* The demuxer surfaces the raw 32-bit DWORD verbatim
+    /// and leaves the rate-conversion (unit is the stream's own
+    /// `dwRate`/`dwScale` tick) to the caller. Surfaced via the typed
+    /// [`AviDemuxer::stream_initial_frames`] accessor in addition to
+    /// the `avi:strh.<index>.initial_frames` metadata key.
+    stream_initial_frames: Vec<Option<u32>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -5238,6 +5349,37 @@ impl AviDemuxer {
         self.stream_languages
             .get(stream_index as usize)
             .and_then(|l| *l)
+    }
+
+    /// `strh.dwInitialFrames` skew for a stream, as the raw 32-bit
+    /// value read little-endian off byte offset 16 of the
+    /// AVISTREAMHEADER (round-153).
+    ///
+    /// Per AVI 1.0 §"AVISTREAMHEADER" (`dwInitialFrames` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`): *"How far
+    /// audio data is skewed ahead of the video frames in interleaved
+    /// files. Typically, this is about 0.75 seconds. If creating
+    /// interleaved files, set the value of this member to the number
+    /// of frames in the file prior to the initial frame of the AVI
+    /// sequence in this member."* AVIMAINHEADER §`dwInitialFrames`
+    /// adds: *"Initial frame for interleaved files. Noninterleaved
+    /// files should specify zero."* The demuxer surfaces the raw
+    /// 32-bit DWORD verbatim; the unit is the stream's own
+    /// `dwRate` / `dwScale` tick (typically frames for video, blocks
+    /// for audio) and the demuxer does not convert.
+    ///
+    /// Returns `None` when the strh carried the `0` ("noninterleaved
+    /// file") writer default so an unspecified skew reads the same as
+    /// an absent one (mirroring the `wLanguage` / `rcFrame` / `strn`
+    /// / `IDIT` "default == absent" convention), or for an
+    /// out-of-range stream index. The same value surfaces as the
+    /// `avi:strh.<index>.initial_frames` metadata key (also omitted
+    /// when absent), and round-trips a muxer-emitted skew set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_initial_frames`].
+    pub fn stream_initial_frames(&self, stream_index: u32) -> Option<u32> {
+        self.stream_initial_frames
+            .get(stream_index as usize)
+            .and_then(|f| *f)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside

@@ -377,6 +377,30 @@ pub struct AviMuxOptions {
     /// (the default) preserves the pre-round-119 byte layout
     /// (`wLanguage = 0`).
     pub stream_languages: Vec<(u32, u16)>,
+    /// Per-stream `strh.dwInitialFrames` overrides (round-153). Each
+    /// entry is `(stream_index, initial_frames)` and stamps the given
+    /// 32-bit value into byte offset 16 of that stream's 56-byte
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    /// (`dwInitialFrames` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`: *"How far
+    /// audio data is skewed ahead of the video frames in interleaved
+    /// files. Typically, this is about 0.75 seconds. If creating
+    /// interleaved files, set the value of this member to the number
+    /// of frames in the file prior to the initial frame of the AVI
+    /// sequence."*). Without an override the muxer writes `0`
+    /// ("noninterleaved file" per AVIMAINHEADER §`dwInitialFrames`:
+    /// *"Noninterleaved files should specify zero"* — the default the
+    /// demuxer maps back to `None`); this builder lets a caller stamp
+    /// a non-zero skew on a per-stream basis — typical use is a
+    /// captured interleaved file where audio leads video by ~0.75
+    /// seconds, recorded by stamping the audio stream's leading-frame
+    /// count here. The muxer writes whatever 32-bit value the caller
+    /// supplies verbatim and does not validate it against the per-stream
+    /// `dwLength`. Duplicate calls for the same stream index replace
+    /// the prior entry — see [`Self::with_stream_initial_frames`].
+    /// Empty list (the default) preserves the pre-round-153 byte layout
+    /// (`dwInitialFrames = 0` on every stream).
+    pub stream_initial_frames: Vec<(u32, u32)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1114,6 +1138,38 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp a `dwInitialFrames` skew into the 56-byte
+    /// AVISTREAMHEADER for `stream_index` (round-153). The 32-bit value
+    /// is written little-endian at byte offset 16 of the strh per AVI
+    /// 1.0 §"AVISTREAMHEADER" (`dwInitialFrames` row).
+    ///
+    /// Per the spec the field is the per-stream interleave skew:
+    /// *"How far audio data is skewed ahead of the video frames in
+    /// interleaved files. Typically, this is about 0.75 seconds. If
+    /// creating interleaved files, set the value of this member to the
+    /// number of frames in the file prior to the initial frame of the
+    /// AVI sequence in this member."* The unit is the stream's own
+    /// `dwRate` / `dwScale` tick (typically frames for video, blocks
+    /// for audio); the muxer writes whatever 32-bit value the caller
+    /// supplies verbatim and does not validate it against the per-stream
+    /// `dwLength`. Passing `0` is equivalent to omitting the override —
+    /// the demuxer maps the all-zero default back to `None` (per
+    /// AVIMAINHEADER §`dwInitialFrames`: *"Noninterleaved files should
+    /// specify zero."*) so a stamp of `0` reads as "no skew" on
+    /// re-demux.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_initial_frames`] for a
+    /// round-trip of any non-zero skew.
+    pub fn with_stream_initial_frames(mut self, stream_index: u32, initial_frames: u32) -> Self {
+        self.stream_initial_frames
+            .retain(|(idx, _)| *idx != stream_index);
+        self.stream_initial_frames
+            .push((stream_index, initial_frames));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -1608,6 +1664,17 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, l)| *l);
+            // Round-153: optional `strh.dwInitialFrames` override for
+            // this stream (see `with_stream_initial_frames`'s
+            // retain-then-push pattern). `None` keeps the legacy `0`
+            // ("noninterleaved file" per AVIMAINHEADER §`dwInitialFrames`)
+            // default the demuxer maps back to `None`.
+            let initial_frames_override = self
+                .options
+                .stream_initial_frames
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, f)| *f);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1621,6 +1688,7 @@ impl Muxer for AviMuxer {
                 stream_header_data,
                 frame_rect_override,
                 language_override,
+                initial_frames_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -3048,6 +3116,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     stream_header_data: Option<&[u8]>,
     frame_rect_override: Option<[i16; 4]>,
     language_override: Option<u16>,
+    initial_frames_override: Option<u32>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -3066,7 +3135,14 @@ fn write_strl<W: Write + Seek + ?Sized>(
     // validation.
     strh.extend_from_slice(&language_override.unwrap_or(0).to_le_bytes());
 
-    strh.extend_from_slice(&0u32.to_le_bytes()); // initial_frames
+    // dwInitialFrames (round-153): an `AviMuxOptions::with_stream_initial_frames`
+    // override (when present) stamps the per-stream interleave skew at
+    // byte offset 16 per AVI 1.0 §"AVISTREAMHEADER"; otherwise the
+    // legacy default is `0` ("noninterleaved file" per AVIMAINHEADER
+    // §`dwInitialFrames`, which the demuxer maps back to `None`). The
+    // 32-bit value is written verbatim; no validation against the
+    // per-stream `dwLength`.
+    strh.extend_from_slice(&initial_frames_override.unwrap_or(0).to_le_bytes()); // initial_frames
     strh.extend_from_slice(&t.entry.scale.to_le_bytes());
     strh.extend_from_slice(&t.entry.rate.to_le_bytes());
     strh.extend_from_slice(&0u32.to_le_bytes()); // start
