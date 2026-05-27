@@ -425,6 +425,400 @@ pub const KSDATAFORMAT_SUBTYPE_MPEG: Guid = Guid::from_components(
     [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
 );
 
+// --- WAVEFORMATEXTENSIBLE channel-mask SPEAKER_* bitmap -------------------
+//
+// Round 163: typed `dwChannelMask` surface (`Speaker` + [`ChannelMask`] +
+// [`ChannelLayout`]). The bit assignments mirror the Microsoft Learn
+// "Channel-mask channel ordering" section verbatim from
+// `docs/container/riff/waveformatextensible/README.md` (2026-05-18). The
+// 18 standard `SPEAKER_*` bits run from `FL = 0x00001` up through `TBR =
+// 0x20000`; the `SPEAKER_ALL = 0x80000000` flag is a separate top-bit
+// catch-all. Channels are laid out in the PCM byte stream in the bit
+// order of the mask (lowest set bit first) — driving the
+// [`ChannelMask::iter_speakers`] iteration order.
+
+/// `SPEAKER_FRONT_LEFT` (`0x00001`) per Microsoft Learn "Channel-mask
+/// channel ordering". Front-left full-range loudspeaker.
+pub const SPEAKER_FRONT_LEFT: u32 = 0x0000_0001;
+/// `SPEAKER_FRONT_RIGHT` (`0x00002`).
+pub const SPEAKER_FRONT_RIGHT: u32 = 0x0000_0002;
+/// `SPEAKER_FRONT_CENTER` (`0x00004`).
+pub const SPEAKER_FRONT_CENTER: u32 = 0x0000_0004;
+/// `SPEAKER_LOW_FREQUENCY` (`0x00008`) — subwoofer.
+pub const SPEAKER_LOW_FREQUENCY: u32 = 0x0000_0008;
+/// `SPEAKER_BACK_LEFT` (`0x00010`).
+pub const SPEAKER_BACK_LEFT: u32 = 0x0000_0010;
+/// `SPEAKER_BACK_RIGHT` (`0x00020`).
+pub const SPEAKER_BACK_RIGHT: u32 = 0x0000_0020;
+/// `SPEAKER_FRONT_LEFT_OF_CENTER` (`0x00040`).
+pub const SPEAKER_FRONT_LEFT_OF_CENTER: u32 = 0x0000_0040;
+/// `SPEAKER_FRONT_RIGHT_OF_CENTER` (`0x00080`).
+pub const SPEAKER_FRONT_RIGHT_OF_CENTER: u32 = 0x0000_0080;
+/// `SPEAKER_BACK_CENTER` (`0x00100`).
+pub const SPEAKER_BACK_CENTER: u32 = 0x0000_0100;
+/// `SPEAKER_SIDE_LEFT` (`0x00200`).
+pub const SPEAKER_SIDE_LEFT: u32 = 0x0000_0200;
+/// `SPEAKER_SIDE_RIGHT` (`0x00400`).
+pub const SPEAKER_SIDE_RIGHT: u32 = 0x0000_0400;
+/// `SPEAKER_TOP_CENTER` (`0x00800`).
+pub const SPEAKER_TOP_CENTER: u32 = 0x0000_0800;
+/// `SPEAKER_TOP_FRONT_LEFT` (`0x01000`).
+pub const SPEAKER_TOP_FRONT_LEFT: u32 = 0x0000_1000;
+/// `SPEAKER_TOP_FRONT_CENTER` (`0x02000`).
+pub const SPEAKER_TOP_FRONT_CENTER: u32 = 0x0000_2000;
+/// `SPEAKER_TOP_FRONT_RIGHT` (`0x04000`).
+pub const SPEAKER_TOP_FRONT_RIGHT: u32 = 0x0000_4000;
+/// `SPEAKER_TOP_BACK_LEFT` (`0x08000`).
+pub const SPEAKER_TOP_BACK_LEFT: u32 = 0x0000_8000;
+/// `SPEAKER_TOP_BACK_CENTER` (`0x10000`).
+pub const SPEAKER_TOP_BACK_CENTER: u32 = 0x0001_0000;
+/// `SPEAKER_TOP_BACK_RIGHT` (`0x20000`).
+pub const SPEAKER_TOP_BACK_RIGHT: u32 = 0x0002_0000;
+/// `SPEAKER_ALL` (`0x80000000`) — top-bit "all speakers" catch-all
+/// per Microsoft Learn § "Extensible Wave-Format Descriptors".
+pub const SPEAKER_ALL: u32 = 0x8000_0000;
+
+/// One named `SPEAKER_*` position from the
+/// `WAVEFORMATEXTENSIBLE.dwChannelMask` bitmap (round 163).
+///
+/// The variants are listed in the same bit order as the docs README
+/// table at `docs/container/riff/waveformatextensible/README.md`,
+/// which is the PCM byte-stream channel order. [`ChannelMask`] iterates
+/// `Speaker`s in this exact order so callers can pair the iteration
+/// with their per-channel buffer indices.
+///
+/// `SpeakerAll` represents `SPEAKER_ALL (0x80000000)` — a catch-all
+/// top bit Microsoft uses to mean "feed every speaker the same mono
+/// channel". It is listed separately from the 18 positional bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Speaker {
+    /// `SPEAKER_FRONT_LEFT` — bit `0x00001`.
+    FrontLeft,
+    /// `SPEAKER_FRONT_RIGHT` — bit `0x00002`.
+    FrontRight,
+    /// `SPEAKER_FRONT_CENTER` — bit `0x00004`.
+    FrontCenter,
+    /// `SPEAKER_LOW_FREQUENCY` — bit `0x00008` (LFE / subwoofer).
+    LowFrequency,
+    /// `SPEAKER_BACK_LEFT` — bit `0x00010`.
+    BackLeft,
+    /// `SPEAKER_BACK_RIGHT` — bit `0x00020`.
+    BackRight,
+    /// `SPEAKER_FRONT_LEFT_OF_CENTER` — bit `0x00040`.
+    FrontLeftOfCenter,
+    /// `SPEAKER_FRONT_RIGHT_OF_CENTER` — bit `0x00080`.
+    FrontRightOfCenter,
+    /// `SPEAKER_BACK_CENTER` — bit `0x00100`.
+    BackCenter,
+    /// `SPEAKER_SIDE_LEFT` — bit `0x00200`.
+    SideLeft,
+    /// `SPEAKER_SIDE_RIGHT` — bit `0x00400`.
+    SideRight,
+    /// `SPEAKER_TOP_CENTER` — bit `0x00800`.
+    TopCenter,
+    /// `SPEAKER_TOP_FRONT_LEFT` — bit `0x01000`.
+    TopFrontLeft,
+    /// `SPEAKER_TOP_FRONT_CENTER` — bit `0x02000`.
+    TopFrontCenter,
+    /// `SPEAKER_TOP_FRONT_RIGHT` — bit `0x04000`.
+    TopFrontRight,
+    /// `SPEAKER_TOP_BACK_LEFT` — bit `0x08000`.
+    TopBackLeft,
+    /// `SPEAKER_TOP_BACK_CENTER` — bit `0x10000`.
+    TopBackCenter,
+    /// `SPEAKER_TOP_BACK_RIGHT` — bit `0x20000`.
+    TopBackRight,
+    /// `SPEAKER_ALL` — bit `0x80000000`. Catch-all "feed every speaker"
+    /// flag per Microsoft Learn § "Extensible Wave-Format Descriptors".
+    SpeakerAll,
+}
+
+impl Speaker {
+    /// Underlying `SPEAKER_*` bit mask for this position.
+    pub const fn mask_bit(self) -> u32 {
+        match self {
+            Self::FrontLeft => SPEAKER_FRONT_LEFT,
+            Self::FrontRight => SPEAKER_FRONT_RIGHT,
+            Self::FrontCenter => SPEAKER_FRONT_CENTER,
+            Self::LowFrequency => SPEAKER_LOW_FREQUENCY,
+            Self::BackLeft => SPEAKER_BACK_LEFT,
+            Self::BackRight => SPEAKER_BACK_RIGHT,
+            Self::FrontLeftOfCenter => SPEAKER_FRONT_LEFT_OF_CENTER,
+            Self::FrontRightOfCenter => SPEAKER_FRONT_RIGHT_OF_CENTER,
+            Self::BackCenter => SPEAKER_BACK_CENTER,
+            Self::SideLeft => SPEAKER_SIDE_LEFT,
+            Self::SideRight => SPEAKER_SIDE_RIGHT,
+            Self::TopCenter => SPEAKER_TOP_CENTER,
+            Self::TopFrontLeft => SPEAKER_TOP_FRONT_LEFT,
+            Self::TopFrontCenter => SPEAKER_TOP_FRONT_CENTER,
+            Self::TopFrontRight => SPEAKER_TOP_FRONT_RIGHT,
+            Self::TopBackLeft => SPEAKER_TOP_BACK_LEFT,
+            Self::TopBackCenter => SPEAKER_TOP_BACK_CENTER,
+            Self::TopBackRight => SPEAKER_TOP_BACK_RIGHT,
+            Self::SpeakerAll => SPEAKER_ALL,
+        }
+    }
+
+    /// Short docs-table abbreviation used in the
+    /// `docs/container/riff/waveformatextensible/README.md` channel
+    /// ordering table (e.g. `"FL"`, `"FR"`, `"FC"`, `"LFE"`, `"BL"`,
+    /// `"BR"`, `"SL"`, `"SR"`). `SpeakerAll` returns `"ALL"`.
+    pub const fn abbrev(self) -> &'static str {
+        match self {
+            Self::FrontLeft => "FL",
+            Self::FrontRight => "FR",
+            Self::FrontCenter => "FC",
+            Self::LowFrequency => "LFE",
+            Self::BackLeft => "BL",
+            Self::BackRight => "BR",
+            Self::FrontLeftOfCenter => "FLC",
+            Self::FrontRightOfCenter => "FRC",
+            Self::BackCenter => "BC",
+            Self::SideLeft => "SL",
+            Self::SideRight => "SR",
+            Self::TopCenter => "TC",
+            Self::TopFrontLeft => "TFL",
+            Self::TopFrontCenter => "TFC",
+            Self::TopFrontRight => "TFR",
+            Self::TopBackLeft => "TBL",
+            Self::TopBackCenter => "TBC",
+            Self::TopBackRight => "TBR",
+            Self::SpeakerAll => "ALL",
+        }
+    }
+}
+
+// Bit-order table — Microsoft Learn lists the 18 positional `SPEAKER_*`
+// bits from `0x00001` through `0x20000`. `SPEAKER_ALL` (`0x80000000`)
+// is appended at the tail because it's a non-positional catch-all.
+const SPEAKER_BIT_ORDER: [Speaker; 19] = [
+    Speaker::FrontLeft,
+    Speaker::FrontRight,
+    Speaker::FrontCenter,
+    Speaker::LowFrequency,
+    Speaker::BackLeft,
+    Speaker::BackRight,
+    Speaker::FrontLeftOfCenter,
+    Speaker::FrontRightOfCenter,
+    Speaker::BackCenter,
+    Speaker::SideLeft,
+    Speaker::SideRight,
+    Speaker::TopCenter,
+    Speaker::TopFrontLeft,
+    Speaker::TopFrontCenter,
+    Speaker::TopFrontRight,
+    Speaker::TopBackLeft,
+    Speaker::TopBackCenter,
+    Speaker::TopBackRight,
+    Speaker::SpeakerAll,
+];
+
+/// Typed view of a `WAVEFORMATEXTENSIBLE.dwChannelMask` 32-bit value
+/// (round 163).
+///
+/// Wraps the raw `u32` returned by
+/// [`crate::demuxer::AviDemuxer::stream_channel_mask`] / stored on
+/// [`WaveFormatExtensible::channel_mask`] and exposes the
+/// `SPEAKER_*` decode without forcing callers to write the bit
+/// arithmetic themselves. Iteration order matches the PCM byte-stream
+/// channel order per Microsoft Learn § "Channel-mask channel
+/// ordering" (lowest set bit first).
+///
+/// Source: `docs/container/riff/waveformatextensible/README.md`
+/// (Microsoft Learn mirror, 2026-05-18). Bit values verified against
+/// the same docs table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChannelMask(pub u32);
+
+impl ChannelMask {
+    /// Wrap a raw `dwChannelMask` value.
+    pub const fn from_raw(mask: u32) -> Self {
+        Self(mask)
+    }
+
+    /// Raw `dwChannelMask` value back out.
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Iterate the [`Speaker`] positions present in this mask, in the
+    /// PCM byte-stream channel order (lowest set bit first per
+    /// Microsoft Learn § "Channel-mask channel ordering").
+    ///
+    /// Unrecognised bits — Microsoft reserves the gap between
+    /// `SPEAKER_TOP_BACK_RIGHT (0x20000)` and `SPEAKER_ALL (0x80000000)`
+    /// for `SPEAKER_RESERVED` — are silently skipped. Use
+    /// [`Self::reserved_bits`] to inspect them.
+    pub fn iter_speakers(self) -> impl Iterator<Item = Speaker> {
+        let mask = self.0;
+        SPEAKER_BIT_ORDER
+            .iter()
+            .copied()
+            .filter(move |sp| mask & sp.mask_bit() != 0)
+    }
+
+    /// Count of recognised `SPEAKER_*` bits present (i.e. number of
+    /// items [`Self::iter_speakers`] would yield). This is also the
+    /// number of audio channels the docs README's "channel ordering"
+    /// table associates with this mask.
+    pub fn len(self) -> u32 {
+        // Population count over the documented bits only — Microsoft's
+        // `SPEAKER_RESERVED` range is excluded so a corrupt / unknown
+        // bit doesn't inflate the channel count.
+        let mut count = 0u32;
+        for sp in SPEAKER_BIT_ORDER {
+            if self.0 & sp.mask_bit() != 0 {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// `true` when no `SPEAKER_*` bits are set (`dwChannelMask == 0`).
+    /// Microsoft Learn treats a zero mask as "speaker assignment
+    /// unknown / unspecified".
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Bits set in `dwChannelMask` that do NOT correspond to one of the
+    /// 18 documented positional `SPEAKER_*` bits or `SPEAKER_ALL` — i.e.
+    /// the Microsoft `SPEAKER_RESERVED` range. Returned as a raw `u32`
+    /// (the same bits, with documented bits cleared) so callers can
+    /// surface them as opaque metadata without losing information.
+    pub fn reserved_bits(self) -> u32 {
+        let mut known = 0u32;
+        for sp in SPEAKER_BIT_ORDER {
+            known |= sp.mask_bit();
+        }
+        self.0 & !known
+    }
+
+    /// Recognise one of the named layouts from the docs README's
+    /// "Standard layouts" table (round 163). Returns `None` for any
+    /// non-standard combination — the caller can still consume
+    /// [`Self::iter_speakers`] for the raw decode.
+    ///
+    /// The seven entries match the docs README verbatim:
+    /// Mono / Stereo / 2.1 / Quad / 5.1 (Microsoft back) / 5.1 (DVD
+    /// side) / 7.1.
+    pub fn layout(self) -> Option<ChannelLayout> {
+        ChannelLayout::from_mask(self.0)
+    }
+}
+
+/// Named multi-channel layout matching one of the rows of the
+/// "Standard layouts" table in
+/// `docs/container/riff/waveformatextensible/README.md` (round 163).
+///
+/// The variants intentionally distinguish "Microsoft 5.1" (with rear
+/// `BL`/`BR`) from "DVD-style 5.1" (with side `SL`/`SR`) since both
+/// are equally common in the wild and the per-bit channel order
+/// differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChannelLayout {
+    /// `SPEAKER_FRONT_CENTER` — 1 channel.
+    Mono,
+    /// `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT` — 2 channels.
+    Stereo,
+    /// `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT |
+    /// SPEAKER_LOW_FREQUENCY` — 3 channels.
+    TwoPointOne,
+    /// `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_BACK_LEFT |
+    /// SPEAKER_BACK_RIGHT` — 4 channels.
+    Quad,
+    /// Microsoft 5.1: `FL | FR | FC | LFE | BL | BR` — 6 channels.
+    FivePointOneBack,
+    /// DVD-style 5.1: `FL | FR | FC | LFE | SL | SR` — 6 channels.
+    FivePointOneSide,
+    /// 7.1: `FL | FR | FC | LFE | BL | BR | SL | SR` — 8 channels.
+    SevenPointOne,
+}
+
+impl ChannelLayout {
+    /// The exact `dwChannelMask` value matching this named layout per
+    /// the docs README table.
+    pub const fn mask(self) -> u32 {
+        match self {
+            Self::Mono => SPEAKER_FRONT_CENTER,
+            Self::Stereo => SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT,
+            Self::TwoPointOne => SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_LOW_FREQUENCY,
+            Self::Quad => {
+                SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT
+            }
+            Self::FivePointOneBack => {
+                SPEAKER_FRONT_LEFT
+                    | SPEAKER_FRONT_RIGHT
+                    | SPEAKER_FRONT_CENTER
+                    | SPEAKER_LOW_FREQUENCY
+                    | SPEAKER_BACK_LEFT
+                    | SPEAKER_BACK_RIGHT
+            }
+            Self::FivePointOneSide => {
+                SPEAKER_FRONT_LEFT
+                    | SPEAKER_FRONT_RIGHT
+                    | SPEAKER_FRONT_CENTER
+                    | SPEAKER_LOW_FREQUENCY
+                    | SPEAKER_SIDE_LEFT
+                    | SPEAKER_SIDE_RIGHT
+            }
+            Self::SevenPointOne => {
+                SPEAKER_FRONT_LEFT
+                    | SPEAKER_FRONT_RIGHT
+                    | SPEAKER_FRONT_CENTER
+                    | SPEAKER_LOW_FREQUENCY
+                    | SPEAKER_BACK_LEFT
+                    | SPEAKER_BACK_RIGHT
+                    | SPEAKER_SIDE_LEFT
+                    | SPEAKER_SIDE_RIGHT
+            }
+        }
+    }
+
+    /// Resolve a raw `dwChannelMask` to a named layout, or `None`. Bits
+    /// outside the 18 documented positional `SPEAKER_*` bits and
+    /// `SPEAKER_ALL` are ignored for matching purposes (a stream with
+    /// stereo + a stray reserved bit still classifies as
+    /// [`ChannelLayout::Stereo`]). Use [`ChannelMask::reserved_bits`]
+    /// if the caller wants to detect that situation explicitly.
+    pub fn from_mask(mask: u32) -> Option<Self> {
+        // Strip any non-documented bits before equality testing.
+        let mut known = 0u32;
+        for sp in SPEAKER_BIT_ORDER {
+            known |= sp.mask_bit();
+        }
+        let cleaned = mask & known;
+        [
+            Self::Mono,
+            Self::Stereo,
+            Self::TwoPointOne,
+            Self::Quad,
+            Self::FivePointOneBack,
+            Self::FivePointOneSide,
+            Self::SevenPointOne,
+        ]
+        .into_iter()
+        .find(|layout| cleaned == layout.mask())
+    }
+
+    /// Short docs-table label (e.g. `"mono"`, `"stereo"`, `"5.1"`,
+    /// `"7.1"`). The two 5.1 variants disambiguate as `"5.1(back)"`
+    /// (Microsoft) and `"5.1(side)"` (DVD-style).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mono => "mono",
+            Self::Stereo => "stereo",
+            Self::TwoPointOne => "2.1",
+            Self::Quad => "quad",
+            Self::FivePointOneBack => "5.1(back)",
+            Self::FivePointOneSide => "5.1(side)",
+            Self::SevenPointOne => "7.1",
+        }
+    }
+}
+
 /// Decoded WAVEFORMATEXTENSIBLE.
 ///
 /// `wfx.format_tag` is always [`WAVE_FORMAT_EXTENSIBLE`] (`0xFFFE`) for
@@ -807,5 +1201,152 @@ mod tests {
         let h = parse_waveformatex(&bytes).unwrap();
         assert_eq!(h.bits_per_sample, 0);
         assert!(h.extradata.is_empty());
+    }
+
+    // ---- Round 163: ChannelMask + ChannelLayout typed surface ----------
+
+    #[test]
+    fn channel_mask_empty_and_layout_for_unrecognised() {
+        // dwChannelMask == 0 ⇒ "speaker assignment unspecified" per
+        // Microsoft Learn. Returns no Speakers, no named layout.
+        let m = ChannelMask::from_raw(0);
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+        assert_eq!(m.iter_speakers().count(), 0);
+        assert!(m.layout().is_none());
+        assert_eq!(m.reserved_bits(), 0);
+    }
+
+    #[test]
+    fn channel_mask_iter_order_matches_docs_table() {
+        // 5.1 (Microsoft back) per docs README:
+        //   FL | FR | FC | LFE | BL | BR (== 0x0000_003F).
+        // Channels are stored in the file in the bit order of the mask
+        // (lowest set bit first) ⇒ iter_speakers yields the same order.
+        let m = ChannelMask::from_raw(0x0000_003F);
+        let got: Vec<Speaker> = m.iter_speakers().collect();
+        assert_eq!(
+            got,
+            vec![
+                Speaker::FrontLeft,
+                Speaker::FrontRight,
+                Speaker::FrontCenter,
+                Speaker::LowFrequency,
+                Speaker::BackLeft,
+                Speaker::BackRight,
+            ],
+            "iter_speakers must follow lowest-set-bit-first PCM channel order"
+        );
+        assert_eq!(m.len(), 6);
+        assert_eq!(m.layout(), Some(ChannelLayout::FivePointOneBack));
+    }
+
+    #[test]
+    fn channel_mask_named_layouts_round_trip() {
+        // Every named layout from the docs README "Standard layouts"
+        // table must round-trip mask -> layout -> mask exactly.
+        for layout in [
+            ChannelLayout::Mono,
+            ChannelLayout::Stereo,
+            ChannelLayout::TwoPointOne,
+            ChannelLayout::Quad,
+            ChannelLayout::FivePointOneBack,
+            ChannelLayout::FivePointOneSide,
+            ChannelLayout::SevenPointOne,
+        ] {
+            let mask = layout.mask();
+            let recovered = ChannelLayout::from_mask(mask);
+            assert_eq!(
+                recovered,
+                Some(layout),
+                "layout {:?} (mask 0x{:08X}) must round-trip",
+                layout,
+                mask
+            );
+        }
+    }
+
+    #[test]
+    fn channel_mask_layout_specific_values_match_docs_table() {
+        // Spot-check the four mask values explicitly called out in the
+        // docs README "Standard layouts" table.
+        assert_eq!(ChannelLayout::Mono.mask(), 0x0000_0004);
+        assert_eq!(ChannelLayout::Stereo.mask(), 0x0000_0003);
+        assert_eq!(ChannelLayout::Quad.mask(), 0x0000_0033);
+        assert_eq!(ChannelLayout::FivePointOneBack.mask(), 0x0000_003F);
+        // DVD-style: FL|FR|FC|LFE|SL|SR = 0x0000_060F per docs README.
+        assert_eq!(ChannelLayout::FivePointOneSide.mask(), 0x0000_060F);
+        // 7.1: FL|FR|FC|LFE|BL|BR|SL|SR = 0x0000_063F.
+        assert_eq!(ChannelLayout::SevenPointOne.mask(), 0x0000_063F);
+    }
+
+    #[test]
+    fn channel_mask_reserved_bits_isolated_and_ignored_for_layout() {
+        // Microsoft reserves the gap between TBR (0x20000) and ALL
+        // (0x80000000). Stereo + a stray reserved bit in that gap
+        // still classifies as Stereo; the reserved bit is surfaced
+        // separately so the caller can warn on it.
+        let stereo_plus_reserved = ChannelLayout::Stereo.mask() | 0x0040_0000;
+        let m = ChannelMask::from_raw(stereo_plus_reserved);
+        assert_eq!(m.layout(), Some(ChannelLayout::Stereo));
+        assert_eq!(m.reserved_bits(), 0x0040_0000);
+        // iter_speakers must NOT yield anything for the reserved bit.
+        let got: Vec<Speaker> = m.iter_speakers().collect();
+        assert_eq!(got, vec![Speaker::FrontLeft, Speaker::FrontRight]);
+        assert_eq!(m.len(), 2, "len counts only documented bits");
+    }
+
+    #[test]
+    fn channel_mask_speaker_all_surfaces_separately() {
+        // SPEAKER_ALL (0x80000000) is the top-bit catch-all per
+        // Microsoft Learn. iter_speakers must yield SpeakerAll for it,
+        // but a bare SpeakerAll bit is NOT one of the named layouts.
+        let m = ChannelMask::from_raw(SPEAKER_ALL);
+        let got: Vec<Speaker> = m.iter_speakers().collect();
+        assert_eq!(got, vec![Speaker::SpeakerAll]);
+        assert_eq!(m.layout(), None);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.reserved_bits(), 0);
+    }
+
+    #[test]
+    fn speaker_abbrev_and_mask_bit_table_complete() {
+        // Every Speaker variant must have a non-empty abbreviation and
+        // a non-zero mask bit; mask bits must be unique (no overlap).
+        let all = [
+            Speaker::FrontLeft,
+            Speaker::FrontRight,
+            Speaker::FrontCenter,
+            Speaker::LowFrequency,
+            Speaker::BackLeft,
+            Speaker::BackRight,
+            Speaker::FrontLeftOfCenter,
+            Speaker::FrontRightOfCenter,
+            Speaker::BackCenter,
+            Speaker::SideLeft,
+            Speaker::SideRight,
+            Speaker::TopCenter,
+            Speaker::TopFrontLeft,
+            Speaker::TopFrontCenter,
+            Speaker::TopFrontRight,
+            Speaker::TopBackLeft,
+            Speaker::TopBackCenter,
+            Speaker::TopBackRight,
+            Speaker::SpeakerAll,
+        ];
+        let mut seen = 0u32;
+        for sp in all {
+            let bit = sp.mask_bit();
+            assert!(bit != 0, "{:?} mask bit must be non-zero", sp);
+            assert_eq!(
+                seen & bit,
+                0,
+                "{:?} bit 0x{:08X} overlaps a previous Speaker",
+                sp,
+                bit
+            );
+            seen |= bit;
+            assert!(!sp.abbrev().is_empty(), "{:?} abbrev must be non-empty", sp);
+        }
     }
 }

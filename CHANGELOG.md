@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `WAVEFORMATEXTENSIBLE.dwChannelMask` surface (round 163).**
+  New `ChannelMask` newtype + `Speaker` enum + `ChannelLayout`
+  recogniser in `stream_format`, plus
+  `AviDemuxer::stream_channel_mask_typed(stream) -> Option<ChannelMask>`
+  and `AviDemuxer::stream_channel_layout(stream) -> Option<ChannelLayout>`
+  accessors. Clean-room source:
+  `docs/container/riff/waveformatextensible/README.md` (Microsoft Learn
+  mirror, 2026-05-18) — verbatim from the "Channel-mask channel
+  ordering" and "Standard layouts" tables. `Speaker` covers the 18
+  documented positional `SPEAKER_*` bits (`FrontLeft` 0x00001 through
+  `TopBackRight` 0x20000) plus the `SpeakerAll` (0x80000000)
+  top-bit catch-all; `ChannelMask::iter_speakers` enumerates them in
+  PCM byte-stream channel order (lowest set bit first per docs §
+  "Channel-mask channel ordering"). `ChannelLayout` recognises the
+  seven docs-table named layouts: `Mono` (FC, 0x00004), `Stereo`
+  (FL|FR, 0x00003), `TwoPointOne` (FL|FR|LFE, 0x0000B), `Quad`
+  (FL|FR|BL|BR, 0x00033), `FivePointOneBack` (Microsoft 5.1:
+  FL|FR|FC|LFE|BL|BR, 0x0003F), `FivePointOneSide` (DVD-style 5.1:
+  FL|FR|FC|LFE|SL|SR, 0x0060F), and `SevenPointOne` (7.1:
+  FL|FR|FC|LFE|BL|BR|SL|SR, 0x0063F). `ChannelMask::reserved_bits`
+  isolates bits in the Microsoft `SPEAKER_RESERVED` gap (between
+  `TopBackRight` and `SpeakerAll`) so a stereo stream that also has
+  a stray reserved bit still classifies as `Stereo` while the caller
+  can detect the anomaly out-of-band. Two new metadata keys land on
+  every extensible audio stream alongside `avi:auds.<n>.channel_mask`:
+  `avi:auds.<n>.channel_speakers` (comma-joined `Speaker::abbrev()`
+  abbreviations like `"FL,FR,FC,LFE,BL,BR"`, surfaced for any non-empty
+  mask) and `avi:auds.<n>.channel_layout` (named-layout label like
+  `"stereo"` / `"5.1(back)"` / `"5.1(side)"` / `"7.1"`, omitted when
+  the mask doesn't match one of the seven named layouts so absence
+  of a key stays observable — mirrors the `avi:strn` / `avi:strd` /
+  `avi:idit` "default == absent" metadata convention). Legacy 18-byte
+  `WAVEFORMATEX` audio streams (`wFormatTag != 0xFFFE`) return `None`
+  for both new typed accessors, matching the existing
+  `stream_channel_mask` precondition. 12 new tests (6 unit
+  + 6 integration in `tests/round163_channel_layout.rs`) cover the
+  full bit-order table, the seven named-layout round-trips, reserved-
+  bit isolation, the `SPEAKER_ALL` catch-all, the new metadata keys,
+  and the legacy-`WAVEFORMATEX` `None`-gating path.
+
 - **File-global `avih.dwInitialFrames` parse + emit + round-trip
   (round 157).** Surfaces the `dwInitialFrames` interleave-skew field
   at byte offset 16 of the 56-byte AVIMAINHEADER body (byte 24 of the

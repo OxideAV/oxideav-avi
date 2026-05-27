@@ -65,7 +65,7 @@ use oxideav_core::{Demuxer, ReadSeek};
 use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_FORM, LIST, RIFF};
 use crate::stream_format::{
     parse_bitmap_info_header, parse_waveformatex, parse_waveformatextensible, subformat_codec_hint,
-    Guid, WAVE_FORMAT_EXTENSIBLE,
+    ChannelLayout, ChannelMask, Guid, WAVE_FORMAT_EXTENSIBLE,
 };
 
 /// `bIndexType` of an `AVIMETAINDEX` super-index (`indx` of indexes).
@@ -696,6 +696,27 @@ fn open_avi_inner(
                 format!("avi:auds.{i}.channel_mask"),
                 format!("0x{mask:08X}"),
             ));
+            // Round 163: typed channel-mask decode per docs README
+            // `docs/container/riff/waveformatextensible/README.md`
+            // "Channel-mask channel ordering" + "Standard layouts"
+            // tables. Surface a comma-joined PCM-channel-order list
+            // of `SPEAKER_*` abbreviations and, when the mask matches
+            // one of the seven docs-table named layouts, the layout
+            // label. Both keys are omitted entirely when there are no
+            // documented bits set so absence stays observable
+            // (mirrors the `avi:strn` / `avi:strd` / `avi:idit`
+            // "default == absent" convention).
+            let cm = ChannelMask::from_raw(mask);
+            if !cm.is_empty() {
+                let speakers: Vec<&'static str> = cm.iter_speakers().map(|s| s.abbrev()).collect();
+                metadata.push((format!("avi:auds.{i}.channel_speakers"), speakers.join(",")));
+            }
+            if let Some(layout) = cm.layout() {
+                metadata.push((
+                    format!("avi:auds.{i}.channel_layout"),
+                    layout.label().to_string(),
+                ));
+            }
         }
         if let Some(guid) = asi.subformat {
             metadata.push((format!("avi:auds.{i}.subformat"), guid.display()));
@@ -5318,6 +5339,50 @@ impl AviDemuxer {
     pub fn stream_subformat(&self, stream_index: u32) -> Option<Guid> {
         self.stream_audio_strf(stream_index)
             .and_then(|asi| asi.subformat)
+    }
+
+    /// Round 163: typed [`ChannelMask`] view of the
+    /// `WAVEFORMATEXTENSIBLE.dwChannelMask` for an extensible audio
+    /// stream.
+    ///
+    /// Wraps the raw `u32` returned by [`Self::stream_channel_mask`]
+    /// so callers can enumerate the `SPEAKER_*` positions in PCM
+    /// byte-stream channel order without re-implementing the bit
+    /// arithmetic. Same eligibility as `stream_channel_mask`: returns
+    /// `Some` only when the stream's `wFormatTag ==
+    /// WAVE_FORMAT_EXTENSIBLE (0xFFFE)` and the strf payload carried
+    /// the 22-byte extension.
+    ///
+    /// The bit-order, speaker abbreviations, and named-layout
+    /// recognition are all sourced from
+    /// `docs/container/riff/waveformatextensible/README.md` (Microsoft
+    /// Learn mirror, 2026-05-18) — see the "Channel-mask channel
+    /// ordering" and "Standard layouts" tables.
+    pub fn stream_channel_mask_typed(&self, stream_index: u32) -> Option<ChannelMask> {
+        self.stream_channel_mask(stream_index)
+            .map(ChannelMask::from_raw)
+    }
+
+    /// Round 163: named [`ChannelLayout`] recognition for an extensible
+    /// audio stream's `dwChannelMask`.
+    ///
+    /// Returns `Some(layout)` only when the raw mask matches one of
+    /// the seven entries in the docs README "Standard layouts" table:
+    /// Mono / Stereo / 2.1 / Quad / 5.1 (Microsoft back) / 5.1
+    /// (DVD-style side) / 7.1. Any other valid `SPEAKER_*` combination
+    /// — and any stream where [`Self::stream_channel_mask`] returns
+    /// `None` — yields `None`; the caller can fall back to
+    /// [`Self::stream_channel_mask_typed`] for the raw decode.
+    ///
+    /// Reserved bits in the `SPEAKER_RESERVED` range (between
+    /// `SPEAKER_TOP_BACK_RIGHT (0x20000)` and `SPEAKER_ALL
+    /// (0x80000000)`) are ignored for matching purposes per
+    /// [`ChannelLayout::from_mask`] — call
+    /// [`ChannelMask::reserved_bits`] on the typed view if the caller
+    /// wants to inspect them.
+    pub fn stream_channel_layout(&self, stream_index: u32) -> Option<ChannelLayout> {
+        self.stream_channel_mask_typed(stream_index)
+            .and_then(|cm| cm.layout())
     }
 
     /// Round-80: optional per-stream name parsed from the `strn` chunk
