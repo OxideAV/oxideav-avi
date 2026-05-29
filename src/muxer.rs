@@ -425,6 +425,27 @@ pub struct AviMuxOptions {
     /// preserves the pre-round-176 byte layout (`dwQuality = -1` on
     /// every stream).
     pub stream_qualities: Vec<(u32, u32)>,
+    /// Per-stream `strh.wPriority` overrides (round-182). Each entry is
+    /// `(stream_index, priority)` and stamps the given 16-bit DWORD
+    /// into byte offset 12 of that stream's 56-byte AVISTREAMHEADER per
+    /// AVI 1.0 §"AVISTREAMHEADER" (`wPriority` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix B line
+    /// 238: *"Priority of a stream type. For example, in a file with
+    /// multiple audio streams, the one with the highest priority might
+    /// be the default stream."*). Without an override the muxer writes
+    /// `0` (the muxer's own default since round-3, which the demuxer
+    /// maps back to `None`); this builder lets a caller stamp a
+    /// selection hint among same-`fccType` streams so it round-trips
+    /// through re-mux. The muxer writes whatever 16-bit value the
+    /// caller supplies verbatim and does not validate it — the spec
+    /// does not normatively pin a value range or a tie-break rule, so
+    /// any anomalous out-of-spec writer that uses the field for
+    /// application-specific tagging round-trips exactly. Duplicate
+    /// calls for the same stream index replace the prior entry — see
+    /// [`Self::with_stream_priority`]. Empty list (the default)
+    /// preserves the pre-round-182 byte layout (`wPriority = 0` on
+    /// every stream).
+    pub stream_priorities: Vec<(u32, u16)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1255,6 +1276,38 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp a `wPriority` selection-hint DWORD into
+    /// the 56-byte AVISTREAMHEADER for `stream_index` (round-182). The
+    /// 16-bit value is written little-endian at byte offset 12 of the
+    /// strh per AVI 1.0 §"AVISTREAMHEADER" (`wPriority` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix B
+    /// line 238).
+    ///
+    /// Per the spec the field is a per-stream selection hint: *"Priority
+    /// of a stream type. For example, in a file with multiple audio
+    /// streams, the one with the highest priority might be the default
+    /// stream."* The spec does not normatively pin a value range or a
+    /// tie-break rule, so the muxer writes whatever 16-bit value the
+    /// caller supplies verbatim and does **not** clamp or normalise —
+    /// applications that use the field for ad-hoc tagging round-trip
+    /// exactly.
+    ///
+    /// Passing `0` is equivalent to omitting the override — the
+    /// demuxer maps the `0` legacy writer default back to `None` (the
+    /// muxer has stamped a zero priority since round-3) so a stamp of
+    /// `0` reads as "no priority recorded" on re-demux.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_priority`] for a round-trip
+    /// of any non-zero selection hint.
+    pub fn with_stream_priority(mut self, stream_index: u32, priority: u16) -> Self {
+        self.stream_priorities
+            .retain(|(idx, _)| *idx != stream_index);
+        self.stream_priorities.push((stream_index, priority));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -1796,6 +1849,17 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, q)| *q);
+            // Round-182: optional `strh.wPriority` override for this
+            // stream (see `with_stream_priority`'s retain-then-push
+            // pattern). `None` keeps the legacy `0` writer default the
+            // demuxer maps back to `None` (per AVI 1.0
+            // §"AVISTREAMHEADER" Appendix B `wPriority` row).
+            let priority_override = self
+                .options
+                .stream_priorities
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, p)| *p);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1811,6 +1875,7 @@ impl Muxer for AviMuxer {
                 language_override,
                 initial_frames_override,
                 quality_override,
+                priority_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -3252,6 +3317,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     language_override: Option<u16>,
     initial_frames_override: Option<u32>,
     quality_override: Option<u32>,
+    priority_override: Option<u16>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -3260,7 +3326,17 @@ fn write_strl<W: Write + Seek + ?Sized>(
     strh.extend_from_slice(&t.entry.strh_type); // fccType
     strh.extend_from_slice(&t.entry.handler_fourcc); // fccHandler
     strh.extend_from_slice(&0u32.to_le_bytes()); // flags
-    strh.extend_from_slice(&0u16.to_le_bytes()); // priority
+                                                 // wPriority (round-182): an `AviMuxOptions::with_stream_priority`
+                                                 // override (when present) stamps the per-stream selection hint at
+                                                 // byte offset 12 per AVI 1.0 §"AVISTREAMHEADER" (`wPriority` row in
+                                                 // `docs/container/riff/avi-riff-file-reference.md` Appendix B line
+                                                 // 238: *"Priority of a stream type. For example, in a file with
+                                                 // multiple audio streams, the one with the highest priority might
+                                                 // be the default stream."*); otherwise the legacy default is `0`
+                                                 // (the muxer's own default since round-3, which the demuxer maps
+                                                 // back to `None`). The 16-bit value is written verbatim; the spec
+                                                 // does not normatively pin a value range or a tie-break rule.
+    strh.extend_from_slice(&priority_override.unwrap_or(0).to_le_bytes()); // priority
 
     // wLanguage (round-119): an `AviMuxOptions::with_stream_language`
     // override (when present) stamps the LANGID at byte offset 14 per

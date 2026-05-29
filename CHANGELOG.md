@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.wPriority` parse + emit + round-trip (round 182).**
+  Surfaces the `wPriority` selection-hint field at byte offset 12 of
+  the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
+  Clean-room source: `docs/container/riff/avi-riff-file-reference.md`
+  Appendix B (`wPriority` row, line 238): *"Priority of a stream type.
+  For example, in a file with multiple audio streams, the one with the
+  highest priority might be the default stream."* The muxer already
+  wrote `0` here since round 3; this round adds the typed
+  `AviDemuxer::stream_priority(stream_index) -> Option<u16>` accessor
+  (mapping the `0` legacy writer default back to `None` so an
+  unspecified priority reads the same as an absent one, mirroring the
+  round-176 `strh.dwQuality` / round-153 `dwInitialFrames` /
+  round-119 `wLanguage` / round-115 `rcFrame` / round-80 `strn` /
+  round-107 `IDIT` "default == absent" convention), the
+  `avi:strh.<n>.priority` metadata key (omitted entirely when the
+  value is the `0` default), and the
+  `AviMuxOptions::with_stream_priority(stream_index, p)` builder that
+  stamps a non-default selection hint into byte offset 12 of the strh
+  so the demuxer can round-trip it. The spec describes the field as
+  a per-`fccType` selection hint (the multi-audio-stream illustration
+  picks the default-playback stream), not a sortable global priority
+  — it pins no value range or tie-break rule, so the demuxer surfaces
+  the raw 16-bit DWORD verbatim and applications that use the field
+  for ad-hoc tagging round-trip exactly. Adds 10 new tests in
+  `tests/round182_strh_priority.rs` covering the mux→demux round-trip
+  via the typed accessor and the metadata key, the no-override
+  baseline (legacy `0` reads as absent), builder idempotency, the
+  explicit `0` override, the boundary values `1` and `u16::MAX`,
+  per-stream independence, the out-of-range accessor case,
+  independence from sibling per-stream DWORDs (`dwQuality` /
+  `dwInitialFrames` / `wLanguage`), and hand-rolled fixtures for the
+  exact byte-offset-12 layout.
 - **Per-stream `strh.dwQuality` parse + emit + round-trip (round 176).**
   Surfaces the `dwQuality` quality-indicator field at byte offset 40 of
   the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".

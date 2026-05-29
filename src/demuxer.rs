@@ -285,6 +285,18 @@ fn open_avi_inner(
     // same as an absent one, mirroring the round-153 `dwInitialFrames`
     // "default == absent" convention.
     let mut stream_qualities: Vec<Option<u32>> = Vec::new();
+    // Round-182: per-stream `strh.wPriority` selection hint from byte
+    // offset 12 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    // (`wPriority` row in `docs/container/riff/avi-riff-file-reference.md`,
+    // Appendix B line 238: *"Priority of a stream type. For example, in a
+    // file with multiple audio streams, the one with the highest priority
+    // might be the default stream."*). Parallel to `streams`:
+    // `Some(priority)` when the strh declared a non-zero hint, `None`
+    // when it carried the legacy `0` writer default so an unspecified
+    // priority reads the same as an absent one, mirroring the
+    // round-119 `wLanguage` / round-176 `dwQuality` "default == absent"
+    // convention.
+    let mut stream_priorities: Vec<Option<u16>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -318,6 +330,7 @@ fn open_avi_inner(
         &mut stream_languages,
         &mut stream_initial_frames,
         &mut stream_qualities,
+        &mut stream_priorities,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -355,6 +368,7 @@ fn open_avi_inner(
                     &mut stream_languages,
                     &mut stream_initial_frames,
                     &mut stream_qualities,
+                    &mut stream_priorities,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -851,6 +865,26 @@ fn open_avi_inner(
         }
     }
 
+    // Round-182: AVI 1.0 §"AVISTREAMHEADER" `wPriority` field at byte
+    // offset 12 of the strh. Surfaced as
+    // `avi:strh.<index>.priority = "<u16>"` for every stream whose strh
+    // declared a non-zero selection hint ("Priority of a stream type.
+    // For example, in a file with multiple audio streams, the one with
+    // the highest priority might be the default stream." per AVI 1.0
+    // §"AVISTREAMHEADER" Appendix B `wPriority` row). The legacy `0`
+    // writer default is omitted so an unspecified priority reads the
+    // same as an absent one, mirroring the `avi:strh.<n>.quality` /
+    // `language` / `initial_frames` conventions. The raw 16-bit value
+    // is also reachable via the typed [`AviDemuxer::stream_priority`]
+    // accessor; the demuxer surfaces it verbatim and does not pin a
+    // value range — the spec describes a selection hint, not a
+    // sortable global priority.
+    for (i, priority_opt) in stream_priorities.iter().enumerate() {
+        if let Some(p) = priority_opt {
+            metadata.push((format!("avi:strh.{i}.priority"), p.to_string()));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1296,6 +1330,7 @@ fn open_avi_inner(
         stream_languages,
         stream_initial_frames,
         stream_qualities,
+        stream_priorities,
         digitization_date,
         smpte_timecode,
     })
@@ -1329,6 +1364,7 @@ fn walk_riff_body(
     stream_languages: &mut Vec<Option<u16>>,
     stream_initial_frames: &mut Vec<Option<u32>>,
     stream_qualities: &mut Vec<Option<u32>>,
+    stream_priorities: &mut Vec<Option<u16>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1368,6 +1404,7 @@ fn walk_riff_body(
                         langs,
                         initial_frames_vec,
                         qualities_vec,
+                        priorities_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1387,6 +1424,7 @@ fn walk_riff_body(
                     *stream_languages = langs;
                     *stream_initial_frames = initial_frames_vec;
                     *stream_qualities = qualities_vec;
+                    *stream_priorities = priorities_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1623,6 +1661,7 @@ type HdrlOutput = (
     Vec<Option<u16>>,
     Vec<Option<u32>>,
     Vec<Option<u32>>,
+    Vec<Option<u16>>,
     Option<String>,
     Option<String>,
 );
@@ -1654,6 +1693,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut stream_languages: Vec<Option<u16>> = Vec::new();
     let mut stream_initial_frames: Vec<Option<u32>> = Vec::new();
     let mut stream_qualities: Vec<Option<u32>> = Vec::new();
+    let mut stream_priorities: Vec<Option<u16>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1725,6 +1765,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         lang,
                         initial_frames,
                         quality,
+                        priority,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1740,6 +1781,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_languages.push(lang);
                         stream_initial_frames.push(initial_frames);
                         stream_qualities.push(quality);
+                        stream_priorities.push(priority);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1786,6 +1828,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_languages,
         stream_initial_frames,
         stream_qualities,
+        stream_priorities,
         digitization_date,
         smpte_timecode,
     ))
@@ -1914,6 +1957,7 @@ type StrlOutput = (
     Option<u16>,
     Option<u32>,
     Option<u32>,
+    Option<u16>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2032,6 +2076,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -2051,6 +2096,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.6,
         parsed.7,
         parsed.8,
+        parsed.9,
     ))
 }
 
@@ -2539,6 +2585,7 @@ type BuildStreamOutput = (
     Option<u16>,
     Option<u32>,
     Option<u32>,
+    Option<u16>,
 );
 
 fn build_stream(
@@ -2591,6 +2638,31 @@ fn build_stream(
         None
     } else {
         Some(language_raw)
+    };
+
+    // `wPriority` (round-182): a 16-bit DWORD at byte offset 12 of the
+    // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`wPriority` row
+    // in `docs/container/riff/avi-riff-file-reference.md`, Appendix B
+    // line 238): *"Priority of a stream type. For example, in a file
+    // with multiple audio streams, the one with the highest priority
+    // might be the default stream."* The spec describes the field as a
+    // selection hint among same-`fccType` streams (the file with
+    // several audio streams picking a default-playback one), not a
+    // sortable global priority. The demuxer surfaces the raw 16-bit
+    // DWORD verbatim and leaves the "what counts as highest" decision
+    // to the caller — the spec does not normatively pin a value range
+    // or a tie-break rule. `0` is the legacy writer default (the
+    // muxer has stamped a zero priority since round-3) and maps to
+    // `None` here so an unspecified priority reads the same as an
+    // absent one, mirroring the round-119 `wLanguage` / round-153
+    // `dwInitialFrames` / round-176 `dwQuality` / round-115 `rcFrame`
+    // / round-80 `strn` / round-107 `IDIT` "default == absent"
+    // convention.
+    let priority_raw = u16::from_le_bytes([strh[12], strh[13]]);
+    let priority: Option<u16> = if priority_raw == 0 {
+        None
+    } else {
+        Some(priority_raw)
     };
 
     // `dwInitialFrames` (round-153): a u32 at byte offset 16 of the
@@ -2901,6 +2973,7 @@ fn build_stream(
         language,
         initial_frames,
         quality,
+        priority,
     ))
 }
 
@@ -3545,6 +3618,24 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::stream_quality`] accessor in addition to the
     /// `avi:strh.<index>.quality` metadata key.
     stream_qualities: Vec<Option<u32>>,
+    /// Per-stream `strh.wPriority` from byte offset 12 of the
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-182).
+    /// Indexed by stream number; `Some(priority)` when the strh declared
+    /// a non-zero selection hint, `None` when it carried the legacy `0`
+    /// writer default so an unspecified priority reads the same as an
+    /// absent one. Per the `wPriority` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (Appendix B
+    /// line 238): *"Priority of a stream type. For example, in a file
+    /// with multiple audio streams, the one with the highest priority
+    /// might be the default stream."* The field is a selection hint
+    /// among same-`fccType` streams (the spec illustration picks a
+    /// default-playback audio stream among several); the spec does not
+    /// normatively pin a value range or a tie-break rule so the
+    /// demuxer surfaces the raw 16-bit DWORD verbatim and leaves the
+    /// "what counts as highest" decision to the caller. Surfaced via
+    /// the typed [`AviDemuxer::stream_priority`] accessor in addition
+    /// to the `avi:strh.<index>.priority` metadata key.
+    stream_priorities: Vec<Option<u16>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -5640,6 +5731,40 @@ impl AviDemuxer {
         self.stream_qualities
             .get(stream_index as usize)
             .and_then(|q| *q)
+    }
+
+    /// `strh.wPriority` selection hint for a stream, as the raw 16-bit
+    /// DWORD read little-endian off byte offset 12 of the 56-byte
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-182). Per
+    /// the `wPriority` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (Appendix B
+    /// line 238): *"Priority of a stream type. For example, in a file
+    /// with multiple audio streams, the one with the highest priority
+    /// might be the default stream."*
+    ///
+    /// The field is a selection hint among same-`fccType` streams
+    /// (the spec illustration picks a default-playback audio stream
+    /// among several `auds` streams); the spec does not normatively
+    /// pin a value range or a tie-break rule, so the demuxer surfaces
+    /// the raw 16-bit DWORD verbatim and leaves the "what counts as
+    /// highest" decision to the caller. Out-of-spec writers — those
+    /// stamping arbitrary u16 values for application-specific tagging
+    /// — round-trip exactly: the demuxer does not clamp or normalise.
+    ///
+    /// Returns `None` when the strh carried the documented `0` legacy
+    /// writer default — the muxer's own default since round-3 — so an
+    /// unspecified priority reads the same as an absent one (mirroring
+    /// the round-176 `dwQuality` / round-153 `dwInitialFrames` /
+    /// round-119 `wLanguage` / round-115 `rcFrame` / round-80 `strn`
+    /// / round-107 `IDIT` "default == absent" convention), or for an
+    /// out-of-range stream index. The same value surfaces as the
+    /// `avi:strh.<index>.priority` metadata key (also omitted when
+    /// absent), and round-trips a muxer-emitted priority set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_priority`].
+    pub fn stream_priority(&self, stream_index: u32) -> Option<u16> {
+        self.stream_priorities
+            .get(stream_index as usize)
+            .and_then(|p| *p)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside
