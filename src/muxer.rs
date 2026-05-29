@@ -401,6 +401,30 @@ pub struct AviMuxOptions {
     /// Empty list (the default) preserves the pre-round-153 byte layout
     /// (`dwInitialFrames = 0` on every stream).
     pub stream_initial_frames: Vec<(u32, u32)>,
+    /// Per-stream `strh.dwQuality` overrides (round-176). Each entry is
+    /// `(stream_index, quality)` and stamps the given 32-bit value into
+    /// byte offset 40 of that stream's 56-byte AVISTREAMHEADER per AVI
+    /// 1.0 §"AVISTREAMHEADER" (`dwQuality` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` line 246:
+    /// *"Indicator of the quality of the data in the stream. Quality
+    /// is represented as a number between 0 and 10,000. For compressed
+    /// data, this typically represents the value of the quality
+    /// parameter passed to the compression software. If set to -1,
+    /// drivers use the default quality value."*). Without an override
+    /// the muxer writes `0xFFFF_FFFF` (= `-1` as i32, the documented
+    /// "use default driver quality" sentinel — the muxer's own default
+    /// since round-3, which the demuxer maps back to `None`); this
+    /// builder lets a caller stamp the quality parameter the encoder
+    /// was driven with so it round-trips through re-mux. The muxer
+    /// writes whatever 32-bit value the caller supplies verbatim and
+    /// does not clamp to the documented `[0, 10_000]` range — anomalous
+    /// out-of-spec writers (capture drivers stamping full-precision
+    /// quality scores etc.) round-trip exactly. Duplicate calls for the
+    /// same stream index replace the prior entry — see
+    /// [`Self::with_stream_quality`]. Empty list (the default)
+    /// preserves the pre-round-176 byte layout (`dwQuality = -1` on
+    /// every stream).
+    pub stream_qualities: Vec<(u32, u32)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1196,6 +1220,41 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp a `dwQuality` quality indicator into the
+    /// 56-byte AVISTREAMHEADER for `stream_index` (round-176). The
+    /// 32-bit value is written little-endian at byte offset 40 of the
+    /// strh per AVI 1.0 §"AVISTREAMHEADER" (`dwQuality` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` line 246).
+    ///
+    /// Per the spec the field is the per-stream quality indicator:
+    /// *"Indicator of the quality of the data in the stream. Quality
+    /// is represented as a number between 0 and 10,000. For compressed
+    /// data, this typically represents the value of the quality
+    /// parameter passed to the compression software. If set to -1,
+    /// drivers use the default quality value."* The documented range
+    /// is `[0, 10_000]` but the muxer writes whatever 32-bit value the
+    /// caller supplies verbatim and does **not** clamp or normalise —
+    /// anomalous out-of-spec writers (capture drivers stamping
+    /// full-precision quality scores etc.) round-trip exactly.
+    ///
+    /// Passing `0xFFFF_FFFF` (= `-1` as i32) is equivalent to omitting
+    /// the override — the demuxer maps the documented `-1` "use default
+    /// driver quality" sentinel back to `None` (per AVI 1.0
+    /// §"AVISTREAMHEADER" `dwQuality` row: *"If set to -1, drivers use
+    /// the default quality value."*) so a stamp of `-1` reads as "no
+    /// quality recorded" on re-demux.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_quality`] for a round-trip
+    /// of any non-default-sentinel quality.
+    pub fn with_stream_quality(mut self, stream_index: u32, quality: u32) -> Self {
+        self.stream_qualities
+            .retain(|(idx, _)| *idx != stream_index);
+        self.stream_qualities.push((stream_index, quality));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -1726,6 +1785,17 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, f)| *f);
+            // Round-176: optional `strh.dwQuality` override for this
+            // stream (see `with_stream_quality`'s retain-then-push
+            // pattern). `None` keeps the legacy `0xFFFF_FFFF` (-1, "use
+            // default driver quality" per AVI 1.0 §"AVISTREAMHEADER"
+            // `dwQuality` row) default the demuxer maps back to `None`.
+            let quality_override = self
+                .options
+                .stream_qualities
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, q)| *q);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1740,6 +1810,7 @@ impl Muxer for AviMuxer {
                 frame_rect_override,
                 language_override,
                 initial_frames_override,
+                quality_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -3180,6 +3251,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     frame_rect_override: Option<[i16; 4]>,
     language_override: Option<u16>,
     initial_frames_override: Option<u32>,
+    quality_override: Option<u32>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -3211,7 +3283,16 @@ fn write_strl<W: Write + Seek + ?Sized>(
     strh.extend_from_slice(&0u32.to_le_bytes()); // start
     strh.extend_from_slice(&0u32.to_le_bytes()); // length (patched)
     strh.extend_from_slice(&0u32.to_le_bytes()); // suggested_buffer_size (patched)
-    strh.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // quality = -1 (default)
+                                                 // dwQuality (round-176): an `AviMuxOptions::with_stream_quality`
+                                                 // override (when present) stamps the per-stream quality indicator at
+                                                 // byte offset 40 per AVI 1.0 §"AVISTREAMHEADER" (`dwQuality` row in
+                                                 // `docs/container/riff/avi-riff-file-reference.md` line 246);
+                                                 // otherwise the legacy default is `0xFFFF_FFFF` (= `-1` as i32, the
+                                                 // documented "use default driver quality" sentinel — *"If set to -1,
+                                                 // drivers use the default quality value."* — which the demuxer maps
+                                                 // back to `None`). The 32-bit value is written verbatim; no clamp to
+                                                 // the documented `[0, 10_000]` range.
+    strh.extend_from_slice(&quality_override.unwrap_or(0xFFFF_FFFFu32).to_le_bytes());
     strh.extend_from_slice(&t.entry.sample_size.to_le_bytes());
     // rcFrame: left, top, right, bottom (i16 each) at byte offset 48 of
     // the 56-byte AVISTREAMHEADER. A round-115

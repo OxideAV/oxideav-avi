@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.dwQuality` parse + emit + round-trip (round 176).**
+  Surfaces the `dwQuality` quality-indicator field at byte offset 40 of
+  the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
+  Clean-room source: `docs/container/riff/avi-riff-file-reference.md`
+  Appendix B (`dwQuality` row, line 246): *"Indicator of the quality of
+  the data in the stream. Quality is represented as a number between 0
+  and 10,000. For compressed data, this typically represents the value
+  of the quality parameter passed to the compression software. If set
+  to -1, drivers use the default quality value."* The muxer already
+  wrote `0xFFFF_FFFF` (= `-1` as i32, the documented "use default
+  driver quality" sentinel) here since round 3; this round adds the
+  typed `AviDemuxer::stream_quality(stream_index) -> Option<u32>`
+  accessor (mapping the documented `-1` sentinel back to `None` so an
+  unspecified quality reads the same as an absent one, mirroring the
+  round-153 `strh.dwInitialFrames` / round-119 `wLanguage` / round-115
+  `rcFrame` / round-80 `strn` / round-107 `IDIT` "default == absent"
+  convention), the `avi:strh.<n>.quality` metadata key (omitted
+  entirely when the value is the `-1` sentinel), and the
+  `AviMuxOptions::with_stream_quality(stream_index, q)` builder that
+  stamps any 32-bit value verbatim at byte offset 40. The spec's
+  documented `[0, 10_000]` range is informational only — values in
+  that range surface verbatim, but `0` is *not* treated as default
+  (only the explicit `0xFFFF_FFFF` sentinel is), and out-of-range
+  writers round-trip exactly without clamp. The per-stream
+  `dwQuality` is independent of the file-global `avih`-side DWORDs and
+  of the round-153 per-stream `dwInitialFrames` / round-119
+  `wLanguage` / round-115 `rcFrame` siblings — none bleed into each
+  other. Covered by 11 new tests in `tests/round176_strh_quality.rs`:
+  mux→demux round-trip, default baseline (sentinel == absent), builder
+  idempotency (per-index `retain`-then-`push`), explicit `-1`
+  override, documented-range endpoints (`0` and `10_000`), out-of-spec
+  values (`0x0001_0000`, `0x7FFF_FFFE`), per-stream independence,
+  out-of-range stream-index accessor, sibling-DWORD independence, and
+  hand-rolled fixtures (explicit non-default + all-ones controlling
+  the exact strh bytes at offset 40).
 - **Typed `WAVEFORMATEXTENSIBLE.dwChannelMask` surface (round 163).**
   New `ChannelMask` newtype + `Speaker` enum + `ChannelLayout`
   recogniser in `stream_format`, plus

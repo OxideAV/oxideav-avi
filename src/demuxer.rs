@@ -275,6 +275,16 @@ fn open_avi_inner(
     // the round-119 `wLanguage` / round-115 `rcFrame` "default == absent"
     // convention.
     let mut stream_initial_frames: Vec<Option<u32>> = Vec::new();
+    // Round-176: per-stream `strh.dwQuality` indicator from byte offset 40
+    // of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwQuality`
+    // row in `docs/container/riff/avi-riff-file-reference.md`, line 246).
+    // Parallel to `streams`: `Some(quality)` when the strh declared a
+    // value in `[0, u32::MAX - 1]`, `None` when it carried the documented
+    // `-1` (= `0xFFFF_FFFF` u32) "use default driver quality" sentinel
+    // (the legacy muxer default) so an unspecified quality reads the
+    // same as an absent one, mirroring the round-153 `dwInitialFrames`
+    // "default == absent" convention.
+    let mut stream_qualities: Vec<Option<u32>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -307,6 +317,7 @@ fn open_avi_inner(
         &mut stream_frame_rects,
         &mut stream_languages,
         &mut stream_initial_frames,
+        &mut stream_qualities,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -343,6 +354,7 @@ fn open_avi_inner(
                     &mut stream_frame_rects,
                     &mut stream_languages,
                     &mut stream_initial_frames,
+                    &mut stream_qualities,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -817,6 +829,28 @@ fn open_avi_inner(
         }
     }
 
+    // Round-176: AVI 1.0 §"AVISTREAMHEADER" `dwQuality` field at byte
+    // offset 40 of the strh. Surfaced as
+    // `avi:strh.<index>.quality = "<u32>"` for every stream whose strh
+    // declared a value other than the `-1` (`0xFFFF_FFFF` u32) writer
+    // default ("use default driver quality" per AVI 1.0 §"AVISTREAMHEADER"
+    // `dwQuality` row: *"If set to -1, drivers use the default quality
+    // value."*) so an unspecified quality reads the same as an absent
+    // one (mirroring the `avi:strh.<n>.initial_frames` / `language` /
+    // `frame_rect` conventions). The raw 32-bit value is also reachable
+    // via the typed [`AviDemuxer::stream_quality`] accessor; per the
+    // spec the documented range is `[0, 10_000]` (where the value is
+    // "represented as a number between 0 and 10,000"; for compressed
+    // streams it typically reflects "the value of the quality parameter
+    // passed to the compression software") but the demuxer surfaces the
+    // raw u32 verbatim and does not clamp or normalise, so anomalous
+    // out-of-range writers round-trip exactly.
+    for (i, quality_opt) in stream_qualities.iter().enumerate() {
+        if let Some(q) = quality_opt {
+            metadata.push((format!("avi:strh.{i}.quality"), q.to_string()));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1261,6 +1295,7 @@ fn open_avi_inner(
         stream_frame_rects,
         stream_languages,
         stream_initial_frames,
+        stream_qualities,
         digitization_date,
         smpte_timecode,
     })
@@ -1293,6 +1328,7 @@ fn walk_riff_body(
     stream_frame_rects: &mut Vec<Option<[i16; 4]>>,
     stream_languages: &mut Vec<Option<u16>>,
     stream_initial_frames: &mut Vec<Option<u32>>,
+    stream_qualities: &mut Vec<Option<u32>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1331,6 +1367,7 @@ fn walk_riff_body(
                         rcframes,
                         langs,
                         initial_frames_vec,
+                        qualities_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1349,6 +1386,7 @@ fn walk_riff_body(
                     *stream_frame_rects = rcframes;
                     *stream_languages = langs;
                     *stream_initial_frames = initial_frames_vec;
+                    *stream_qualities = qualities_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1584,6 +1622,7 @@ type HdrlOutput = (
     Vec<Option<[i16; 4]>>,
     Vec<Option<u16>>,
     Vec<Option<u32>>,
+    Vec<Option<u32>>,
     Option<String>,
     Option<String>,
 );
@@ -1614,6 +1653,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut stream_frame_rects: Vec<Option<[i16; 4]>> = Vec::new();
     let mut stream_languages: Vec<Option<u16>> = Vec::new();
     let mut stream_initial_frames: Vec<Option<u32>> = Vec::new();
+    let mut stream_qualities: Vec<Option<u32>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1684,6 +1724,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         rc_frame,
                         lang,
                         initial_frames,
+                        quality,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1698,6 +1739,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_frame_rects.push(rc_frame);
                         stream_languages.push(lang);
                         stream_initial_frames.push(initial_frames);
+                        stream_qualities.push(quality);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1743,6 +1785,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_frame_rects,
         stream_languages,
         stream_initial_frames,
+        stream_qualities,
         digitization_date,
         smpte_timecode,
     ))
@@ -1870,6 +1913,7 @@ type StrlOutput = (
     Option<[i16; 4]>,
     Option<u16>,
     Option<u32>,
+    Option<u32>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -1987,6 +2031,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -2005,6 +2050,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.5,
         parsed.6,
         parsed.7,
+        parsed.8,
     ))
 }
 
@@ -2492,6 +2538,7 @@ type BuildStreamOutput = (
     Option<[i16; 4]>,
     Option<u16>,
     Option<u32>,
+    Option<u32>,
 );
 
 fn build_stream(
@@ -2568,6 +2615,31 @@ fn build_stream(
         None
     } else {
         Some(initial_frames_raw)
+    };
+
+    // `dwQuality` (round-176): a u32 at byte offset 40 of the 56-byte
+    // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwQuality` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, line 246):
+    // *"Indicator of the quality of the data in the stream. Quality is
+    // represented as a number between 0 and 10,000. For compressed data,
+    // this typically represents the value of the quality parameter passed
+    // to the compression software. If set to -1, drivers use the default
+    // quality value."* The `-1` (`0xFFFF_FFFF` as u32) sentinel is the
+    // documented "use default driver quality" marker — both the legacy
+    // muxer default and what the spec text calls out as a special value —
+    // mapped here to `None` so an unspecified quality reads the same as
+    // an absent one, mirroring the round-153 `dwInitialFrames` /
+    // round-119 `wLanguage` / round-115 `rcFrame` "default == absent"
+    // convention. Values in the documented `[0, 10_000]` range surface
+    // verbatim; anomalous out-of-range writers (e.g. capture tools that
+    // stamp arbitrary u32 values like the high-precision quality scores
+    // some legacy VfW drivers use) also surface verbatim — the demuxer
+    // does not clamp or normalise.
+    let quality_raw = u32::from_le_bytes([strh[40], strh[41], strh[42], strh[43]]);
+    let quality: Option<u32> = if quality_raw == 0xFFFF_FFFF {
+        None
+    } else {
+        Some(quality_raw)
     };
 
     // `rcFrame` (round-115): the AVISTREAMHEADER destination rectangle at
@@ -2828,6 +2900,7 @@ fn build_stream(
         rc_frame,
         language,
         initial_frames,
+        quality,
     ))
 }
 
@@ -3453,6 +3526,25 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::stream_initial_frames`] accessor in addition to
     /// the `avi:strh.<index>.initial_frames` metadata key.
     stream_initial_frames: Vec<Option<u32>>,
+    /// Per-stream `strh.dwQuality` from byte offset 40 of the
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-176).
+    /// Indexed by stream number; `Some(quality)` when the strh declared
+    /// a value other than the `-1` (`0xFFFF_FFFF` u32) "use default
+    /// driver quality" sentinel, `None` when it carried the legacy
+    /// muxer default per the `dwQuality` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (*"If set to
+    /// -1, drivers use the default quality value."*) so an unspecified
+    /// quality reads the same as an absent one. Per the same row the
+    /// documented range is `[0, 10_000]` (*"Indicator of the quality
+    /// of the data in the stream. Quality is represented as a number
+    /// between 0 and 10,000. For compressed data, this typically
+    /// represents the value of the quality parameter passed to the
+    /// compression software."*); the demuxer surfaces the raw u32
+    /// verbatim and does not clamp or normalise, so anomalous
+    /// out-of-range writers round-trip exactly. Surfaced via the typed
+    /// [`AviDemuxer::stream_quality`] accessor in addition to the
+    /// `avi:strh.<index>.quality` metadata key.
+    stream_qualities: Vec<Option<u32>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -5514,6 +5606,40 @@ impl AviDemuxer {
         self.stream_initial_frames
             .get(stream_index as usize)
             .and_then(|f| *f)
+    }
+
+    /// `strh.dwQuality` quality indicator for a stream, as the raw
+    /// 32-bit value read little-endian off byte offset 40 of the
+    /// 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    /// (round-176). Per the `dwQuality` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 246):
+    /// *"Indicator of the quality of the data in the stream. Quality
+    /// is represented as a number between 0 and 10,000. For
+    /// compressed data, this typically represents the value of the
+    /// quality parameter passed to the compression software. If set
+    /// to -1, drivers use the default quality value."*
+    ///
+    /// The demuxer surfaces the raw 32-bit DWORD verbatim. Per the
+    /// spec the documented range is `[0, 10_000]`; legacy capture
+    /// drivers occasionally stamp arbitrary values outside that range
+    /// (full-precision quality scores, framework-internal markers,
+    /// etc.) and the demuxer does not clamp or normalise — so
+    /// out-of-spec writers round-trip exactly.
+    ///
+    /// Returns `None` when the strh carried the documented `-1`
+    /// (`0xFFFF_FFFF` as u32) "use default driver quality" writer
+    /// default — the legacy muxer's own default since round-3 — so an
+    /// unspecified quality reads the same as an absent one (mirroring
+    /// the `dwInitialFrames` / `wLanguage` / `rcFrame` / `strn` /
+    /// `IDIT` "default == absent" convention), or for an out-of-range
+    /// stream index. The same value surfaces as the
+    /// `avi:strh.<index>.quality` metadata key (also omitted when
+    /// absent), and round-trips a muxer-emitted quality set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_quality`].
+    pub fn stream_quality(&self, stream_index: u32) -> Option<u32> {
+        self.stream_qualities
+            .get(stream_index as usize)
+            .and_then(|q| *q)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside
