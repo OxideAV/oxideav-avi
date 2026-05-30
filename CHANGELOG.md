@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-avi/compare/v0.0.7...v0.0.8) - 2026-05-29
+
+### Other
+
+- per-stream strh.wPriority parse + emit (round 182)
+- per-stream strh.dwQuality parse + emit (round 176)
+- typed WAVEFORMATEXTENSIBLE.dwChannelMask surface (round 163)
+- file-global avih.dwInitialFrames parse + emit (round 157)
+- per-stream strh.dwInitialFrames parse + emit (round 153)
+- strh.wLanguage per-stream LANGID parse + emit (round 119)
+
 ### Added
 
 - **Per-stream `strh.wPriority` parse + emit + round-trip (round 182).**
