@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenDML `indx` super-index `bIndexSubType` surface (round 197).**
+  Per the AVISUPERINDEX layout in
+  `docs/container/riff/avi-riff-file-reference.md` Appendix F
+  (`bIndexSubType` row: *"The index subtype. The value must be zero
+  or AVI_INDEX_SUB_2FIELD."*) the super-index inherits the sub-type
+  of the pointed-to per-segment `ix##` standard indexes — so an
+  OpenDML reader that sees `AVI_INDEX_SUB_2FIELD` on the super-index
+  knows the pointed-to segments will carry 12-byte 2-field
+  `(dwOffset, dwSize, dwOffsetField2)` entries. The muxer (round-4
+  P1) already stamps this byte for streams registered via
+  `AviMuxOptions::with_field2_stream`; the demuxer parsed it but
+  never surfaced it, so callers had to wait for the in-`movi` `ix##`
+  scan to fire the existing `avi:ix.<n>.is_2field` hint. Round-197
+  adds the typed
+  `AviDemuxer::super_index_sub_type(stream_index) -> Option<u8>`
+  accessor (returns the raw byte verbatim; `None` distinguishes "no
+  super-index declared" from "super-index sub-type 0"), the
+  `AviDemuxer::super_index_is_2field(stream_index) -> bool`
+  convenience boolean, and the `avi:indx.<n>.sub_type_2field`
+  metadata key (only emitted when the byte is
+  `AVI_INDEX_SUB_2FIELD == 0x01`; the `0` default is omitted so
+  absence stays observable, mirroring the round-176/153/119/115/107
+  "default == absent" convention). Three regression tests cover the
+  2-field round-trip, the default-subtype default-suppression, and
+  the AVI 1.0 "no super-index" case.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-avi/compare/v0.0.7...v0.0.8) - 2026-05-29
 
 ### Other

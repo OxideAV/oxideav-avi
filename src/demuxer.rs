@@ -1030,6 +1030,39 @@ fn open_avi_inner(
         }
     }
 
+    // Round-197: surface the `indx` super-index's own `bIndexSubType`
+    // byte. Per the AVISUPERINDEX layout in
+    // `docs/container/riff/avi-riff-file-reference.md` Appendix F
+    // (`bIndexSubType` field, line 366: *"0 (default)"*) and the
+    // §"AVISUPERINDEX" companion in Appendix E (`bIndexSubType` line
+    // 329: *"Index sub-type (e.g., AVI_INDEX_SUB_2FIELD)"*), the
+    // super-index inherits the sub-type of the per-segment `ix##`
+    // standard indexes it points at — so `AVI_INDEX_SUB_2FIELD` on
+    // the super-index is the reader-facing signal that every
+    // pointed-to segment's `ix##` will carry 2-field-interlaced
+    // entries (12-byte `(dwOffset, dwSize, dwOffsetField2)` records
+    // instead of the default 8-byte `(dwOffset, dwSize)` pair). The
+    // muxer already stamps this byte under `with_field2_stream(0)`
+    // for stream 0's super-index (see round-4 P1
+    // `opendml_field2_super_index_inherits_subtype`); this surfaces
+    // the parsed value verbatim on the demuxer side so a reader can
+    // detect the 2-field declaration from the `strl`-level super
+    // index *before* having to scan into the `movi` body for the
+    // first `ix##` chunk. Skip the `0` default so absence of the key
+    // stays observable, mirroring the round-176/153/119/115/107
+    // "default == absent" convention. Skip empty super-indexes so a
+    // stream that never declared an `indx` produces no key (otherwise
+    // the post-pad to `streams.len()` zero-slots would emit spurious
+    // entries).
+    for (i, sx) in super_indexes.iter().enumerate() {
+        if sx.entries.is_empty() {
+            continue;
+        }
+        if sx.b_index_sub_type == AVI_INDEX_SUB_2FIELD {
+            metadata.push((format!("avi:indx.{i}.sub_type_2field"), "true".into()));
+        }
+    }
+
     // Round-5 candidate 2: when an idx1 table is present alongside
     // an `AVI_INDEX_2FIELD` ix## for the same stream, surface a
     // per-stream "interlaced via idx1" hint at the idx1 layer. The
@@ -5359,6 +5392,54 @@ impl AviDemuxer {
             }
         }
         out
+    }
+
+    /// Raw `bIndexSubType` byte of a stream's `indx` super-index
+    /// (round-197).
+    ///
+    /// Per AVISUPERINDEX (clean-room source:
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix F,
+    /// `bIndexSubType` row): *"The index subtype. The value must be
+    /// zero or AVI_INDEX_SUB_2FIELD."* `AVI_INDEX_SUB_2FIELD` is
+    /// `0x01` per Appendix E §"Sub-types" — the super-index inherits
+    /// it from the pointed-to per-segment `ix##` standard indexes so
+    /// a reader can detect 2-field interlaced carriage from the
+    /// `strl`-level super index *before* opening the `movi` body.
+    ///
+    /// Returns the raw u8 verbatim (no normalisation: the spec pins
+    /// only two values but the demuxer surfaces whatever the file
+    /// carried). Returns `None` for `stream_index` out of range or
+    /// streams that didn't declare an `indx` super-index (the AVI-1.0
+    /// case and OpenDML streams whose `strl` reserved no super-index
+    /// slot). The companion [`Self::super_index_is_2field`] folds the
+    /// raw byte into a boolean for the common "is this stream
+    /// interlaced?" question; this accessor exposes the raw value for
+    /// callers that need to round-trip writer-private subtype bytes
+    /// or distinguish an explicit `0` declaration from "no super
+    /// index at all".
+    pub fn super_index_sub_type(&self, stream_index: u32) -> Option<u8> {
+        let sx = self.super_indexes.get(stream_index as usize)?;
+        if sx.entries.is_empty() {
+            // Pad slot (no indx declared) — distinguishable from a
+            // genuine super-index whose sub-type happens to be 0.
+            return None;
+        }
+        Some(sx.b_index_sub_type)
+    }
+
+    /// True iff the stream's `indx` super-index declares the
+    /// `AVI_INDEX_SUB_2FIELD` (= `0x01`) sub-type (round-197).
+    ///
+    /// Convenience wrapper around [`Self::super_index_sub_type`].
+    /// Returns `false` for streams without an `indx` super-index or
+    /// whose super-index sub-type byte is the `0` default. This is
+    /// the highest-fanout reader-facing signal for interlaced
+    /// 2-field carriage on OpenDML files: it requires only the
+    /// `strl`-level super-index parse, not the in-`movi` `ix##` scan
+    /// that backs [`AviDemuxer::field2_offset_for_packet`] and the
+    /// existing `avi:ix.<n>.is_2field` metadata key.
+    pub fn super_index_is_2field(&self, stream_index: u32) -> bool {
+        self.super_index_sub_type(stream_index) == Some(AVI_INDEX_SUB_2FIELD)
     }
 
     /// Per-stream `vprp` `VIDEO_FIELD_DESC` records (round-9
