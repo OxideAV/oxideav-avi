@@ -297,6 +297,20 @@ fn open_avi_inner(
     // round-119 `wLanguage` / round-176 `dwQuality` "default == absent"
     // convention.
     let mut stream_priorities: Vec<Option<u16>> = Vec::new();
+    // Round-203: per-stream `strh.dwStart` starting time from byte
+    // offset 28 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    // (`dwStart` row in `docs/container/riff/avi-riff-file-reference.md`
+    // line 243: *"Starting time for this stream. The units are defined
+    // by the dwRate and dwScale members in the main file header.
+    // Usually, this is zero, but it can specify a delay time for a
+    // stream that does not start concurrently with the file."*).
+    // Parallel to `streams`: `Some(start)` when the strh declared a
+    // non-zero start, `None` when it carried the legacy `0` writer
+    // default (the spec-documented "starts concurrently with the file"
+    // value) so an unspecified start reads the same as an absent one,
+    // mirroring the round-182 `wPriority` / round-176 `dwQuality` /
+    // round-153 `dwInitialFrames` "default == absent" convention.
+    let mut stream_starts: Vec<Option<u32>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -331,6 +345,7 @@ fn open_avi_inner(
         &mut stream_initial_frames,
         &mut stream_qualities,
         &mut stream_priorities,
+        &mut stream_starts,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -369,6 +384,7 @@ fn open_avi_inner(
                     &mut stream_initial_frames,
                     &mut stream_qualities,
                     &mut stream_priorities,
+                    &mut stream_starts,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -885,6 +901,28 @@ fn open_avi_inner(
         }
     }
 
+    // Round-203: AVI 1.0 §"AVISTREAMHEADER" `dwStart` field at byte
+    // offset 28 of the strh. Surfaced as
+    // `avi:strh.<index>.start = "<u32>"` for every stream whose strh
+    // declared a non-zero starting time ("Starting time for this
+    // stream. The units are defined by the dwRate and dwScale members
+    // in the main file header. Usually, this is zero, but it can
+    // specify a delay time for a stream that does not start
+    // concurrently with the file." per AVI 1.0 §"AVISTREAMHEADER"
+    // `dwStart` row, line 243). The legacy `0` writer default
+    // ("starts concurrently with the file") is omitted so an
+    // unspecified start reads the same as an absent one, mirroring
+    // the `avi:strh.<n>.priority` / `quality` / `initial_frames` /
+    // `language` conventions. The raw 32-bit value is also reachable
+    // via the typed [`AviDemuxer::stream_start`] accessor; the unit
+    // is the stream's own `(dwRate / dwScale)` tick and the demuxer
+    // surfaces the value verbatim with no rate-conversion.
+    for (i, start_opt) in stream_starts.iter().enumerate() {
+        if let Some(s) = start_opt {
+            metadata.push((format!("avi:strh.{i}.start"), s.to_string()));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1364,6 +1402,7 @@ fn open_avi_inner(
         stream_initial_frames,
         stream_qualities,
         stream_priorities,
+        stream_starts,
         digitization_date,
         smpte_timecode,
     })
@@ -1398,6 +1437,7 @@ fn walk_riff_body(
     stream_initial_frames: &mut Vec<Option<u32>>,
     stream_qualities: &mut Vec<Option<u32>>,
     stream_priorities: &mut Vec<Option<u16>>,
+    stream_starts: &mut Vec<Option<u32>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1438,6 +1478,7 @@ fn walk_riff_body(
                         initial_frames_vec,
                         qualities_vec,
                         priorities_vec,
+                        starts_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1458,6 +1499,7 @@ fn walk_riff_body(
                     *stream_initial_frames = initial_frames_vec;
                     *stream_qualities = qualities_vec;
                     *stream_priorities = priorities_vec;
+                    *stream_starts = starts_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1695,6 +1737,7 @@ type HdrlOutput = (
     Vec<Option<u32>>,
     Vec<Option<u32>>,
     Vec<Option<u16>>,
+    Vec<Option<u32>>,
     Option<String>,
     Option<String>,
 );
@@ -1727,6 +1770,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut stream_initial_frames: Vec<Option<u32>> = Vec::new();
     let mut stream_qualities: Vec<Option<u32>> = Vec::new();
     let mut stream_priorities: Vec<Option<u16>> = Vec::new();
+    let mut stream_starts: Vec<Option<u32>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1799,6 +1843,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         initial_frames,
                         quality,
                         priority,
+                        start,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1815,6 +1860,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_initial_frames.push(initial_frames);
                         stream_qualities.push(quality);
                         stream_priorities.push(priority);
+                        stream_starts.push(start);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1862,6 +1908,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_initial_frames,
         stream_qualities,
         stream_priorities,
+        stream_starts,
         digitization_date,
         smpte_timecode,
     ))
@@ -1991,6 +2038,7 @@ type StrlOutput = (
     Option<u32>,
     Option<u32>,
     Option<u16>,
+    Option<u32>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2110,6 +2158,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -2130,6 +2179,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.7,
         parsed.8,
         parsed.9,
+        parsed.10,
     ))
 }
 
@@ -2619,6 +2669,7 @@ type BuildStreamOutput = (
     Option<u32>,
     Option<u32>,
     Option<u16>,
+    Option<u32>,
 );
 
 fn build_stream(
@@ -2696,6 +2747,29 @@ fn build_stream(
         None
     } else {
         Some(priority_raw)
+    };
+
+    // `dwStart` (round-203): a u32 at byte offset 28 of the 56-byte
+    // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwStart` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, line 243):
+    // *"Starting time for this stream. The units are defined by the
+    // dwRate and dwScale members in the main file header. Usually, this
+    // is zero, but it can specify a delay time for a stream that does
+    // not start concurrently with the file."* The `0` value is the
+    // documented "starts concurrently with the file" default (also the
+    // muxer's own default since round-3), mapped here to `None` so an
+    // unspecified start reads the same as an absent one, mirroring the
+    // round-182 `wPriority` / round-176 `dwQuality` / round-153
+    // `dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame`
+    // / round-80 `strn` / round-107 `IDIT` "default == absent"
+    // convention. The unit is the stream's own `(dwRate / dwScale)`
+    // tick (frames for video, samples-or-blocks for audio) and the
+    // demuxer surfaces the raw u32 verbatim with no rate-conversion.
+    let start_raw = u32::from_le_bytes([strh[28], strh[29], strh[30], strh[31]]);
+    let start: Option<u32> = if start_raw == 0 {
+        None
+    } else {
+        Some(start_raw)
     };
 
     // `dwInitialFrames` (round-153): a u32 at byte offset 16 of the
@@ -3007,6 +3081,7 @@ fn build_stream(
         initial_frames,
         quality,
         priority,
+        start,
     ))
 }
 
@@ -3669,6 +3744,23 @@ pub struct AviDemuxer {
     /// the typed [`AviDemuxer::stream_priority`] accessor in addition
     /// to the `avi:strh.<index>.priority` metadata key.
     stream_priorities: Vec<Option<u16>>,
+    /// Per-stream `strh.dwStart` starting time from byte offset 28 of
+    /// the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-203).
+    /// Indexed by stream number; `Some(start)` when the strh declared
+    /// a non-zero start, `None` when it carried the legacy `0` writer
+    /// default so an unspecified start reads the same as an absent
+    /// one. Per the `dwStart` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 243):
+    /// *"Starting time for this stream. The units are defined by the
+    /// dwRate and dwScale members in the main file header. Usually,
+    /// this is zero, but it can specify a delay time for a stream
+    /// that does not start concurrently with the file."* The unit is
+    /// the stream's own `(dwRate / dwScale)` tick (frames for video,
+    /// samples-or-blocks for audio); the demuxer surfaces the raw u32
+    /// verbatim with no rate-conversion. Surfaced via the typed
+    /// [`AviDemuxer::stream_start`] accessor in addition to the
+    /// `avi:strh.<index>.start` metadata key.
+    stream_starts: Vec<Option<u32>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -5846,6 +5938,44 @@ impl AviDemuxer {
         self.stream_priorities
             .get(stream_index as usize)
             .and_then(|p| *p)
+    }
+
+    /// `strh.dwStart` starting time for a stream, as the raw 32-bit
+    /// DWORD read little-endian off byte offset 28 of the 56-byte
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-203). Per
+    /// the `dwStart` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 243):
+    /// *"Starting time for this stream. The units are defined by the
+    /// dwRate and dwScale members in the main file header. Usually,
+    /// this is zero, but it can specify a delay time for a stream
+    /// that does not start concurrently with the file."*
+    ///
+    /// The unit is the stream's own `(dwRate / dwScale)` tick — frames
+    /// for video, samples-or-blocks for audio — and the demuxer surfaces
+    /// the value verbatim. The spec phrases the field as a stream-local
+    /// delay relative to the file's logical start (typical use is a
+    /// non-zero `dwStart` on an audio stream whose first sample is
+    /// supposed to play several frames after the video begins, or on
+    /// a late-joining secondary video stream), so the caller decides
+    /// how to combine it with the file's own [`Self::initial_frames`]
+    /// skew.
+    ///
+    /// Returns `None` when the strh carried the documented `0` legacy
+    /// writer default (the spec-documented "starts concurrently with
+    /// the file" value, also the muxer's own default since round-3) so
+    /// an unspecified start reads the same as an absent one (mirroring
+    /// the round-182 `wPriority` / round-176 `dwQuality` / round-153
+    /// `dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame`
+    /// / round-80 `strn` / round-107 `IDIT` "default == absent"
+    /// convention), or for an out-of-range stream index. The same
+    /// value surfaces as the `avi:strh.<index>.start` metadata key
+    /// (also omitted when absent), and round-trips a muxer-emitted
+    /// start set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_start`].
+    pub fn stream_start(&self, stream_index: u32) -> Option<u32> {
+        self.stream_starts
+            .get(stream_index as usize)
+            .and_then(|s| *s)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside

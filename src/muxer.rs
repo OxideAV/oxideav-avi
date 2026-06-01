@@ -446,6 +446,30 @@ pub struct AviMuxOptions {
     /// preserves the pre-round-182 byte layout (`wPriority = 0` on
     /// every stream).
     pub stream_priorities: Vec<(u32, u16)>,
+    /// Per-stream `strh.dwStart` overrides (round-203). Each entry is
+    /// `(stream_index, start)` and stamps the given 32-bit DWORD into
+    /// byte offset 28 of that stream's 56-byte AVISTREAMHEADER per AVI
+    /// 1.0 §"AVISTREAMHEADER" (`dwStart` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` line 243:
+    /// *"Starting time for this stream. The units are defined by the
+    /// dwRate and dwScale members in the main file header. Usually,
+    /// this is zero, but it can specify a delay time for a stream that
+    /// does not start concurrently with the file."*). Without an
+    /// override the muxer writes `0` (the muxer's own default since
+    /// round-3, the spec-documented "starts concurrently with the
+    /// file" value the demuxer maps back to `None`); this builder lets
+    /// a caller stamp a non-zero start offset on a per-stream basis so
+    /// a re-mux of a file whose audio is delayed relative to the video
+    /// (or whose video starts late relative to a longer audio track)
+    /// round-trips exactly. The muxer writes whatever 32-bit value the
+    /// caller supplies verbatim and does not validate it against the
+    /// per-stream `dwLength` — the spec phrases the field as a stream-
+    /// local tick count in `(dwRate / dwScale)` units, not a global
+    /// constraint. Duplicate calls for the same stream index replace
+    /// the prior entry — see [`Self::with_stream_start`]. Empty list
+    /// (the default) preserves the pre-round-203 byte layout
+    /// (`dwStart = 0` on every stream).
+    pub stream_starts: Vec<(u32, u32)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1308,6 +1332,41 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp a `dwStart` starting-time DWORD into the
+    /// 56-byte AVISTREAMHEADER for `stream_index` (round-203). The
+    /// 32-bit value is written little-endian at byte offset 28 of the
+    /// strh per AVI 1.0 §"AVISTREAMHEADER" (`dwStart` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` line 243).
+    ///
+    /// Per the spec the field is the stream-local starting time:
+    /// *"Starting time for this stream. The units are defined by the
+    /// dwRate and dwScale members in the main file header. Usually,
+    /// this is zero, but it can specify a delay time for a stream that
+    /// does not start concurrently with the file."* The unit is the
+    /// stream's own `(dwRate / dwScale)` tick (so frames for video,
+    /// samples-or-blocks for audio) and the demuxer surfaces the raw
+    /// 32-bit DWORD verbatim — the muxer writes whatever value the
+    /// caller supplies and does not validate it against the per-stream
+    /// `dwLength`.
+    ///
+    /// Passing `0` is equivalent to omitting the override — the demuxer
+    /// maps the `0` legacy writer default back to `None` (the spec-
+    /// documented "starts concurrently with the file" value) so a
+    /// stamp of `0` reads as "no start offset recorded" on re-demux,
+    /// mirroring the round-182 `wPriority` / round-176 `dwQuality` /
+    /// round-153 `dwInitialFrames` / round-119 `wLanguage` "default ==
+    /// absent" convention.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_start`] for a round-trip of
+    /// any non-zero start offset.
+    pub fn with_stream_start(mut self, stream_index: u32, start: u32) -> Self {
+        self.stream_starts.retain(|(idx, _)| *idx != stream_index);
+        self.stream_starts.push((stream_index, start));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -1860,6 +1919,18 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, p)| *p);
+            // Round-203: optional `strh.dwStart` override for this
+            // stream (see `with_stream_start`'s retain-then-push
+            // pattern). `None` keeps the legacy `0` writer default
+            // ("starts concurrently with the file" per AVI 1.0
+            // §"AVISTREAMHEADER" `dwStart` row) the demuxer maps back
+            // to `None`.
+            let start_override = self
+                .options
+                .stream_starts
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, s)| *s);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1876,6 +1947,7 @@ impl Muxer for AviMuxer {
                 initial_frames_override,
                 quality_override,
                 priority_override,
+                start_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -3318,6 +3390,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     initial_frames_override: Option<u32>,
     quality_override: Option<u32>,
     priority_override: Option<u16>,
+    start_override: Option<u32>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -3356,7 +3429,18 @@ fn write_strl<W: Write + Seek + ?Sized>(
     strh.extend_from_slice(&initial_frames_override.unwrap_or(0).to_le_bytes()); // initial_frames
     strh.extend_from_slice(&t.entry.scale.to_le_bytes());
     strh.extend_from_slice(&t.entry.rate.to_le_bytes());
-    strh.extend_from_slice(&0u32.to_le_bytes()); // start
+    // dwStart (round-203): an `AviMuxOptions::with_stream_start` override
+    // (when present) stamps the per-stream starting time at byte offset
+    // 28 per AVI 1.0 §"AVISTREAMHEADER" (`dwStart` row in
+    // `docs/container/riff/avi-riff-file-reference.md` line 243:
+    // *"Starting time for this stream. The units are defined by the
+    // dwRate and dwScale members in the main file header. Usually, this
+    // is zero, but it can specify a delay time for a stream that does
+    // not start concurrently with the file."*); otherwise the legacy
+    // default is `0` (the muxer's own default since round-3, which the
+    // demuxer maps back to `None`). The 32-bit value is written verbatim
+    // and is not validated against the per-stream `dwLength`.
+    strh.extend_from_slice(&start_override.unwrap_or(0).to_le_bytes()); // start
     strh.extend_from_slice(&0u32.to_le_bytes()); // length (patched)
     strh.extend_from_slice(&0u32.to_le_bytes()); // suggested_buffer_size (patched)
                                                  // dwQuality (round-176): an `AviMuxOptions::with_stream_quality`

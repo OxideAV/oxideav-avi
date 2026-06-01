@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.dwStart` parse + emit + round-trip (round 203).**
+  Surfaces the `dwStart` starting-time DWORD at byte offset 28 of the
+  56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
+  Clean-room source: `docs/container/riff/avi-riff-file-reference.md`
+  Appendix B (`dwStart` row, line 243): *"Starting time for this
+  stream. The units are defined by the dwRate and dwScale members in
+  the main file header. Usually, this is zero, but it can specify a
+  delay time for a stream that does not start concurrently with the
+  file."* The muxer already wrote `0` here since round 3; this round
+  adds the typed
+  `AviDemuxer::stream_start(stream_index) -> Option<u32>` accessor
+  (mapping the `0` legacy writer default — the spec-documented "starts
+  concurrently with the file" value — back to `None` so an unspecified
+  start reads the same as an absent one, mirroring the round-182
+  `wPriority` / round-176 `dwQuality` / round-153 `dwInitialFrames` /
+  round-119 `wLanguage` / round-115 `rcFrame` / round-80 `strn` /
+  round-107 `IDIT` "default == absent" convention), the
+  `avi:strh.<n>.start` metadata key (omitted for the default-zero case
+  to keep absence observable), and the muxer builder
+  `AviMuxOptions::with_stream_start(stream_index, start)` writing the
+  supplied 32-bit value verbatim at byte offset 28 (last call per
+  stream-index wins via retain-then-push; no validation against the
+  per-stream `dwLength` — the unit is the stream's own
+  `(dwRate / dwScale)` tick and the demuxer surfaces the raw u32
+  verbatim with no rate-conversion). Eleven regression tests cover
+  the mux→demux round-trip via the typed accessor and the metadata
+  key, the no-override baseline, builder idempotency, the explicit
+  `0` override mapping back to `None`, the boundary values `1` and
+  `u32::MAX` (the spec pins no range so neither extreme is
+  special-cased), per-stream independence, the out-of-range
+  stream-index accessor case, independence from sibling per-stream
+  DWORDs (`wPriority` / `dwQuality` / `dwInitialFrames` / `wLanguage`
+  all stay decoupled), and hand-rolled fixtures that pin the exact
+  byte-offset-28 layout.
+
 - **OpenDML `indx` super-index `bIndexSubType` surface (round 197).**
   Per the AVISUPERINDEX layout in
   `docs/container/riff/avi-riff-file-reference.md` Appendix F
