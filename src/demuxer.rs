@@ -311,6 +311,23 @@ fn open_avi_inner(
     // mirroring the round-182 `wPriority` / round-176 `dwQuality` /
     // round-153 `dwInitialFrames` "default == absent" convention.
     let mut stream_starts: Vec<Option<u32>> = Vec::new();
+    // Round-210: per-stream `strh.fccHandler` driver hint from byte
+    // offset 4 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    // (`fccHandler` row in `docs/container/riff/avi-riff-file-reference.md`,
+    // Appendix B line 236: *"An optional FOURCC that identifies a
+    // specific data handler. The data handler is the preferred handler
+    // for the stream. For audio and video streams, this specifies the
+    // codec for decoding the stream."*). Parallel to `streams`:
+    // `Some([f0,f1,f2,f3])` when the strh declared a non-zero FourCC,
+    // `None` when it carried the all-zero `\0\0\0\0` "no preferred
+    // handler" default (the spec uses the *optional* qualifier and
+    // audio-stream writers in the wild routinely leave the field zero)
+    // so an unspecified driver hint reads the same as an absent one,
+    // mirroring the round-203 `dwStart` / round-182 `wPriority` /
+    // round-176 `dwQuality` / round-153 `dwInitialFrames` /
+    // round-119 `wLanguage` / round-115 `rcFrame` "default == absent"
+    // convention.
+    let mut stream_handlers: Vec<Option<[u8; 4]>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -346,6 +363,7 @@ fn open_avi_inner(
         &mut stream_qualities,
         &mut stream_priorities,
         &mut stream_starts,
+        &mut stream_handlers,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -385,6 +403,7 @@ fn open_avi_inner(
                     &mut stream_qualities,
                     &mut stream_priorities,
                     &mut stream_starts,
+                    &mut stream_handlers,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -923,6 +942,35 @@ fn open_avi_inner(
         }
     }
 
+    // Round-210: AVI 1.0 §"AVISTREAMHEADER" `fccHandler` field at byte
+    // offset 4 of the strh. Surfaced as
+    // `avi:strh.<index>.handler = "<fourcc-or-hex>"` for every stream
+    // whose strh declared a non-zero driver-handler FourCC ("An
+    // optional FOURCC that identifies a specific data handler. The
+    // data handler is the preferred handler for the stream. For audio
+    // and video streams, this specifies the codec for decoding the
+    // stream." per AVI 1.0 §"AVISTREAMHEADER" Appendix B `fccHandler`
+    // row, line 236). The all-zero `\0\0\0\0` "no preferred handler"
+    // writer default is omitted so an unspecified hint reads the same
+    // as an absent one, mirroring the `avi:strh.<n>.start` /
+    // `priority` / `quality` / `initial_frames` / `language`
+    // conventions. The raw 4-byte value is also reachable via the
+    // typed [`AviDemuxer::stream_handler`] accessor; the demuxer
+    // surfaces the bytes verbatim. The metadata-string form renders
+    // as four printable ASCII characters when every byte is in the
+    // `0x20..=0x7e` printable range (so e.g. `MJPG` round-trips
+    // legibly), otherwise as eight lower-case hex characters with a
+    // `0x` prefix (so e.g. a binary `00 11 22 33` driver hint stays
+    // round-trippable without colliding with any ASCII tag) — this
+    // matches the printable-vs-hex split documented for the
+    // `avi:<fourcc>` unknown-video-tag key in the codec mapping
+    // table.
+    for (i, handler_opt) in stream_handlers.iter().enumerate() {
+        if let Some(h) = handler_opt {
+            metadata.push((format!("avi:strh.{i}.handler"), format_fourcc_or_hex(h)));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1403,6 +1451,7 @@ fn open_avi_inner(
         stream_qualities,
         stream_priorities,
         stream_starts,
+        stream_handlers,
         digitization_date,
         smpte_timecode,
     })
@@ -1438,6 +1487,7 @@ fn walk_riff_body(
     stream_qualities: &mut Vec<Option<u32>>,
     stream_priorities: &mut Vec<Option<u16>>,
     stream_starts: &mut Vec<Option<u32>>,
+    stream_handlers: &mut Vec<Option<[u8; 4]>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1479,6 +1529,7 @@ fn walk_riff_body(
                         qualities_vec,
                         priorities_vec,
                         starts_vec,
+                        handlers_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1500,6 +1551,7 @@ fn walk_riff_body(
                     *stream_qualities = qualities_vec;
                     *stream_priorities = priorities_vec;
                     *stream_starts = starts_vec;
+                    *stream_handlers = handlers_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1738,6 +1790,7 @@ type HdrlOutput = (
     Vec<Option<u32>>,
     Vec<Option<u16>>,
     Vec<Option<u32>>,
+    Vec<Option<[u8; 4]>>,
     Option<String>,
     Option<String>,
 );
@@ -1771,6 +1824,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut stream_qualities: Vec<Option<u32>> = Vec::new();
     let mut stream_priorities: Vec<Option<u16>> = Vec::new();
     let mut stream_starts: Vec<Option<u32>> = Vec::new();
+    let mut stream_handlers: Vec<Option<[u8; 4]>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1844,6 +1898,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         quality,
                         priority,
                         start,
+                        handler,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1861,6 +1916,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_qualities.push(quality);
                         stream_priorities.push(priority);
                         stream_starts.push(start);
+                        stream_handlers.push(handler);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1909,6 +1965,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_qualities,
         stream_priorities,
         stream_starts,
+        stream_handlers,
         digitization_date,
         smpte_timecode,
     ))
@@ -2039,6 +2096,7 @@ type StrlOutput = (
     Option<u32>,
     Option<u16>,
     Option<u32>,
+    Option<[u8; 4]>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2159,6 +2217,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -2180,6 +2239,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.8,
         parsed.9,
         parsed.10,
+        parsed.11,
     ))
 }
 
@@ -2670,6 +2730,7 @@ type BuildStreamOutput = (
     Option<u32>,
     Option<u16>,
     Option<u32>,
+    Option<[u8; 4]>,
 );
 
 fn build_stream(
@@ -2848,6 +2909,33 @@ fn build_stream(
         }
     } else {
         None
+    };
+
+    // `fccHandler` (round-210): a 4-byte FourCC at byte offset 4 of
+    // the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`fccHandler`
+    // row in `docs/container/riff/avi-riff-file-reference.md`,
+    // Appendix B line 236): *"An optional FOURCC that identifies a
+    // specific data handler. The data handler is the preferred handler
+    // for the stream. For audio and video streams, this specifies the
+    // codec for decoding the stream."* The `\0\0\0\0` all-zero value
+    // is the spec-aligned "no preferred handler" default (the
+    // *optional* qualifier in the prose lines up with the legacy
+    // writer practice of leaving audio-stream fccHandler zero); it
+    // maps here to `None` so an unspecified driver hint reads the
+    // same as an absent one, mirroring the round-203 `dwStart` /
+    // round-182 `wPriority` / round-176 `dwQuality` / round-153
+    // `dwInitialFrames` / round-119 `wLanguage` / round-115
+    // `rcFrame` / round-80 `strn` / round-107 `IDIT` "default ==
+    // absent" convention. Non-zero values surface verbatim — the
+    // demuxer does NOT inspect or validate the bytes (capture
+    // hardware writers in the wild sometimes pack non-printable
+    // bytes here as a vendor-specific driver token, and the spec's
+    // *optional FOURCC that identifies a specific data handler*
+    // phrasing does not normatively pin printability).
+    let handler: Option<[u8; 4]> = if fcc_handler == [0, 0, 0, 0] {
+        None
+    } else {
+        Some(fcc_handler)
     };
 
     let mut audio_info: Option<AudioStrhInfo> = None;
@@ -3082,6 +3170,7 @@ fn build_stream(
         quality,
         priority,
         start,
+        handler,
     ))
 }
 
@@ -3089,6 +3178,31 @@ fn build_stream(
 /// has no claim on the FourCC. Downstream `make_decoder` will return
 /// `CodecNotFound` for these; the prefix lets callers tell "the codec
 /// crate isn't wired in" apart from "the codec id is genuinely unknown".
+/// Render a 4-byte FourCC for human-readable metadata output (round-210).
+///
+/// When every byte is in the `0x20..=0x7e` ASCII printable range,
+/// returns the literal four-character string (so e.g. `MJPG` /
+/// `iv32` / `DIB ` round-trip legibly). Otherwise returns an
+/// `0xHHHHHHHH` lower-case hex form (8 hex digits prefixed with
+/// `0x`) so a binary or out-of-band-byte handler hint stays
+/// round-trippable without colliding with any printable ASCII
+/// tag — matching the printable-vs-hex split this crate already
+/// uses for unknown-FourCC palette / text / data side-band keys
+/// (see the `key` branch in [`scan_idx1_for_sideband_summary`] and
+/// the `avi_namespaced` branches around line 4935).
+fn format_fourcc_or_hex(fourcc: &[u8; 4]) -> String {
+    let printable = fourcc.iter().all(|&b| (0x20..=0x7e).contains(&b));
+    if printable {
+        // Safe: every byte is printable ASCII (so valid UTF-8).
+        std::str::from_utf8(fourcc).unwrap().to_string()
+    } else {
+        format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            fourcc[0], fourcc[1], fourcc[2], fourcc[3]
+        )
+    }
+}
+
 fn video_codec_id_fallback(fourcc: &[u8; 4]) -> CodecId {
     if fourcc == &[0, 0, 0, 0] {
         // BI_RGB sentinel. There's no meaningful FourCC string to print
@@ -3761,6 +3875,28 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::stream_start`] accessor in addition to the
     /// `avi:strh.<index>.start` metadata key.
     stream_starts: Vec<Option<u32>>,
+    /// Per-stream `strh.fccHandler` driver hint from byte offset 4 of
+    /// the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-210).
+    /// Indexed by stream number; `Some([f0,f1,f2,f3])` when the strh
+    /// declared a non-zero FourCC, `None` when it carried the all-zero
+    /// `\0\0\0\0` "no preferred handler" default so an unspecified hint
+    /// reads the same as an absent one. Per the `fccHandler` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (Appendix B
+    /// line 236): *"An optional FOURCC that identifies a specific data
+    /// handler. The data handler is the preferred handler for the
+    /// stream. For audio and video streams, this specifies the codec
+    /// for decoding the stream."* The field is the optional VfW data-
+    /// handler identifier — distinct from the video stream's
+    /// `BITMAPINFOHEADER.biCompression` FourCC (which the strh's
+    /// fccHandler typically mirrors but is not required to match;
+    /// some legacy capture writers leave fccHandler zero on video
+    /// streams that have a perfectly valid biCompression) — and the
+    /// spec's *optional FOURCC* phrasing does not normatively pin
+    /// printability, so the demuxer surfaces the raw 4 bytes
+    /// verbatim and does not validate. Surfaced via the typed
+    /// [`AviDemuxer::stream_handler`] accessor in addition to the
+    /// `avi:strh.<index>.handler` metadata key.
+    stream_handlers: Vec<Option<[u8; 4]>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -5976,6 +6112,46 @@ impl AviDemuxer {
         self.stream_starts
             .get(stream_index as usize)
             .and_then(|s| *s)
+    }
+
+    /// `strh.fccHandler` driver-handler FourCC for a stream, as the raw
+    /// 4 bytes read off byte offset 4 of the AVISTREAMHEADER
+    /// (round-210).
+    ///
+    /// Per AVI 1.0 §"AVISTREAMHEADER" (`fccHandler` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, Appendix B
+    /// line 236): *"An optional FOURCC that identifies a specific data
+    /// handler. The data handler is the preferred handler for the
+    /// stream. For audio and video streams, this specifies the codec
+    /// for decoding the stream."* This is the VfW preferred-driver
+    /// hint; it sits beside (and is logically distinct from) the
+    /// video stream's `BITMAPINFOHEADER.biCompression` FourCC and
+    /// the audio stream's `WAVEFORMATEX.wFormatTag`. The two
+    /// typically mirror each other for video (`MJPG` in both
+    /// fccHandler and biCompression) but the spec does not require
+    /// them to match, and legacy capture writers in the wild
+    /// occasionally leave fccHandler zero on a video stream whose
+    /// biCompression is set. For audio streams the field is almost
+    /// always zero (the spec's *optional* qualifier — the
+    /// `WAVEFORMATEX.wFormatTag` already routes to the codec).
+    ///
+    /// Returns `None` when the strh carried the all-zero
+    /// `\0\0\0\0` "no preferred handler" default so an unspecified
+    /// driver hint reads the same as an absent one (mirroring the
+    /// round-203 `dwStart` / round-182 `wPriority` / round-176
+    /// `dwQuality` / round-153 `dwInitialFrames` / round-119
+    /// `wLanguage` / round-115 `rcFrame` / round-80 `strn` /
+    /// round-107 `IDIT` "default == absent" convention), or for an
+    /// out-of-range stream index. The same value surfaces as the
+    /// `avi:strh.<index>.handler` metadata key (printable-ASCII form
+    /// when every byte is in `0x20..=0x7e`, otherwise an
+    /// `0xHHHHHHHH` lower-case hex form; also omitted when absent),
+    /// and round-trips a muxer-emitted handler set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_handler`].
+    pub fn stream_handler(&self, stream_index: u32) -> Option<[u8; 4]> {
+        self.stream_handlers
+            .get(stream_index as usize)
+            .and_then(|h| *h)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside

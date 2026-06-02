@@ -470,6 +470,45 @@ pub struct AviMuxOptions {
     /// (the default) preserves the pre-round-203 byte layout
     /// (`dwStart = 0` on every stream).
     pub stream_starts: Vec<(u32, u32)>,
+    /// Per-stream `strh.fccHandler` driver-handler FourCC override
+    /// (round-210). Each entry is a tuple of
+    /// `(stream_index, fourcc_bytes)` and stamps the given 4 bytes
+    /// into byte offset 4 of that stream's 56-byte AVISTREAMHEADER
+    /// per AVI 1.0 §"AVISTREAMHEADER" (`fccHandler` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, Appendix B
+    /// line 236: *"An optional FOURCC that identifies a specific
+    /// data handler. The data handler is the preferred handler for
+    /// the stream. For audio and video streams, this specifies the
+    /// codec for decoding the stream."*).
+    ///
+    /// Without an override the muxer writes the packaging-derived
+    /// default: for video streams that's the per-codec FourCC
+    /// (`MJPG` / `XVID` / etc., mirroring what most writers in the
+    /// wild do — `fccHandler == biCompression`); for audio streams
+    /// that's the all-zero `\0\0\0\0` "no preferred handler"
+    /// default (which the demuxer maps back to `None`). This builder
+    /// lets a caller stamp a different FourCC — useful for
+    /// re-muxing a capture where the source file's fccHandler does
+    /// not equal biCompression (some legacy VfW drivers store a
+    /// driver-suite identifier here that differs from the
+    /// per-stream codec tag), for stamping a per-stream driver
+    /// hint on an audio stream, or for explicitly zeroing the
+    /// field on a video stream whose original writer left
+    /// fccHandler empty.
+    ///
+    /// The muxer writes the 4 bytes verbatim and does not validate
+    /// printability (the spec's *optional FOURCC* phrasing does not
+    /// normatively pin it). Stamping `[0, 0, 0, 0]` is equivalent
+    /// to omitting the override for audio streams (the audio
+    /// default is also all-zero); on video streams stamping
+    /// `[0, 0, 0, 0]` explicitly zeroes the field, overriding the
+    /// `biCompression`-mirror default.
+    ///
+    /// Duplicate calls for the same stream index replace the prior
+    /// entry — see [`Self::with_stream_handler`]. Empty list (the
+    /// default) preserves the pre-round-210 byte layout
+    /// (packaging-derived `fccHandler` on every stream).
+    pub stream_handlers: Vec<(u32, [u8; 4])>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1367,6 +1406,51 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp an `fccHandler` driver-handler FourCC into
+    /// the 56-byte AVISTREAMHEADER for `stream_index` (round-210). The
+    /// 4 bytes are written verbatim at byte offset 4 of the strh per
+    /// AVI 1.0 §"AVISTREAMHEADER" (`fccHandler` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, Appendix B
+    /// line 236).
+    ///
+    /// Per the spec the field is the *optional FOURCC that identifies
+    /// a specific data handler*. For video streams the packaging
+    /// layer's default is to mirror `BITMAPINFOHEADER.biCompression`
+    /// (so an `MJPG` video stream gets `fccHandler = b"MJPG"`,
+    /// matching what most writers in the wild do); for audio streams
+    /// the default is the all-zero `\0\0\0\0` "no preferred handler"
+    /// value (the demuxer maps that back to `None`). This builder
+    /// overrides whichever default applied — useful when re-muxing a
+    /// capture whose original writer set a driver-suite identifier
+    /// in fccHandler that differs from biCompression, when stamping
+    /// an explicit driver hint on an audio stream, or when
+    /// explicitly zeroing the field on a video stream whose original
+    /// writer left it empty.
+    ///
+    /// Passing `[0, 0, 0, 0]` is equivalent to omitting the override
+    /// for audio streams (the audio default is also all-zero) — the
+    /// demuxer maps the all-zero default back to `None`, mirroring
+    /// the round-203 `dwStart` / round-182 `wPriority` / round-176
+    /// `dwQuality` / round-153 `dwInitialFrames` / round-119
+    /// `wLanguage` / round-115 `rcFrame` "default == absent"
+    /// convention. On a video stream `[0, 0, 0, 0]` explicitly
+    /// zeroes the field, overriding the `biCompression`-mirror
+    /// default.
+    ///
+    /// The muxer writes the 4 bytes verbatim and does not validate
+    /// printability — the spec's *optional FOURCC* phrasing does
+    /// not normatively pin it.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_handler`] for a round-trip
+    /// of any non-zero driver-handler FourCC.
+    pub fn with_stream_handler(mut self, stream_index: u32, fourcc: [u8; 4]) -> Self {
+        self.stream_handlers.retain(|(idx, _)| *idx != stream_index);
+        self.stream_handlers.push((stream_index, fourcc));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -1931,6 +2015,19 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, s)| *s);
+            // Round-210: optional `strh.fccHandler` override for this
+            // stream (see `with_stream_handler`'s retain-then-push
+            // pattern). `None` keeps the packaging-derived default —
+            // for video streams the per-codec FourCC (mirroring
+            // `BITMAPINFOHEADER.biCompression`), for audio streams
+            // the all-zero `\0\0\0\0` "no preferred handler" value
+            // (per AVI 1.0 §"AVISTREAMHEADER" `fccHandler` row).
+            let handler_override = self
+                .options
+                .stream_handlers
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, h)| *h);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -1948,6 +2045,7 @@ impl Muxer for AviMuxer {
                 quality_override,
                 priority_override,
                 start_override,
+                handler_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -3391,13 +3489,30 @@ fn write_strl<W: Write + Seek + ?Sized>(
     quality_override: Option<u32>,
     priority_override: Option<u16>,
     start_override: Option<u32>,
+    handler_override: Option<[u8; 4]>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
     // strh body (56 bytes).
     let mut strh = Vec::with_capacity(56);
     strh.extend_from_slice(&t.entry.strh_type); // fccType
-    strh.extend_from_slice(&t.entry.handler_fourcc); // fccHandler
+                                                // fccHandler (round-210): an `AviMuxOptions::with_stream_handler`
+                                                // override (when present) stamps the per-stream preferred-driver
+                                                // FourCC at byte offset 4 per AVI 1.0 §"AVISTREAMHEADER"
+                                                // (`fccHandler` row in
+                                                // `docs/container/riff/avi-riff-file-reference.md`, Appendix B
+                                                // line 236: *"An optional FOURCC that identifies a specific data
+                                                // handler. The data handler is the preferred handler for the
+                                                // stream. For audio and video streams, this specifies the codec
+                                                // for decoding the stream."*); otherwise the legacy default is
+                                                // the packaging-derived `t.entry.handler_fourcc` (for video
+                                                // streams: the per-codec FourCC, mirroring
+                                                // `BITMAPINFOHEADER.biCompression`; for audio streams: the
+                                                // all-zero `\0\0\0\0` "no preferred handler" default the
+                                                // demuxer maps back to `None`). The 4 bytes are written
+                                                // verbatim; printability is not validated.
+    let handler_bytes = handler_override.unwrap_or(t.entry.handler_fourcc);
+    strh.extend_from_slice(&handler_bytes);
     strh.extend_from_slice(&0u32.to_le_bytes()); // flags
                                                  // wPriority (round-182): an `AviMuxOptions::with_stream_priority`
                                                  // override (when present) stamps the per-stream selection hint at

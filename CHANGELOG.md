@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.fccHandler` parse + emit + round-trip (round 210).**
+  Surfaces the `fccHandler` driver-handler FourCC at byte offset 4 of
+  the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
+  Clean-room source: `docs/container/riff/avi-riff-file-reference.md`
+  Appendix B (`fccHandler` row, line 236): *"An optional FOURCC that
+  identifies a specific data handler. The data handler is the
+  preferred handler for the stream. For audio and video streams, this
+  specifies the codec for decoding the stream."* The muxer already
+  wrote a packaging-derived FourCC here on every stream (video streams
+  mirror `BITMAPINFOHEADER.biCompression`, audio streams default to
+  the all-zero `\0\0\0\0` "no preferred handler" value); this round
+  adds the typed
+  `AviDemuxer::stream_handler(stream_index) -> Option<[u8; 4]>`
+  accessor (mapping the all-zero default — per the spec's *optional
+  FOURCC* qualifier — back to `None` so an unspecified hint reads
+  the same as an absent one, mirroring the round-203 `dwStart` /
+  round-182 `wPriority` / round-176 `dwQuality` / round-153
+  `dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame` /
+  round-80 `strn` / round-107 `IDIT` "default == absent"
+  convention), the `avi:strh.<n>.handler` metadata key (printable
+  four-character ASCII when every byte is in the `0x20..=0x7e`
+  range so e.g. `MJPG` / `iv32` / `DIB ` round-trip legibly,
+  `0xHHHHHHHH` lower-case hex form otherwise so a binary or
+  vendor-specific driver token still round-trips uniquely; omitted
+  for the all-zero default case to keep absence observable), and
+  the muxer builder
+  `AviMuxOptions::with_stream_handler(stream_index, fourcc)` writing
+  the supplied 4 bytes verbatim at byte offset 4 (last call per
+  stream-index wins via retain-then-push; no printability validation
+  — the spec's *optional FOURCC* phrasing does not pin it; passing
+  `[0, 0, 0, 0]` is equivalent to omitting the override for audio
+  streams whose default is also all-zero, and explicitly zeroes the
+  field on video streams overriding the `biCompression`-mirror
+  default). Thirteen regression tests cover the mux→demux round-trip
+  via the typed accessor and the metadata key, the no-override
+  baseline (video mirrors `biCompression`, audio reads back as
+  `None`), builder idempotency (last call per index wins), the
+  explicit `[0, 0, 0, 0]` override clearing the video stream's
+  `biCompression` mirror, an explicit audio-stream stamp on a stream
+  whose default would be all-zero, three boundary forms (a
+  printable `DIB ` rendering as `"DIB "`, a non-printable
+  `[0xFF; 4]` rendering as `"0xffffffff"`, a mixed-byte
+  `[A,0x1f,C,D]` rendering as `"0x411f4344"` per the helper's
+  all-or-nothing range check), per-stream independence (a handler
+  on one stream doesn't perturb another's packaging default), an
+  out-of-range stream-index accessor returning `None`, sibling-DWORD
+  independence (stamping `fccHandler` leaves `dwStart` /
+  `wPriority` / `dwQuality` / `dwInitialFrames` / `wLanguage`
+  readbacks at their own defaults), and two hand-rolled fixtures
+  validating that an `iv32` byte-offset-4 FourCC decodes to the
+  expected raw `[u8; 4]` and an all-zero one parses as `None`. The
+  `fccHandler` field is logically distinct from
+  `BITMAPINFOHEADER.biCompression` (video) and `WAVEFORMATEX.wFormatTag`
+  (audio); writers in the wild typically mirror `biCompression`
+  into `fccHandler` on video streams, but the spec does not require
+  the two to match and the override path lets callers preserve a
+  driver-suite identifier distinct from `biCompression`.
+
 - **Per-stream `strh.dwStart` parse + emit + round-trip (round 203).**
   Surfaces the `dwStart` starting-time DWORD at byte offset 28 of the
   56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
