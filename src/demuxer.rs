@@ -344,6 +344,24 @@ fn open_avi_inner(
     // `dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame`
     // "default == absent" convention.
     let mut stream_suggested_buffer_sizes: Vec<Option<u32>> = Vec::new();
+    // Round-222: per-stream `strh.dwSampleSize` indicator from byte
+    // offset 44 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    // (`dwSampleSize` row in
+    // `docs/container/riff/avi-riff-file-reference.md` line 247: *"The
+    // size of a single sample of data. This is set to zero if the samples
+    // can vary in size. … For video streams, this number is typically
+    // zero, although it can be nonzero if all video frames are the same
+    // size. For audio streams, this number should be the same as the
+    // nBlockAlign member of the WAVEFORMATEX structure describing the
+    // audio."*). Parallel to `streams`: `Some(n)` when the strh declared
+    // a non-zero size, `None` when it carried the spec-documented `0`
+    // "samples can vary in size" sentinel — so an unspecified hint reads
+    // the same as an absent one, mirroring the round-217
+    // `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    // `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    // round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+    // `rcFrame` "default == absent" convention.
+    let mut stream_sample_sizes: Vec<Option<u32>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -381,6 +399,7 @@ fn open_avi_inner(
         &mut stream_starts,
         &mut stream_handlers,
         &mut stream_suggested_buffer_sizes,
+        &mut stream_sample_sizes,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -422,6 +441,7 @@ fn open_avi_inner(
                     &mut stream_starts,
                     &mut stream_handlers,
                     &mut stream_suggested_buffer_sizes,
+                    &mut stream_sample_sizes,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -1012,6 +1032,33 @@ fn open_avi_inner(
         }
     }
 
+    // Round-222: AVI 1.0 §"AVISTREAMHEADER" `dwSampleSize` field at byte
+    // offset 44 of the strh. Surfaced as `avi:strh.<index>.sample_size =
+    // "<u32>"` for every stream whose strh declared a non-zero
+    // sample-size hint ("The size of a single sample of data. This is
+    // set to zero if the samples can vary in size. If this number is
+    // nonzero, then multiple samples of data can be grouped into a
+    // single chunk within the file. … For video streams, this number is
+    // typically zero, although it can be nonzero if all video frames are
+    // the same size. For audio streams, this number should be the same
+    // as the nBlockAlign member of the WAVEFORMATEX structure describing
+    // the audio." per AVI 1.0 §"AVISTREAMHEADER" `dwSampleSize` row,
+    // line 247). The spec-documented `0` "samples can vary in size"
+    // sentinel is omitted so an unspecified hint reads the same as an
+    // absent one, mirroring the round-217 `suggested_buffer_size` /
+    // round-210 `handler` / round-203 `start` / round-182 `priority` /
+    // round-176 `quality` / round-153 `initial_frames` / round-119
+    // `language` conventions. The raw 32-bit value is also reachable via
+    // the typed [`AviDemuxer::stream_sample_size`] accessor; the
+    // demuxer surfaces the value verbatim with no validation against
+    // `WAVEFORMATEX.nBlockAlign` (the round-14 C2 audio sample-size
+    // invariant is a separate VBR/CBR consistency check).
+    for (i, ss_opt) in stream_sample_sizes.iter().enumerate() {
+        if let Some(n) = ss_opt {
+            metadata.push((format!("avi:strh.{i}.sample_size"), n.to_string()));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1494,6 +1541,7 @@ fn open_avi_inner(
         stream_starts,
         stream_handlers,
         stream_suggested_buffer_sizes,
+        stream_sample_sizes,
         digitization_date,
         smpte_timecode,
     })
@@ -1531,6 +1579,7 @@ fn walk_riff_body(
     stream_starts: &mut Vec<Option<u32>>,
     stream_handlers: &mut Vec<Option<[u8; 4]>>,
     stream_suggested_buffer_sizes: &mut Vec<Option<u32>>,
+    stream_sample_sizes: &mut Vec<Option<u32>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1574,6 +1623,7 @@ fn walk_riff_body(
                         starts_vec,
                         handlers_vec,
                         suggested_buffer_sizes_vec,
+                        sample_sizes_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1597,6 +1647,7 @@ fn walk_riff_body(
                     *stream_starts = starts_vec;
                     *stream_handlers = handlers_vec;
                     *stream_suggested_buffer_sizes = suggested_buffer_sizes_vec;
+                    *stream_sample_sizes = sample_sizes_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1837,6 +1888,7 @@ type HdrlOutput = (
     Vec<Option<u32>>,
     Vec<Option<[u8; 4]>>,
     Vec<Option<u32>>,
+    Vec<Option<u32>>,
     Option<String>,
     Option<String>,
 );
@@ -1875,6 +1927,13 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     // at byte offset 36 of each AVISTREAMHEADER). Spec-documented `0`
     // "do not know" sentinel maps to `None`.
     let mut stream_suggested_buffer_sizes: Vec<Option<u32>> = Vec::new();
+    // Round-222: per-stream `strh.dwSampleSize` (raw u32 at byte offset
+    // 44 of each AVISTREAMHEADER). The spec-documented `0` "samples can
+    // vary in size" sentinel maps to `None` so an unspecified hint reads
+    // the same as an absent one — mirroring the round-217
+    // `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    // `dwStart` etc. "default == absent" convention.
+    let mut stream_sample_sizes: Vec<Option<u32>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1950,6 +2009,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         start,
                         handler,
                         suggested_buffer_size,
+                        sample_size,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1969,6 +2029,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_starts.push(start);
                         stream_handlers.push(handler);
                         stream_suggested_buffer_sizes.push(suggested_buffer_size);
+                        stream_sample_sizes.push(sample_size);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -2019,6 +2080,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_starts,
         stream_handlers,
         stream_suggested_buffer_sizes,
+        stream_sample_sizes,
         digitization_date,
         smpte_timecode,
     ))
@@ -2151,6 +2213,7 @@ type StrlOutput = (
     Option<u32>,
     Option<[u8; 4]>,
     Option<u32>,
+    Option<u32>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2273,6 +2336,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -2296,6 +2360,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.10,
         parsed.11,
         parsed.12,
+        parsed.13,
     ))
 }
 
@@ -2788,6 +2853,7 @@ type BuildStreamOutput = (
     Option<u32>,
     Option<[u8; 4]>,
     Option<u32>,
+    Option<u32>,
 );
 
 fn build_stream(
@@ -3018,6 +3084,39 @@ fn build_stream(
         None
     } else {
         Some(suggested_buffer_size_raw)
+    };
+
+    // `dwSampleSize` (round-222): a u32 at byte offset 44 of the 56-byte
+    // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwSampleSize` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, line 247): *"The
+    // size of a single sample of data. This is set to zero if the samples
+    // can vary in size. If this number is nonzero, then multiple samples
+    // of data can be grouped into a single chunk within the file. If it
+    // is zero, each sample of data (such as a video frame) must be in a
+    // separate chunk. For video streams, this number is typically zero,
+    // although it can be nonzero if all video frames are the same size.
+    // For audio streams, this number should be the same as the
+    // nBlockAlign member of the WAVEFORMATEX structure describing the
+    // audio."* The `0` value is the spec-documented "samples can vary in
+    // size" sentinel — the dominant value for video streams (one frame
+    // per chunk) and the required value for VBR audio (MP3 / AAC / MPEG)
+    // — mapped here to `None` so an unspecified / variable-size hint
+    // reads the same as an absent one, mirroring the round-217
+    // `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    // `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    // round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+    // `rcFrame` "default == absent" convention. Non-zero values surface
+    // verbatim — the demuxer does not validate against `WAVEFORMATEX
+    // .nBlockAlign` (the round-14 C2 audio sample-size invariant in
+    // `open_avi` covers VBR / CBR mismatches separately) nor against any
+    // observed chunk-size pattern in `movi`. The 44 raw byte is already
+    // captured for the `AudioStrhInfo` round-14 C2 validator as the
+    // `sample_size: u32` field; this round adds the public per-stream
+    // surface.
+    let sample_size_opt: Option<u32> = if sample_size == 0 {
+        None
+    } else {
+        Some(sample_size)
     };
 
     let mut audio_info: Option<AudioStrhInfo> = None;
@@ -3254,6 +3353,7 @@ fn build_stream(
         start,
         handler,
         suggested_buffer_size,
+        sample_size_opt,
     ))
 }
 
@@ -4001,6 +4101,25 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::stream_suggested_buffer_size`] accessor in addition
     /// to the `avi:strh.<index>.suggested_buffer_size` metadata key.
     stream_suggested_buffer_sizes: Vec<Option<u32>>,
+    /// Per-stream `strh.dwSampleSize` hint from byte offset 44 of the
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-222).
+    /// Indexed by stream number; `Some(n)` when the strh declared a
+    /// non-zero size, `None` when it carried the spec-documented `0`
+    /// "samples can vary in size" sentinel so an unspecified hint reads
+    /// the same as an absent one. Per the `dwSampleSize` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 247):
+    /// *"The size of a single sample of data. This is set to zero if
+    /// the samples can vary in size. If this number is nonzero, then
+    /// multiple samples of data can be grouped into a single chunk
+    /// within the file. If it is zero, each sample of data (such as a
+    /// video frame) must be in a separate chunk. For video streams,
+    /// this number is typically zero, although it can be nonzero if all
+    /// video frames are the same size. For audio streams, this number
+    /// should be the same as the nBlockAlign member of the WAVEFORMATEX
+    /// structure describing the audio."* Surfaced via the typed
+    /// [`AviDemuxer::stream_sample_size`] accessor in addition to the
+    /// `avi:strh.<index>.sample_size` metadata key.
+    stream_sample_sizes: Vec<Option<u32>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -6293,6 +6412,58 @@ impl AviDemuxer {
     /// [`crate::muxer::AviMuxOptions::with_stream_suggested_buffer_size`].
     pub fn stream_suggested_buffer_size(&self, stream_index: u32) -> Option<u32> {
         self.stream_suggested_buffer_sizes
+            .get(stream_index as usize)
+            .and_then(|s| *s)
+    }
+
+    /// `strh.dwSampleSize` indicator for a stream, as the raw 32-bit
+    /// DWORD read little-endian off byte offset 44 of the 56-byte
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-222). Per
+    /// the `dwSampleSize` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 247):
+    /// *"The size of a single sample of data. This is set to zero if
+    /// the samples can vary in size. If this number is nonzero, then
+    /// multiple samples of data can be grouped into a single chunk
+    /// within the file. If it is zero, each sample of data (such as a
+    /// video frame) must be in a separate chunk. For video streams,
+    /// this number is typically zero, although it can be nonzero if all
+    /// video frames are the same size. For audio streams, this number
+    /// should be the same as the nBlockAlign member of the WAVEFORMATEX
+    /// structure describing the audio."*
+    ///
+    /// For audio streams the field doubles as the spec's VBR / CBR
+    /// switch (a complementary view to the separate round-14 C2 audio
+    /// sample-size invariant that this crate enforces at `open` time):
+    /// CBR codecs (PCM / G.711 / IMA-ADPCM) must stamp the
+    /// `nBlockAlign` byte size here (so `dwLength` ends up as the total
+    /// number of audio frames), while VBR codecs (MP3 / AAC / MPEG)
+    /// must stamp `0` (so each chunk is one frame and
+    /// `Packet.duration` drives the count). For video streams the field
+    /// is dominantly `0` (one frame per chunk) and only legacy
+    /// fixed-frame-size capture writers (early DV-in-AVI tools, some
+    /// raw-yuv recorders) stamp a non-zero value.
+    ///
+    /// Returns `None` when the strh carried the spec-documented `0`
+    /// "samples can vary in size" sentinel so an unspecified hint reads
+    /// the same as an absent one (mirroring the round-217
+    /// `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    /// `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    /// round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+    /// `rcFrame` / round-80 `strn` / round-107 `IDIT` "default ==
+    /// absent" convention), or for an out-of-range stream index. The
+    /// same value surfaces as the `avi:strh.<index>.sample_size`
+    /// metadata key (also omitted when absent), and round-trips a
+    /// muxer-emitted hint set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_sample_size`].
+    ///
+    /// The demuxer surfaces the raw u32 verbatim and does not validate
+    /// against `WAVEFORMATEX.nBlockAlign` for audio streams — the
+    /// round-14 C2 audio sample-size invariant covers the VBR/CBR
+    /// consistency check separately (and is bypassable via
+    /// [`open_avi_lenient`] for forensic inspection of files whose
+    /// `dwSampleSize` lies about their carriage).
+    pub fn stream_sample_size(&self, stream_index: u32) -> Option<u32> {
+        self.stream_sample_sizes
             .get(stream_index as usize)
             .and_then(|s| *s)
     }

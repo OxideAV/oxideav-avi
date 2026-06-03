@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.dwSampleSize` parse + emit + round-trip
+  (round 222).** Surfaces the `dwSampleSize` indicator at byte offset
+  44 of the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
+  Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md`
+  (`dwSampleSize` row, line 247): *"The size of a single sample of
+  data. This is set to zero if the samples can vary in size. If this
+  number is nonzero, then multiple samples of data can be grouped into
+  a single chunk within the file. If it is zero, each sample of data
+  (such as a video frame) must be in a separate chunk. For video
+  streams, this number is typically zero, although it can be nonzero
+  if all video frames are the same size. For audio streams, this
+  number should be the same as the nBlockAlign member of the
+  WAVEFORMATEX structure describing the audio."* The 44 raw byte was
+  already captured internally for the round-14 C2 audio sample-size
+  invariant (the VBR / CBR consistency check that fires at `open_avi`
+  time); this round adds the public per-stream surface:
+
+  * typed `AviDemuxer::stream_sample_size(stream_index) -> Option<u32>`
+    accessor mapping the spec-documented `0` "samples can vary in
+    size" sentinel back to `None` so an unspecified hint reads the
+    same as an absent one — mirroring the round-217
+    `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+    `rcFrame` / round-80 `strn` / round-107 `IDIT` "default == absent"
+    convention,
+  * `avi:strh.<n>.sample_size` metadata key (omitted for the `0`
+    sentinel to keep absence observable),
+  * `AviMuxOptions::with_stream_sample_size(stream_index, n)` builder
+    writing the supplied 32-bit value verbatim at byte offset 44 of
+    the strh (last call per stream-index wins via retain-then-push;
+    no validation against `WAVEFORMATEX.nBlockAlign` or any observed
+    chunk-size pattern in `movi`).
+
+  Pre-round-222 the muxer always stamped the packaging-derived default
+  (`nBlockAlign` for PCM / CBR audio, `0` for VBR audio, `0` for
+  video) — those byte writes are preserved verbatim when no override
+  is supplied. The override only changes the byte stamp at offset 44;
+  it does NOT alter the muxer's own `dwLength` derivation (the audio
+  `size / sample_size` formula keeps using the packaging-derived
+  `entry.sample_size`), so a caller that stamps a `dwSampleSize`
+  incompatible with their packet stream is creating an internally-
+  inconsistent file on purpose and will need `open_avi_lenient` to
+  read it back (the round-14 C2 invariant correctly rejects PCM
+  streams with `dwSampleSize == 0` and VBR streams with
+  `dwSampleSize > 0` under strict open). Covered by a 12-test suite
+  exercising the audio-PCM baseline (auto-derived `nBlockAlign = 4`
+  for 2-channel s16le), video override round-trip (typed accessor +
+  metadata key), builder idempotency, the explicit-`0`-on-audio
+  invariant fire under strict open + `None` readback under lenient
+  open, boundary values (`1` / `u32::MAX` / a typical 1280×720 raw
+  frame size), independence across streams, independence from sibling
+  strh DWORDs (`dwSuggestedBufferSize` / `fccHandler` / `dwStart` /
+  `wPriority` / `dwQuality` / `dwInitialFrames` / `wLanguage` all
+  unaffected), and hand-rolled fixtures for explicit non-zero / zero
+  `dwSampleSize` decode.
+
 - **Per-stream `strh.dwSuggestedBufferSize` parse + emit + round-trip
   (round 217).** Surfaces the `dwSuggestedBufferSize` read-ahead hint
   at byte offset 36 of the 56-byte AVISTREAMHEADER per AVI 1.0

@@ -540,6 +540,57 @@ pub struct AviMuxOptions {
     /// default) preserves the pre-round-217 byte layout (auto-derived
     /// `t.max_chunk_size` on every stream).
     pub stream_suggested_buffer_sizes: Vec<(u32, u32)>,
+    /// Per-stream `strh.dwSampleSize` overrides (round-222). Each entry
+    /// is `(stream_index, sample_size)` and stamps the given 32-bit
+    /// DWORD into byte offset 44 of that stream's 56-byte
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    /// (`dwSampleSize` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 247:
+    /// *"The size of a single sample of data. This is set to zero if
+    /// the samples can vary in size. If this number is nonzero, then
+    /// multiple samples of data can be grouped into a single chunk
+    /// within the file. If it is zero, each sample of data (such as a
+    /// video frame) must be in a separate chunk. For video streams,
+    /// this number is typically zero, although it can be nonzero if
+    /// all video frames are the same size. For audio streams, this
+    /// number should be the same as the nBlockAlign member of the
+    /// WAVEFORMATEX structure describing the audio."*).
+    ///
+    /// Without an override the muxer keeps its long-standing
+    /// packaging-derived default: audio streams get `nBlockAlign` for
+    /// PCM / CBR audio and `0` for VBR audio (MP3 / AAC / MPEG); video
+    /// streams get `0` (one frame per chunk). The override stamps the
+    /// 32-bit byte value verbatim at offset 44 of the strh and does
+    /// NOT change the muxer's own `dwLength` derivation (which keeps
+    /// using the packaging-derived `entry.sample_size` for the audio
+    /// `size / sample_size` formula); a caller that stamps a
+    /// dwSampleSize incompatible with their packet stream is creating
+    /// an internally-inconsistent file on purpose (e.g. to round-trip
+    /// a fixed-frame-size legacy video capture, to force a `0`
+    /// "samples can vary" sentinel onto a CBR audio stream that the
+    /// caller does not want subject to multi-sample chunking, or to
+    /// reproduce a pathological writer for fuzz / regression
+    /// purposes).
+    ///
+    /// Note that the demuxer's round-14 C2 audio sample-size
+    /// invariant (the VBR/CBR consistency check at `open` time) will
+    /// reject mismatched files; callers that intentionally produce
+    /// such a file must read it back via
+    /// [`crate::demuxer::open_avi_lenient`].
+    ///
+    /// Passing `0` stamps the spec-documented "samples can vary in
+    /// size" sentinel — the demuxer maps that back to `None`,
+    /// mirroring the round-217 `dwSuggestedBufferSize` / round-210
+    /// `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+    /// round-176 `dwQuality` / round-153 `dwInitialFrames` /
+    /// round-119 `wLanguage` / round-115 `rcFrame` "default == absent"
+    /// convention.
+    ///
+    /// Duplicate calls for the same stream index replace the prior
+    /// entry — see [`Self::with_stream_sample_size`]. Empty list (the
+    /// default) preserves the pre-round-222 byte layout
+    /// (packaging-derived `dwSampleSize` on every stream).
+    pub stream_sample_sizes: Vec<(u32, u32)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1535,6 +1586,67 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp a `dwSampleSize` indicator into the 56-byte
+    /// AVISTREAMHEADER for `stream_index` (round-222). The 32-bit value
+    /// is written verbatim at byte offset 44 of the strh per AVI 1.0
+    /// §"AVISTREAMHEADER" (`dwSampleSize` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 247).
+    ///
+    /// Per the spec the field is *"The size of a single sample of data.
+    /// This is set to zero if the samples can vary in size. If this
+    /// number is nonzero, then multiple samples of data can be grouped
+    /// into a single chunk within the file. If it is zero, each sample
+    /// of data (such as a video frame) must be in a separate chunk.
+    /// For video streams, this number is typically zero, although it
+    /// can be nonzero if all video frames are the same size. For audio
+    /// streams, this number should be the same as the nBlockAlign
+    /// member of the WAVEFORMATEX structure describing the audio."*
+    ///
+    /// Without an override the muxer keeps its long-standing
+    /// packaging-derived default: audio streams get the `nBlockAlign`
+    /// byte size for PCM / CBR audio and `0` for VBR audio (MP3 / AAC
+    /// / MPEG); video streams get `0` (one frame per chunk). This
+    /// builder overrides that default — useful for re-muxing a file
+    /// whose original writer stamped a non-canonical value (a
+    /// fixed-frame-size raw-yuv recorder that wrote `dwSampleSize =
+    /// frame_bytes` instead of leaving it `0` for the video stream;
+    /// an audio stream that needs to match a downstream player's idea
+    /// of `nBlockAlign` exactly), for forcing the `0` "samples can
+    /// vary in size" sentinel back (so the demuxer round-trips the
+    /// absent-hint case via
+    /// [`crate::demuxer::AviDemuxer::stream_sample_size`] `== None`),
+    /// or for reproducing a pathological writer for fuzz / regression
+    /// purposes.
+    ///
+    /// Passing `0` stamps the spec-documented "samples can vary in
+    /// size" sentinel — the demuxer maps that back to `None`,
+    /// mirroring the round-217 `dwSuggestedBufferSize` / round-210
+    /// `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+    /// round-176 `dwQuality` / round-153 `dwInitialFrames` /
+    /// round-119 `wLanguage` / round-115 `rcFrame` "default ==
+    /// absent" convention.
+    ///
+    /// The muxer writes the 32-bit value verbatim at byte offset 44
+    /// and does NOT change the muxer's own `dwLength` derivation
+    /// (which keeps using the packaging-derived `entry.sample_size`
+    /// for the audio `size / sample_size` formula); a caller that
+    /// stamps a `dwSampleSize` incompatible with their packet stream
+    /// is creating an internally-inconsistent file on purpose, and
+    /// will need [`crate::demuxer::open_avi_lenient`] to read it back
+    /// (the round-14 C2 audio sample-size invariant rejects VBR/CBR
+    /// mismatches by default).
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_sample_size`] for a
+    /// round-trip of any non-zero hint.
+    pub fn with_stream_sample_size(mut self, stream_index: u32, sample_size: u32) -> Self {
+        self.stream_sample_sizes
+            .retain(|(idx, _)| *idx != stream_index);
+        self.stream_sample_sizes.push((stream_index, sample_size));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -2112,6 +2224,19 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, h)| *h);
+            // Round-222: optional `strh.dwSampleSize` override for this
+            // stream (see `with_stream_sample_size`'s retain-then-push
+            // pattern). `None` keeps the packaging-derived default — for
+            // audio streams the `nBlockAlign` byte size for PCM / CBR
+            // audio and `0` for VBR audio (MP3 / AAC / MPEG); for video
+            // streams `0` (one frame per chunk) — per AVI 1.0
+            // §"AVISTREAMHEADER" `dwSampleSize` row.
+            let sample_size_override = self
+                .options
+                .stream_sample_sizes
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, s)| *s);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -2130,6 +2255,7 @@ impl Muxer for AviMuxer {
                 priority_override,
                 start_override,
                 handler_override,
+                sample_size_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -3596,6 +3722,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     priority_override: Option<u16>,
     start_override: Option<u32>,
     handler_override: Option<[u8; 4]>,
+    sample_size_override: Option<u32>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -3674,7 +3801,30 @@ fn write_strl<W: Write + Seek + ?Sized>(
                                                  // back to `None`). The 32-bit value is written verbatim; no clamp to
                                                  // the documented `[0, 10_000]` range.
     strh.extend_from_slice(&quality_override.unwrap_or(0xFFFF_FFFFu32).to_le_bytes());
-    strh.extend_from_slice(&t.entry.sample_size.to_le_bytes());
+    // dwSampleSize (round-222): an `AviMuxOptions::with_stream_sample_size`
+    // override (when present) stamps the per-stream sample-size indicator
+    // at byte offset 44 per AVI 1.0 §"AVISTREAMHEADER" (`dwSampleSize` row
+    // in `docs/container/riff/avi-riff-file-reference.md` line 247: *"The
+    // size of a single sample of data. This is set to zero if the samples
+    // can vary in size. If this number is nonzero, then multiple samples
+    // of data can be grouped into a single chunk within the file. … For
+    // video streams, this number is typically zero, although it can be
+    // nonzero if all video frames are the same size. For audio streams,
+    // this number should be the same as the nBlockAlign member of the
+    // WAVEFORMATEX structure describing the audio."*); otherwise the
+    // packaging-derived default `t.entry.sample_size` wins (audio: PCM /
+    // CBR streams carry `nBlockAlign`, VBR streams carry `0`; video:
+    // `0`). The 32-bit value is written verbatim. The override only
+    // changes the byte stamp at offset 44; it does NOT alter the muxer's
+    // own `dwLength` derivation (the audio `size / sample_size` formula
+    // continues to use the packaging-derived `t.entry.sample_size`). An
+    // explicit `0` stamps the spec-documented "samples can vary in size"
+    // sentinel — the demuxer maps that back to `None`.
+    strh.extend_from_slice(
+        &sample_size_override
+            .unwrap_or(t.entry.sample_size)
+            .to_le_bytes(),
+    );
     // rcFrame: left, top, right, bottom (i16 each) at byte offset 48 of
     // the 56-byte AVISTREAMHEADER. A round-115
     // `AviMuxOptions::with_stream_frame_rect` override (when present) wins
