@@ -328,6 +328,22 @@ fn open_avi_inner(
     // round-119 `wLanguage` / round-115 `rcFrame` "default == absent"
     // convention.
     let mut stream_handlers: Vec<Option<[u8; 4]>> = Vec::new();
+    // Round-217: per-stream `strh.dwSuggestedBufferSize` read-ahead hint
+    // from byte offset 36 of the AVISTREAMHEADER per AVI 1.0
+    // §"AVISTREAMHEADER" (`dwSuggestedBufferSize` row in
+    // `docs/container/riff/avi-riff-file-reference.md` line 245: *"How
+    // large a buffer should be used to read this stream. Typically, this
+    // contains a value corresponding to the largest chunk present in the
+    // stream. Using the correct buffer size makes playback more efficient.
+    // Use zero if you do not know the correct buffer size."*). Parallel
+    // to `streams`: `Some(n)` when the strh declared a non-zero hint,
+    // `None` when it carried the spec-documented `0` "do not know"
+    // sentinel — so an unspecified hint reads the same as an absent one,
+    // mirroring the round-210 `fccHandler` / round-203 `dwStart` /
+    // round-182 `wPriority` / round-176 `dwQuality` / round-153
+    // `dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame`
+    // "default == absent" convention.
+    let mut stream_suggested_buffer_sizes: Vec<Option<u32>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -364,6 +380,7 @@ fn open_avi_inner(
         &mut stream_priorities,
         &mut stream_starts,
         &mut stream_handlers,
+        &mut stream_suggested_buffer_sizes,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -404,6 +421,7 @@ fn open_avi_inner(
                     &mut stream_priorities,
                     &mut stream_starts,
                     &mut stream_handlers,
+                    &mut stream_suggested_buffer_sizes,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -971,6 +989,29 @@ fn open_avi_inner(
         }
     }
 
+    // Round-217: AVI 1.0 §"AVISTREAMHEADER" `dwSuggestedBufferSize` field
+    // at byte offset 36 of the strh. Surfaced as
+    // `avi:strh.<index>.suggested_buffer_size = "<u32>"` for every stream
+    // whose strh declared a non-zero read-ahead hint ("How large a buffer
+    // should be used to read this stream. Typically, this contains a
+    // value corresponding to the largest chunk present in the stream.
+    // Using the correct buffer size makes playback more efficient. Use
+    // zero if you do not know the correct buffer size." per AVI 1.0
+    // §"AVISTREAMHEADER" `dwSuggestedBufferSize` row, line 245). The
+    // spec-documented `0` "do not know the correct buffer size"
+    // sentinel is omitted so an unspecified hint reads the same as an
+    // absent one, mirroring the `avi:strh.<n>.handler` / `start` /
+    // `priority` / `quality` / `initial_frames` / `language`
+    // conventions. The raw 32-bit value is also reachable via the
+    // typed [`AviDemuxer::stream_suggested_buffer_size`] accessor; the
+    // demuxer surfaces the value verbatim with no validation against
+    // the actual largest chunk seen in `movi`.
+    for (i, sbs_opt) in stream_suggested_buffer_sizes.iter().enumerate() {
+        if let Some(n) = sbs_opt {
+            metadata.push((format!("avi:strh.{i}.suggested_buffer_size"), n.to_string()));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1452,6 +1493,7 @@ fn open_avi_inner(
         stream_priorities,
         stream_starts,
         stream_handlers,
+        stream_suggested_buffer_sizes,
         digitization_date,
         smpte_timecode,
     })
@@ -1488,6 +1530,7 @@ fn walk_riff_body(
     stream_priorities: &mut Vec<Option<u16>>,
     stream_starts: &mut Vec<Option<u32>>,
     stream_handlers: &mut Vec<Option<[u8; 4]>>,
+    stream_suggested_buffer_sizes: &mut Vec<Option<u32>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1530,6 +1573,7 @@ fn walk_riff_body(
                         priorities_vec,
                         starts_vec,
                         handlers_vec,
+                        suggested_buffer_sizes_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1552,6 +1596,7 @@ fn walk_riff_body(
                     *stream_priorities = priorities_vec;
                     *stream_starts = starts_vec;
                     *stream_handlers = handlers_vec;
+                    *stream_suggested_buffer_sizes = suggested_buffer_sizes_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1791,6 +1836,7 @@ type HdrlOutput = (
     Vec<Option<u16>>,
     Vec<Option<u32>>,
     Vec<Option<[u8; 4]>>,
+    Vec<Option<u32>>,
     Option<String>,
     Option<String>,
 );
@@ -1825,6 +1871,10 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     let mut stream_priorities: Vec<Option<u16>> = Vec::new();
     let mut stream_starts: Vec<Option<u32>> = Vec::new();
     let mut stream_handlers: Vec<Option<[u8; 4]>> = Vec::new();
+    // Round-217: per-stream `strh.dwSuggestedBufferSize` hint (raw u32
+    // at byte offset 36 of each AVISTREAMHEADER). Spec-documented `0`
+    // "do not know" sentinel maps to `None`.
+    let mut stream_suggested_buffer_sizes: Vec<Option<u32>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -1899,6 +1949,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         priority,
                         start,
                         handler,
+                        suggested_buffer_size,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -1917,6 +1968,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_priorities.push(priority);
                         stream_starts.push(start);
                         stream_handlers.push(handler);
+                        stream_suggested_buffer_sizes.push(suggested_buffer_size);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -1966,6 +2018,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_priorities,
         stream_starts,
         stream_handlers,
+        stream_suggested_buffer_sizes,
         digitization_date,
         smpte_timecode,
     ))
@@ -2097,6 +2150,7 @@ type StrlOutput = (
     Option<u16>,
     Option<u32>,
     Option<[u8; 4]>,
+    Option<u32>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2218,6 +2272,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -2240,6 +2295,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.9,
         parsed.10,
         parsed.11,
+        parsed.12,
     ))
 }
 
@@ -2731,6 +2787,7 @@ type BuildStreamOutput = (
     Option<u16>,
     Option<u32>,
     Option<[u8; 4]>,
+    Option<u32>,
 );
 
 fn build_stream(
@@ -2936,6 +2993,31 @@ fn build_stream(
         None
     } else {
         Some(fcc_handler)
+    };
+
+    // `dwSuggestedBufferSize` (round-217): a u32 at byte offset 36 of
+    // the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    // (`dwSuggestedBufferSize` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, line 245):
+    // *"How large a buffer should be used to read this stream.
+    // Typically, this contains a value corresponding to the largest
+    // chunk present in the stream. Using the correct buffer size makes
+    // playback more efficient. Use zero if you do not know the correct
+    // buffer size."* The `0` value is the spec-documented "do not know"
+    // sentinel — mapped here to `None` so an unspecified hint reads the
+    // same as an absent one, mirroring the round-210 `fccHandler` /
+    // round-203 `dwStart` / round-182 `wPriority` / round-176
+    // `dwQuality` / round-153 `dwInitialFrames` / round-119
+    // `wLanguage` / round-115 `rcFrame` "default == absent" convention.
+    // Non-zero values surface verbatim — the demuxer does not validate
+    // against the actual largest chunk in `movi` (writers commonly
+    // overestimate to bound read-ahead allocation; some legacy
+    // capture tools under-declare a stream's largest chunk).
+    let suggested_buffer_size_raw = u32::from_le_bytes([strh[36], strh[37], strh[38], strh[39]]);
+    let suggested_buffer_size: Option<u32> = if suggested_buffer_size_raw == 0 {
+        None
+    } else {
+        Some(suggested_buffer_size_raw)
     };
 
     let mut audio_info: Option<AudioStrhInfo> = None;
@@ -3171,6 +3253,7 @@ fn build_stream(
         priority,
         start,
         handler,
+        suggested_buffer_size,
     ))
 }
 
@@ -3897,6 +3980,27 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::stream_handler`] accessor in addition to the
     /// `avi:strh.<index>.handler` metadata key.
     stream_handlers: Vec<Option<[u8; 4]>>,
+    /// Per-stream `strh.dwSuggestedBufferSize` read-ahead hint from byte
+    /// offset 36 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    /// (round-217). Indexed by stream number; `Some(n)` when the strh
+    /// declared a non-zero hint, `None` when it carried the spec-
+    /// documented `0` "do not know the correct buffer size" sentinel so
+    /// an unspecified hint reads the same as an absent one. Per the
+    /// `dwSuggestedBufferSize` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 245):
+    /// *"How large a buffer should be used to read this stream.
+    /// Typically, this contains a value corresponding to the largest
+    /// chunk present in the stream. Using the correct buffer size makes
+    /// playback more efficient. Use zero if you do not know the correct
+    /// buffer size."* The field is the per-stream counterpart of the
+    /// file-global `avih.dwSuggestedBufferSize` already surfaced via
+    /// [`AviDemuxer::avih_suggested_buffer_size`] — the avih flavour is the
+    /// largest chunk across every stream, the strh flavour is a
+    /// per-stream upper bound (which the spec recommends keeping equal
+    /// to the largest chunk in that one stream). Surfaced via the typed
+    /// [`AviDemuxer::stream_suggested_buffer_size`] accessor in addition
+    /// to the `avi:strh.<index>.suggested_buffer_size` metadata key.
+    stream_suggested_buffer_sizes: Vec<Option<u32>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -6152,6 +6256,45 @@ impl AviDemuxer {
         self.stream_handlers
             .get(stream_index as usize)
             .and_then(|h| *h)
+    }
+
+    /// `strh.dwSuggestedBufferSize` read-ahead hint for a stream, as the
+    /// raw 32-bit DWORD read little-endian off byte offset 36 of the
+    /// 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-217).
+    /// Per the `dwSuggestedBufferSize` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 245): *"How
+    /// large a buffer should be used to read this stream. Typically, this
+    /// contains a value corresponding to the largest chunk present in the
+    /// stream. Using the correct buffer size makes playback more
+    /// efficient. Use zero if you do not know the correct buffer size."*
+    ///
+    /// The field is the per-stream counterpart of the file-global
+    /// `avih.dwSuggestedBufferSize` already surfaced via
+    /// [`Self::avih_suggested_buffer_size`]: the avih flavour is meant to
+    /// cover the largest chunk across every stream, while this strh
+    /// flavour is a per-stream upper bound (the spec recommends keeping
+    /// it equal to the largest chunk in that one stream). The two are
+    /// spec-independent — writers may stamp consistent values, or set
+    /// only one, or leave both at the `0` "do not know" sentinel — and
+    /// the demuxer surfaces each verbatim with no validation against
+    /// the actual largest chunk seen in `movi`.
+    ///
+    /// Returns `None` when the strh carried the spec-documented `0` "do
+    /// not know the correct buffer size" sentinel so an unspecified hint
+    /// reads the same as an absent one (mirroring the round-210
+    /// `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+    /// round-176 `dwQuality` / round-153 `dwInitialFrames` / round-119
+    /// `wLanguage` / round-115 `rcFrame` / round-80 `strn` / round-107
+    /// `IDIT` "default == absent" convention), or for an out-of-range
+    /// stream index. The same value surfaces as the
+    /// `avi:strh.<index>.suggested_buffer_size` metadata key (also
+    /// omitted when absent), and round-trips a muxer-emitted hint set
+    /// via
+    /// [`crate::muxer::AviMuxOptions::with_stream_suggested_buffer_size`].
+    pub fn stream_suggested_buffer_size(&self, stream_index: u32) -> Option<u32> {
+        self.stream_suggested_buffer_sizes
+            .get(stream_index as usize)
+            .and_then(|s| *s)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside

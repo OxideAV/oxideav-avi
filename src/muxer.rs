@@ -509,6 +509,37 @@ pub struct AviMuxOptions {
     /// default) preserves the pre-round-210 byte layout
     /// (packaging-derived `fccHandler` on every stream).
     pub stream_handlers: Vec<(u32, [u8; 4])>,
+    /// Per-stream `strh.dwSuggestedBufferSize` overrides (round-217).
+    /// Each entry is `(stream_index, suggested_buffer_size)` and stamps
+    /// the given 32-bit DWORD into byte offset 36 of that stream's
+    /// 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    /// (`dwSuggestedBufferSize` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` line 245: *"How
+    /// large a buffer should be used to read this stream. Typically,
+    /// this contains a value corresponding to the largest chunk present
+    /// in the stream. Using the correct buffer size makes playback more
+    /// efficient. Use zero if you do not know the correct buffer size."*).
+    ///
+    /// Without an override the muxer keeps its long-standing
+    /// auto-derived default: `t.max_chunk_size` (the largest body it
+    /// observed on that stream during `write_packet` calls), patched
+    /// into the strh at the end of `write_trailer`. This builder lets
+    /// a caller stamp an explicit hint — useful for round-tripping a
+    /// file whose original writer over-declared a peak the actual
+    /// largest chunk doesn't match (some capture tools preallocate a
+    /// fixed-size readback buffer and stamp it verbatim), for forcing
+    /// the `0` "do not know" sentinel back (so the demuxer round-trips
+    /// the absent-hint case), or for matching a downstream player's
+    /// read-ahead budget exactly.
+    ///
+    /// The muxer writes whatever 32-bit value the caller supplies
+    /// verbatim and does NOT validate it against the actual largest
+    /// chunk observed in `movi`. Duplicate calls for the same stream
+    /// index replace the prior entry — see
+    /// [`Self::with_stream_suggested_buffer_size`]. Empty list (the
+    /// default) preserves the pre-round-217 byte layout (auto-derived
+    /// `t.max_chunk_size` on every stream).
+    pub stream_suggested_buffer_sizes: Vec<(u32, u32)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1448,6 +1479,59 @@ impl AviMuxOptions {
     pub fn with_stream_handler(mut self, stream_index: u32, fourcc: [u8; 4]) -> Self {
         self.stream_handlers.retain(|(idx, _)| *idx != stream_index);
         self.stream_handlers.push((stream_index, fourcc));
+        self
+    }
+
+    /// Builder helper: stamp a `dwSuggestedBufferSize` read-ahead hint
+    /// into the 56-byte AVISTREAMHEADER for `stream_index` (round-217).
+    /// The 32-bit value is written verbatim at byte offset 36 of the
+    /// strh per AVI 1.0 §"AVISTREAMHEADER" (`dwSuggestedBufferSize`
+    /// row in `docs/container/riff/avi-riff-file-reference.md`, line
+    /// 245).
+    ///
+    /// Per the spec the field is *"How large a buffer should be used
+    /// to read this stream. Typically, this contains a value
+    /// corresponding to the largest chunk present in the stream.
+    /// Using the correct buffer size makes playback more efficient.
+    /// Use zero if you do not know the correct buffer size."* Without
+    /// an override the muxer keeps its long-standing auto-derived
+    /// default (`t.max_chunk_size` — the largest body it observed on
+    /// that stream during `write_packet` calls, patched into the strh
+    /// at the end of `write_trailer`). This builder overrides that
+    /// default — useful for re-muxing a file whose original writer
+    /// over-declared a peak the actual largest chunk doesn't match,
+    /// for forcing the `0` "do not know" sentinel (so the demuxer
+    /// round-trips the absent-hint case via
+    /// [`crate::demuxer::AviDemuxer::stream_suggested_buffer_size`]
+    /// `== None`), or for matching a downstream player's read-ahead
+    /// budget exactly.
+    ///
+    /// Passing `0` stamps the spec-documented "do not know" sentinel
+    /// — the demuxer maps that back to `None`, mirroring the
+    /// round-210 `fccHandler` / round-203 `dwStart` / round-182
+    /// `wPriority` / round-176 `dwQuality` / round-153
+    /// `dwInitialFrames` / round-119 `wLanguage` / round-115
+    /// `rcFrame` "default == absent" convention.
+    ///
+    /// The muxer writes the 32-bit value verbatim and does NOT
+    /// validate it against the actual largest chunk observed in
+    /// `movi` — over-declaration is the documented intent of the
+    /// field and a caller that wants strict equality should pass the
+    /// max-chunk value explicitly.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_suggested_buffer_size`]
+    /// for a round-trip of any non-zero hint.
+    pub fn with_stream_suggested_buffer_size(
+        mut self,
+        stream_index: u32,
+        suggested_buffer_size: u32,
+    ) -> Self {
+        self.stream_suggested_buffer_sizes
+            .retain(|(idx, _)| *idx != stream_index);
+        self.stream_suggested_buffer_sizes
+            .push((stream_index, suggested_buffer_size));
         self
     }
 
@@ -2687,8 +2771,30 @@ impl AviMuxer {
             self.output.write_all(&length.to_le_bytes())?;
 
             // Also patch strh.dwSuggestedBufferSize at body offset 36.
+            // Round-217: an `AviMuxOptions::with_stream_suggested_buffer_size`
+            // override (when present) wins over the long-standing
+            // auto-derived `t.max_chunk_size` default. Per AVI 1.0
+            // §"AVISTREAMHEADER" (`dwSuggestedBufferSize` row in
+            // `docs/container/riff/avi-riff-file-reference.md` line 245)
+            // the field is *"How large a buffer should be used to read
+            // this stream. Typically, this contains a value corresponding
+            // to the largest chunk present in the stream. Using the
+            // correct buffer size makes playback more efficient. Use zero
+            // if you do not know the correct buffer size."* The
+            // pre-round-217 muxer wrote `t.max_chunk_size` unconditionally
+            // (the spec's "largest chunk present" recommendation); the
+            // override lets a caller stamp a different hint — including
+            // the `0` "do not know" sentinel — for round-trippability of
+            // legacy capture files.
+            let strh_sbs_override = self
+                .options
+                .stream_suggested_buffer_sizes
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, n)| *n);
+            let strh_sbs = strh_sbs_override.unwrap_or(t.max_chunk_size);
             self.output.seek(SeekFrom::Start(strh_body_off + 36))?;
-            self.output.write_all(&t.max_chunk_size.to_le_bytes())?;
+            self.output.write_all(&strh_sbs.to_le_bytes())?;
 
             // Advance strl_off by the size of this strl LIST (8 header +
             // body). Body = 4 (form) + 64 (strh) + 8 + strf.len() + pad

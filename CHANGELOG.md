@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.dwSuggestedBufferSize` parse + emit + round-trip
+  (round 217).** Surfaces the `dwSuggestedBufferSize` read-ahead hint
+  at byte offset 36 of the 56-byte AVISTREAMHEADER per AVI 1.0
+  §"AVISTREAMHEADER". Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md`
+  (`dwSuggestedBufferSize` row, line 245): *"How large a buffer should
+  be used to read this stream. Typically, this contains a value
+  corresponding to the largest chunk present in the stream. Using the
+  correct buffer size makes playback more efficient. Use zero if you
+  do not know the correct buffer size."* The muxer already
+  auto-derived this DWORD from `t.max_chunk_size` (the largest body
+  observed on the stream during `write_packet`) and patched it into
+  the strh at the end of `write_trailer`; this round adds the typed
+  `AviDemuxer::stream_suggested_buffer_size(stream_index) -> Option<u32>`
+  accessor (mapping the spec-documented `0` "do not know the correct
+  buffer size" sentinel back to `None` so an unspecified hint reads
+  the same as an absent one, mirroring the round-210 `fccHandler` /
+  round-203 `dwStart` / round-182 `wPriority` / round-176 `dwQuality`
+  / round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+  `rcFrame` / round-80 `strn` / round-107 `IDIT` "default == absent"
+  convention), the `avi:strh.<n>.suggested_buffer_size` metadata key
+  (omitted for the `0` sentinel to keep absence observable), and the
+  muxer builder
+  `AviMuxOptions::with_stream_suggested_buffer_size(stream_index, n)`
+  writing the supplied 32-bit value verbatim at byte offset 36 (last
+  call per stream-index wins via retain-then-push; no validation
+  against the actual largest chunk observed in `movi`, since
+  over-declaration is the documented intent of the field and some
+  legacy capture tools stamp a fixed read-ahead budget independent of
+  their occasional peak). The new accessor is logically distinct
+  from the file-global `AviDemuxer::avih_suggested_buffer_size()`
+  already exposed for the `avih.dwSuggestedBufferSize` DWORD — the
+  avih flavour covers the largest chunk across every stream, the
+  strh flavour is a per-stream upper bound, and the two are
+  spec-independent (writers may stamp consistent values, set only
+  one, or leave both at the `0` sentinel). Fourteen regression
+  tests cover the mux→demux round-trip via the typed accessor and
+  the metadata key, the no-override baseline (auto-derived
+  `t.max_chunk_size` surfacing per stream), builder idempotency
+  (last call per index wins), the explicit `0` override stamping
+  the spec-documented "do not know" sentinel (demuxer maps to
+  `None`, metadata key omitted), boundary values `1` and
+  `u32::MAX`, over-declaration of the hint relative to the actual
+  largest chunk (round-trips verbatim per the spec's *upper bound*
+  framing), under-declaration of the hint (also round-trips
+  verbatim — the demuxer does not second-guess the writer),
+  per-stream independence (an override on one stream doesn't
+  perturb another's auto-derived default), an out-of-range
+  stream-index accessor returning `None`, sibling-DWORD
+  independence (stamping `dwSuggestedBufferSize` leaves
+  `fccHandler` / `dwStart` / `wPriority` / `dwQuality` /
+  `dwInitialFrames` / `wLanguage` readbacks at their own defaults),
+  spec-independence from the file-global `avih.dwSuggestedBufferSize`
+  (the per-stream strh value and the file-global avih value
+  round-trip without bleeding into each other), and two hand-rolled
+  fixtures (a 56-byte strh with a non-zero `dwSuggestedBufferSize`
+  of `0xDEAD_BEEF` decoding verbatim, and an all-zero
+  `dwSuggestedBufferSize` parsing as `None`).
+
 - **Per-stream `strh.fccHandler` parse + emit + round-trip (round 210).**
   Surfaces the `fccHandler` driver-handler FourCC at byte offset 4 of
   the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
