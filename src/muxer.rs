@@ -591,6 +591,45 @@ pub struct AviMuxOptions {
     /// default) preserves the pre-round-222 byte layout
     /// (packaging-derived `dwSampleSize` on every stream).
     pub stream_sample_sizes: Vec<(u32, u32)>,
+    /// Per-stream `strh.dwLength` overrides (round-229). Each entry is
+    /// `(stream_index, length)` and stamps the given 32-bit DWORD into
+    /// byte offset 32 of that stream's 56-byte AVISTREAMHEADER per AVI
+    /// 1.0 §"AVISTREAMHEADER" (`dwLength` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 244:
+    /// *"Length of this stream. The units are defined by the dwRate
+    /// and dwScale members of the stream's header."*).
+    ///
+    /// Without an override the muxer keeps its long-standing
+    /// auto-derived default in
+    /// [`AviMuxer::write_trailer`] / `patch_post_counts`:
+    /// `packet_count` for video streams and PCM / CBR audio's
+    /// `sample_count` (the running total derived from each packet's
+    /// declared `Packet.duration` per the muxer's `size /
+    /// sample_size` formula); the override replaces that derived
+    /// value at the patch site. The 32-bit byte stamp at offset 32
+    /// is the only change — the muxer does NOT touch
+    /// `avih.dwTotalFrames` (the per-stream length and the file-global
+    /// total are spec-independent fields), and does NOT alter any
+    /// downstream `idx1` / `ix##` / `dmlh` derivation. Callers can
+    /// therefore reproduce legacy writers whose `dwLength` stamp
+    /// disagrees with their actual chunk count (some half-written
+    /// capture dumps, fixed-budget streamers that round to a known
+    /// playlist boundary, or fuzz / regression fixtures); the
+    /// resulting file is internally inconsistent on purpose.
+    ///
+    /// Passing `0` stamps the de-facto "no length declared" value —
+    /// the demuxer maps that back to `None`, mirroring the round-222
+    /// `dwSampleSize` / round-217 `dwSuggestedBufferSize` / round-210
+    /// `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+    /// round-176 `dwQuality` / round-153 `dwInitialFrames` /
+    /// round-119 `wLanguage` / round-115 `rcFrame` "default ==
+    /// absent" convention.
+    ///
+    /// Duplicate calls for the same stream index replace the prior
+    /// entry — see [`Self::with_stream_length`]. Empty list (the
+    /// default) preserves the pre-round-229 byte layout
+    /// (auto-derived `dwLength` on every stream).
+    pub stream_lengths: Vec<(u32, u32)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1644,6 +1683,54 @@ impl AviMuxOptions {
         self.stream_sample_sizes
             .retain(|(idx, _)| *idx != stream_index);
         self.stream_sample_sizes.push((stream_index, sample_size));
+        self
+    }
+
+    /// Builder helper: stamp a per-stream `strh.dwLength` override
+    /// (round-229). See [`Self::stream_lengths`] for the full
+    /// semantics. The muxer writes `length` verbatim into the 32-bit
+    /// DWORD at byte offset 32 of the named stream's 56-byte
+    /// AVISTREAMHEADER at the [`AviMuxer::write_trailer`] /
+    /// `patch_post_counts` site, replacing the auto-derived
+    /// per-stream packet / sample count.
+    ///
+    /// Per AVI 1.0 §"AVISTREAMHEADER" (`dwLength` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 244):
+    /// *"Length of this stream. The units are defined by the dwRate
+    /// and dwScale members of the stream's header."* The unit is the
+    /// stream's own `(dwRate / dwScale)` tick — frames for video,
+    /// samples-or-blocks for audio — and the muxer writes whatever
+    /// 32-bit value the caller supplies with no rate-conversion or
+    /// validation. Passing `0` stamps the de-facto "no length
+    /// declared" value — the demuxer maps that back to `None`.
+    ///
+    /// Useful for reproducing legacy writers whose stamped `dwLength`
+    /// disagrees with their actual chunk count (half-written capture
+    /// dumps, fixed-budget streamers that round to a playlist
+    /// boundary, fuzz / regression fixtures), and for forcing the `0`
+    /// "no length declared" value back so the demuxer round-trips the
+    /// absent-length case via
+    /// [`crate::demuxer::AviDemuxer::stream_length`] `== None`.
+    ///
+    /// The override only changes the byte stamp at offset 32; it does
+    /// NOT touch `avih.dwTotalFrames` (the per-stream length and the
+    /// file-global total are spec-independent fields) and does NOT
+    /// alter any downstream `idx1` / `ix##` / `dmlh` derivation — a
+    /// caller that stamps a `dwLength` incompatible with the file's
+    /// actual packet count is creating an internally inconsistent
+    /// file on purpose. The `StreamInfo::duration` the demuxer
+    /// surfaces via [`oxideav_core::Demuxer::streams`] will reflect
+    /// the stamped value (the framework already derives duration from
+    /// this same DWORD).
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_length`] for a round-trip
+    /// of any value (including the `0` "no length declared" stamp,
+    /// which round-trips as `None`).
+    pub fn with_stream_length(mut self, stream_index: u32, length: u32) -> Self {
+        self.stream_lengths.retain(|(idx, _)| *idx != stream_index);
+        self.stream_lengths.push((stream_index, length));
         self
     }
 
@@ -2885,14 +2972,40 @@ impl AviMuxer {
         for (i, t) in self.tracks.iter().enumerate() {
             let strh_body_off = strl_off + 20;
             // strh.dwLength is at body offset 32 → file offset strh_body_off + 32.
-            let length = if &t.entry.strh_type == b"auds" {
-                // For PCM we store sample_count (frames). For VBR we'd
-                // normally use packet count, but we don't support VBR audio
-                // in the mux yet.
-                t.sample_count as u32
-            } else {
-                t.packet_count
-            };
+            //
+            // Round-229: an `AviMuxOptions::with_stream_length` override
+            // (when present) wins over the long-standing auto-derived
+            // per-stream packet / sample count. Per AVI 1.0
+            // §"AVISTREAMHEADER" (`dwLength` row in
+            // `docs/container/riff/avi-riff-file-reference.md`, line 244):
+            // *"Length of this stream. The units are defined by the dwRate
+            // and dwScale members of the stream's header."* The unit is
+            // the stream's own `(dwRate / dwScale)` tick — frames for
+            // video, samples-or-blocks for audio per the existing
+            // packaging convention below — and the muxer writes whatever
+            // 32-bit value the caller supplied verbatim. The override
+            // does NOT touch `avih.dwTotalFrames`, nor any downstream
+            // `idx1` / `ix##` / `dmlh` derivation — a caller that
+            // stamps a `dwLength` incompatible with their actual chunk
+            // count is creating an internally inconsistent file on
+            // purpose (e.g. to reproduce a half-written legacy capture
+            // dump or a fixed-budget streamer's playlist-boundary stamp).
+            let length_override = self
+                .options
+                .stream_lengths
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, n)| *n);
+            let length = length_override.unwrap_or_else(|| {
+                if &t.entry.strh_type == b"auds" {
+                    // For PCM we store sample_count (frames). For VBR we'd
+                    // normally use packet count, but we don't support VBR audio
+                    // in the mux yet.
+                    t.sample_count as u32
+                } else {
+                    t.packet_count
+                }
+            });
             self.output.seek(SeekFrom::Start(strh_body_off + 32))?;
             self.output.write_all(&length.to_le_bytes())?;
 

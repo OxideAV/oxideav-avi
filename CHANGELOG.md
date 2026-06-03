@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.dwLength` parse + emit + round-trip
+  (round 229).** Surfaces the `dwLength` field at byte offset 32 of
+  the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
+  Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md`
+  (`dwLength` row, line 244): *"Length of this stream. The units are
+  defined by the dwRate and dwScale members of the stream's
+  header."* The 32 raw byte was already read internally as the
+  `length` local used to derive `StreamInfo::duration`; this round
+  adds the public per-stream surface:
+
+  * typed `AviDemuxer::stream_length(stream_index) -> Option<u32>`
+    accessor mapping the `0` "no length declared" value back to
+    `None` so an unspecified length reads the same as an absent one
+    — mirroring the round-222 `dwSampleSize` / round-217
+    `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+    `rcFrame` / round-80 `strn` / round-107 `IDIT` "default ==
+    absent" convention,
+  * `avi:strh.<n>.length` metadata key (omitted for the `0` value
+    to keep absence observable),
+  * `AviMuxOptions::with_stream_length(stream_index, n)` builder
+    writing the supplied 32-bit value verbatim at byte offset 32 of
+    the strh at the `write_trailer` / `patch_post_counts` site,
+    replacing the auto-derived per-stream packet / sample count
+    (last call per stream-index wins via retain-then-push; no
+    validation against the actual chunk count).
+
+  Pre-round-229 the muxer always patched the auto-derived value
+  (video: `packet_count`; audio PCM / CBR: running `sample_count`
+  from the muxer's `size / sample_size` formula) — those byte
+  writes are preserved verbatim when no override is supplied. The
+  override only changes the byte stamp at offset 32; it does NOT
+  touch `avih.dwTotalFrames` (per-stream length and the file-global
+  total are spec-independent fields), and does NOT alter any
+  downstream `idx1` / `ix##` / `dmlh` derivation, so a caller that
+  stamps a `dwLength` incompatible with their actual chunk count is
+  creating an internally-inconsistent file on purpose (e.g. to
+  reproduce a half-written legacy capture dump, a fixed-budget
+  streamer's playlist-boundary stamp, or a pathological writer for
+  fuzz / regression purposes). The `StreamInfo::duration` exposed
+  by `Demuxer::streams` continues to track the raw stamp (the
+  framework already derives duration from this same DWORD).
+
+  Logically distinct from `StreamInfo::duration` already exposed
+  by `oxideav_core::Demuxer::streams` (also derived from this same
+  DWORD but typed as `Option<i64>` for the framework-level
+  duration model); the raw-u32 surface keeps the value observable
+  verbatim for callers that need byte-exact round-trip semantics
+  or comparison against a separately-emitted writer's stamp.
+  Covered by a 14-test suite exercising the auto-derived baseline
+  (video: 1 packet ⇒ `Some(1)`; audio: 8-byte PCM payload /
+  nBlockAlign=4 ⇒ `Some(2)`), video override round-trip (typed
+  accessor + metadata key), audio override replacing the
+  auto-derived `sample_count`, builder idempotency, the explicit
+  `0` round-tripping as `None` with the metadata key omitted,
+  boundary values (`1` / `u32::MAX` / a typical 90 000-frame
+  long-form-capture count), independence across streams,
+  independence from sibling strh DWORDs (`dwSampleSize` /
+  `dwSuggestedBufferSize` / `fccHandler` / `dwStart` / `wPriority`
+  / `dwQuality` / `dwInitialFrames` / `wLanguage` all unaffected),
+  `StreamInfo::duration` agreement with the raw stamp, hand-rolled
+  fixtures for explicit non-zero / zero `dwLength` decode, and
+  the out-of-range stream index returning `None` on the typed
+  accessor.
+
 - **Per-stream `strh.dwSampleSize` parse + emit + round-trip
   (round 222).** Surfaces the `dwSampleSize` indicator at byte offset
   44 of the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".

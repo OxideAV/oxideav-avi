@@ -344,6 +344,23 @@ fn open_avi_inner(
     // `dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame`
     // "default == absent" convention.
     let mut stream_suggested_buffer_sizes: Vec<Option<u32>> = Vec::new();
+    // Round-229: per-stream `strh.dwLength` from byte offset 32 of the
+    // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwLength` row in
+    // `docs/container/riff/avi-riff-file-reference.md` line 244: *"Length
+    // of this stream. The units are defined by the dwRate and dwScale
+    // members of the stream's header."*). Parallel to `streams`: `Some(n)`
+    // when the strh declared a non-zero length, `None` when it carried the
+    // `0` "no length declared" value (typical for half-written capture
+    // dumps and the case the long-standing internal `length > 0` duration
+    // guard already treated as absent) — so a zero-length / unspecified
+    // stream reads the same as an absent one, mirroring the round-222
+    // `dwSampleSize` / round-217 `dwSuggestedBufferSize` / round-210
+    // `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+    // round-176 `dwQuality` / round-153 `dwInitialFrames` / round-119
+    // `wLanguage` / round-115 `rcFrame` "default == absent" convention.
+    // The unit is the stream's own `(dwRate / dwScale)` tick and the
+    // demuxer surfaces the raw u32 verbatim with no rate-conversion.
+    let mut stream_lengths: Vec<Option<u32>> = Vec::new();
     // Round-222: per-stream `strh.dwSampleSize` indicator from byte
     // offset 44 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
     // (`dwSampleSize` row in
@@ -400,6 +417,7 @@ fn open_avi_inner(
         &mut stream_handlers,
         &mut stream_suggested_buffer_sizes,
         &mut stream_sample_sizes,
+        &mut stream_lengths,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -442,6 +460,7 @@ fn open_avi_inner(
                     &mut stream_handlers,
                     &mut stream_suggested_buffer_sizes,
                     &mut stream_sample_sizes,
+                    &mut stream_lengths,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -1059,6 +1078,33 @@ fn open_avi_inner(
         }
     }
 
+    // Round-229: AVI 1.0 §"AVISTREAMHEADER" `dwLength` field at byte
+    // offset 32 of the strh. Surfaced as `avi:strh.<index>.length =
+    // "<u32>"` for every stream whose strh declared a non-zero
+    // length ("Length of this stream. The units are defined by the
+    // dwRate and dwScale members of the stream's header." per AVI 1.0
+    // §"AVISTREAMHEADER" `dwLength` row, line 244). The `0` "no length
+    // declared" value is omitted so an unspecified length reads the
+    // same as an absent one, mirroring the round-222 `sample_size` /
+    // round-217 `suggested_buffer_size` / round-210 `handler` /
+    // round-203 `start` / round-182 `priority` / round-176 `quality` /
+    // round-153 `initial_frames` / round-119 `language` conventions.
+    // The raw 32-bit value is also reachable via the typed
+    // [`AviDemuxer::stream_length`] accessor; the unit is the stream's
+    // own `(dwRate / dwScale)` tick and the demuxer surfaces the value
+    // verbatim with no rate-conversion. Logically distinct from the
+    // `StreamInfo::duration` already exposed by [`Demuxer::streams`]
+    // (also derived from this same DWORD but typed as an `Option<i64>`
+    // for the framework-level duration model); the `avi:strh.<n>.length`
+    // surface keeps the raw u32 visible for callers that need to
+    // round-trip a value exceeding `i64::MAX` or compare bytewise
+    // against a separately-emitted writer's stamp.
+    for (i, len_opt) in stream_lengths.iter().enumerate() {
+        if let Some(n) = len_opt {
+            metadata.push((format!("avi:strh.{i}.length"), n.to_string()));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1542,6 +1588,7 @@ fn open_avi_inner(
         stream_handlers,
         stream_suggested_buffer_sizes,
         stream_sample_sizes,
+        stream_lengths,
         digitization_date,
         smpte_timecode,
     })
@@ -1580,6 +1627,7 @@ fn walk_riff_body(
     stream_handlers: &mut Vec<Option<[u8; 4]>>,
     stream_suggested_buffer_sizes: &mut Vec<Option<u32>>,
     stream_sample_sizes: &mut Vec<Option<u32>>,
+    stream_lengths: &mut Vec<Option<u32>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1624,6 +1672,7 @@ fn walk_riff_body(
                         handlers_vec,
                         suggested_buffer_sizes_vec,
                         sample_sizes_vec,
+                        lengths_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1648,6 +1697,7 @@ fn walk_riff_body(
                     *stream_handlers = handlers_vec;
                     *stream_suggested_buffer_sizes = suggested_buffer_sizes_vec;
                     *stream_sample_sizes = sample_sizes_vec;
+                    *stream_lengths = lengths_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1889,6 +1939,7 @@ type HdrlOutput = (
     Vec<Option<[u8; 4]>>,
     Vec<Option<u32>>,
     Vec<Option<u32>>,
+    Vec<Option<u32>>,
     Option<String>,
     Option<String>,
 );
@@ -1934,6 +1985,14 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     // `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
     // `dwStart` etc. "default == absent" convention.
     let mut stream_sample_sizes: Vec<Option<u32>> = Vec::new();
+    // Round-229: per-stream `strh.dwLength` (raw u32 at byte offset 32
+    // of each AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER", `dwLength`
+    // row). The `0` "no length declared" value maps to `None` so an
+    // empty / unspecified stream reads the same as an absent one —
+    // mirroring the round-222 `dwSampleSize` / round-217
+    // `dwSuggestedBufferSize` / round-210 `fccHandler` "default ==
+    // absent" convention.
+    let mut stream_lengths: Vec<Option<u32>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -2010,6 +2069,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         handler,
                         suggested_buffer_size,
                         sample_size,
+                        length,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -2030,6 +2090,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_handlers.push(handler);
                         stream_suggested_buffer_sizes.push(suggested_buffer_size);
                         stream_sample_sizes.push(sample_size);
+                        stream_lengths.push(length);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -2081,6 +2142,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_handlers,
         stream_suggested_buffer_sizes,
         stream_sample_sizes,
+        stream_lengths,
         digitization_date,
         smpte_timecode,
     ))
@@ -2214,6 +2276,7 @@ type StrlOutput = (
     Option<[u8; 4]>,
     Option<u32>,
     Option<u32>,
+    Option<u32>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2337,6 +2400,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -2361,6 +2425,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.11,
         parsed.12,
         parsed.13,
+        parsed.14,
     ))
 }
 
@@ -2854,6 +2919,7 @@ type BuildStreamOutput = (
     Option<[u8; 4]>,
     Option<u32>,
     Option<u32>,
+    Option<u32>,
 );
 
 fn build_stream(
@@ -3119,6 +3185,29 @@ fn build_stream(
         Some(sample_size)
     };
 
+    // `dwLength` (round-229): a u32 at byte offset 32 of the 56-byte
+    // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwLength` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, line 244):
+    // *"Length of this stream. The units are defined by the dwRate and
+    // dwScale members of the stream's header."* The `0` value is the
+    // de-facto "no length declared" marker — typical for half-written
+    // capture dumps and the case the long-standing internal
+    // `length > 0` duration guard already treated as absent — mapped
+    // here to `None` so an unspecified length reads the same as an
+    // absent one, mirroring the round-222 `dwSampleSize` / round-217
+    // `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    // `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    // round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+    // `rcFrame` "default == absent" convention. Non-zero values surface
+    // verbatim — the unit is the stream's own `(dwRate / dwScale)` tick
+    // (frames for video, samples-or-blocks for audio per the existing
+    // muxer derivation in `patch_post_counts`) and the demuxer does not
+    // rate-convert. The 32 raw byte is already read above as the
+    // `length` local used for `StreamInfo::duration`; this round adds
+    // the public per-stream surface that keeps the raw u32 visible
+    // separately from the framework's `Option<i64>` duration model.
+    let length_opt: Option<u32> = if length == 0 { None } else { Some(length) };
+
     let mut audio_info: Option<AudioStrhInfo> = None;
     let mut video_strf_info: Option<VideoStrfInfo> = None;
     let mut audio_strf_info: Option<AudioStrfInfo> = None;
@@ -3354,6 +3443,7 @@ fn build_stream(
         handler,
         suggested_buffer_size,
         sample_size_opt,
+        length_opt,
     ))
 }
 
@@ -4120,6 +4210,25 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::stream_sample_size`] accessor in addition to the
     /// `avi:strh.<index>.sample_size` metadata key.
     stream_sample_sizes: Vec<Option<u32>>,
+    /// Per-stream `strh.dwLength` raw value from byte offset 32 of the
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-229).
+    /// Indexed by stream number; `Some(n)` when the strh declared a
+    /// non-zero length, `None` when it carried the `0` "no length
+    /// declared" value so an empty / unspecified stream reads the same
+    /// as an absent one. Per the `dwLength` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 244):
+    /// *"Length of this stream. The units are defined by the dwRate
+    /// and dwScale members of the stream's header."* Surfaced via the
+    /// typed [`AviDemuxer::stream_length`] accessor in addition to the
+    /// `avi:strh.<index>.length` metadata key. Logically distinct from
+    /// the `StreamInfo::duration` exposed by
+    /// [`oxideav_core::Demuxer::streams`] — both are derived from this
+    /// same DWORD but the framework's duration is typed as
+    /// `Option<i64>` while the raw-u32 surface keeps the value
+    /// observable verbatim for callers that need byte-exact round-trip
+    /// semantics or comparison against a separately-emitted writer's
+    /// stamp.
+    stream_lengths: Vec<Option<u32>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -6464,6 +6573,48 @@ impl AviDemuxer {
     /// `dwSampleSize` lies about their carriage).
     pub fn stream_sample_size(&self, stream_index: u32) -> Option<u32> {
         self.stream_sample_sizes
+            .get(stream_index as usize)
+            .and_then(|s| *s)
+    }
+
+    /// Round-229: per-stream `strh.dwLength` raw u32 from byte offset
+    /// 32 of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    /// (`dwLength` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 244):
+    /// *"Length of this stream. The units are defined by the dwRate
+    /// and dwScale members of the stream's header."* The unit is the
+    /// stream's own `(dwRate / dwScale)` tick — frames for video,
+    /// samples-or-blocks for audio per the muxer's own derivation in
+    /// `patch_post_counts`. For the audio side the value is
+    /// `total_sample_count` for PCM / CBR carriage and `packet_count`
+    /// (one DWORD per packet) for VBR carriage; video streams always
+    /// carry `packet_count`. The demuxer surfaces the raw 32-bit value
+    /// verbatim with no rate-conversion.
+    ///
+    /// Returns `None` when the strh carried the `0` "no length
+    /// declared" value so an unspecified / empty-stream length reads
+    /// the same as an absent one (mirroring the round-222
+    /// `dwSampleSize` / round-217 `dwSuggestedBufferSize` / round-210
+    /// `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+    /// round-176 `dwQuality` / round-153 `dwInitialFrames` /
+    /// round-119 `wLanguage` / round-115 `rcFrame` / round-80 `strn`
+    /// / round-107 `IDIT` "default == absent" convention), or for an
+    /// out-of-range stream index. The same value surfaces as the
+    /// `avi:strh.<index>.length` metadata key (also omitted when
+    /// absent), and round-trips a muxer-emitted override set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_length`].
+    ///
+    /// Logically distinct from the `StreamInfo::duration` already
+    /// exposed by [`oxideav_core::Demuxer::streams`] (also derived
+    /// from this same DWORD but typed as `Option<i64>` for the
+    /// framework-level duration model). The raw-u32 surface keeps the
+    /// value observable verbatim for callers that need byte-exact
+    /// round-trip semantics or comparison against a separately-emitted
+    /// writer's stamp; the framework duration is the right shape for
+    /// arithmetic in stream ticks. The two values agree whenever the
+    /// strh stamp fits in `i64`.
+    pub fn stream_length(&self, stream_index: u32) -> Option<u32> {
+        self.stream_lengths
             .get(stream_index as usize)
             .and_then(|s| *s)
     }
