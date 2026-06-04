@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenDML `LIST odml dmlh.dwTotalFrames` muxer-side override
+  (round 234).** Surfaces the cross-segment frame-count stamp as a
+  caller-controlled value. Clean-room source:
+  `docs/container/riff/opendml-avi-2.0.pdf` page 16, OpenDML 2.0 §5.0
+  "Extended AVI Header (dmlh)" / "Total Frames": *"The dwTotalFrames
+  field indicates the real size of the AVI file. Since the same field
+  in the Main AVI Header 'avih' indicates the size within the first
+  RIFF 'AVI' chunk."* — i.e. the cross-segment count, distinct from
+  `avih.dwTotalFrames` which §5.0 "Main AVI Header (avih)" / "Total
+  Frames" pins to *"the size (number of frames) within the first RIFF
+  'AVI' chunk."*
+
+  The 32-bit `ODMLExtendedAVIHeader.dwTotalFrames` DWORD inside `LIST
+  odml dmlh` was already auto-derived to the primary video stream's
+  cross-segment `packet_count` (= `total_video_frames` from
+  `patch_post_counts`) at `write_trailer` time. This round adds:
+
+  * `AviMuxOptions::with_dmlh_total_frames(n)` builder writing the
+    supplied 32-bit value verbatim into the 4-byte `dmlh` body in
+    `patch_post_counts`, replacing the auto-derived
+    `total_video_frames` value;
+  * `AviMuxOptions::dmlh_total_frames_override: Option<u32>` field as
+    the public surface of the override.
+
+  The override only changes the 4-byte stamp inside `LIST odml dmlh`;
+  it does NOT touch `avih.dwTotalFrames` (the primary-RIFF count
+  stays the muxer's auto-derived `packet_count`, so the file-level
+  duration `Demuxer::duration_micros` keeps tracking the auto-derived
+  primary segment count), nor any downstream `idx1` / `ix##` /
+  per-stream `strh.dwLength` derivation — a caller that stamps a
+  `dmlh.dwTotalFrames` incompatible with the file's actual
+  cross-segment chunk count is creating an internally-inconsistent
+  file on purpose (e.g. to reproduce a half-written legacy capture
+  dump whose `dmlh` landed before the encoder finalised the last
+  segment, a fixed-budget streamer that pre-declares a known frame
+  budget, or fuzz / regression fixtures).
+
+  Pairs with the round-101 demuxer accessor
+  `AviDemuxer::dmlh_total_frames` (typed `Option<u64>`, widened from
+  the raw `u32` for arithmetic against `i64` pts/duration values) and
+  the `avi:total_frames_all_segments` metadata key for a builder→
+  writer→demuxer round-trip of any value. Unlike `strh.dwLength` /
+  `dwSampleSize` / `dwSuggestedBufferSize` / `fccHandler` /
+  `dwStart` / `wPriority` / `dwQuality` / `dwInitialFrames` /
+  `wLanguage` / `rcFrame` / `strn` / `IDIT` (which all map their
+  spec-documented `0` sentinel back to `None`), OpenDML 2.0 §5.0
+  does not define a "no length declared" sentinel for
+  `dmlh.dwTotalFrames` — `0` literally means zero frames, so the
+  override of `0` round-trips as `Some(0)` (distinct from `None`,
+  which means no `LIST odml dmlh` was present).
+
+  Only meaningful for `AviKind::OpenDml`; ignored for `AviKind::Avi10`
+  (which never emits a `LIST odml dmlh`). Covered by a 10-test suite
+  exercising the auto-derived baseline (3 packets ⇒ `Some(3)`),
+  override round-trip via the typed accessor + metadata key, builder
+  idempotency (last call wins), independence from `avih.dwTotalFrames`
+  (file duration stays anchored to the auto-derived avih count),
+  independence from per-stream `strh.dwLength` (both video and audio
+  stamps keep their auto-derived `packet_count` / `sample_count`),
+  boundary values (`1` / `u32::MAX` / a typical 90 000-frame
+  long-form-capture count / explicit `0` → `Some(0)`), and the
+  `AviKind::Avi10` mode no-op (override present in options but
+  surfaces as `None` because no `LIST odml dmlh` is written).
+
 - **Per-stream `strh.dwLength` parse + emit + round-trip
   (round 229).** Surfaces the `dwLength` field at byte offset 32 of
   the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".

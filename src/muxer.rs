@@ -736,6 +736,48 @@ pub struct AviMuxOptions {
     /// byte-faithful regardless of the chosen format.
     /// See [`Self::with_smpte_timecode`].
     pub smpte_timecode: Option<String>,
+    /// Optional override for the OpenDML 2.0 `LIST odml dmlh`
+    /// extended-header `dwTotalFrames` DWORD (round-234). `None` (the
+    /// default) keeps the long-standing auto-derived value the muxer
+    /// has emitted since the round-3 OpenDML envelope landed: the
+    /// primary video stream's `packet_count` (already aggregated
+    /// across every `RIFF AVIX` continuation by the time
+    /// `write_trailer` runs, since
+    /// [`AviMuxer::write_packet`] bumps `TrackState::packet_count` on
+    /// every chunk emitted into any segment). `Some(n)` stamps `n`
+    /// verbatim into the 32-bit `ODMLExtendedAVIHeader.dwTotalFrames`
+    /// DWORD inside `LIST odml dmlh` instead.
+    ///
+    /// Per OpenDML 2.0 §5.0 "Extended AVI Header (dmlh)" + "Total
+    /// Frames" (`docs/container/riff/opendml-avi-2.0.pdf` page 16):
+    /// *"The dwTotalFrames field indicates the real size of the AVI
+    /// file. Since the same field in the Main AVI Header 'avih'
+    /// indicates the size within the first RIFF 'AVI' chunk."* The
+    /// field is the cross-segment frame count — distinct from
+    /// `avih.dwTotalFrames` which §5.0 "Main AVI Header (avih)" /
+    /// "Total Frames" pins to *"the size (number of frames) within
+    /// the first RIFF 'AVI' chunk."*
+    ///
+    /// The override only changes the 4-byte stamp inside `LIST odml
+    /// dmlh`; it does NOT touch `avih.dwTotalFrames` (the primary-RIFF
+    /// count remains the muxer's auto-derived value), nor any
+    /// downstream `idx1` / `ix##` / per-stream `strh.dwLength`
+    /// derivation. A caller that stamps a `dmlh.dwTotalFrames`
+    /// incompatible with the file's actual cross-segment chunk count
+    /// is creating an internally-inconsistent file on purpose (e.g. to
+    /// reproduce a half-written legacy capture dump whose `dmlh`
+    /// landed before the encoder finalised the last segment, to round-
+    /// trip a fixed-budget streamer that pre-declares a known frame
+    /// budget, or for fuzz / regression fixtures).
+    ///
+    /// Pairs with the round-101 demuxer accessor
+    /// [`crate::demuxer::AviDemuxer::dmlh_total_frames`] (and the
+    /// `avi:total_frames_all_segments` metadata key) for a builder→
+    /// writer→demuxer round-trip of any non-zero value. Only
+    /// meaningful for [`AviKind::OpenDml`]; ignored for
+    /// [`AviKind::Avi10`] (which never emits a `LIST odml dmlh`).
+    /// Use [`Self::with_dmlh_total_frames`].
+    pub dmlh_total_frames_override: Option<u32>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1819,6 +1861,38 @@ impl AviMuxOptions {
     /// when the intent is to round-trip a value.
     pub fn with_smpte_timecode(mut self, timecode: impl Into<String>) -> Self {
         self.smpte_timecode = Some(timecode.into());
+        self
+    }
+
+    /// Builder helper: stamp a `LIST odml dmlh` extended-header
+    /// `dwTotalFrames` override (round-234). See
+    /// [`Self::dmlh_total_frames_override`] for semantics.
+    ///
+    /// Per OpenDML 2.0 §5.0 "Extended AVI Header (dmlh)" / "Total
+    /// Frames" (`docs/container/riff/opendml-avi-2.0.pdf` page 16):
+    /// *"The dwTotalFrames field indicates the real size of the AVI
+    /// file. Since the same field in the Main AVI Header 'avih'
+    /// indicates the size within the first RIFF 'AVI' chunk."* The
+    /// muxer writes `n` verbatim into the 32-bit
+    /// `ODMLExtendedAVIHeader.dwTotalFrames` DWORD at the
+    /// [`AviMuxer::write_trailer`] / `patch_post_counts` site,
+    /// replacing the auto-derived cross-segment count
+    /// (`total_video_frames`).
+    ///
+    /// Useful for reproducing legacy writers whose stamped
+    /// `dmlh.dwTotalFrames` disagrees with the primary video stream's
+    /// summed packet count (half-written capture dumps, fixed-budget
+    /// streamers that pre-declare a known frame budget, or fuzz /
+    /// regression fixtures). Only meaningful for
+    /// [`AviKind::OpenDml`]; ignored for [`AviKind::Avi10`] (which
+    /// never emits a `LIST odml dmlh`).
+    ///
+    /// Pairs with the round-101 demuxer accessor
+    /// [`crate::demuxer::AviDemuxer::dmlh_total_frames`] (and the
+    /// `avi:total_frames_all_segments` metadata key) for a round-trip
+    /// of any non-zero value.
+    pub fn with_dmlh_total_frames(mut self, n: u32) -> Self {
+        self.dmlh_total_frames_override = Some(n);
         self
     }
 }
@@ -3063,9 +3137,29 @@ impl AviMuxer {
         // frames are already summed into the primary video stream's
         // packet_count via TrackState::packet_count by the time
         // write_trailer runs).
+        //
+        // Round-234: an `AviMuxOptions::with_dmlh_total_frames` override
+        // (when present) wins over the auto-derived cross-segment count.
+        // Per OpenDML 2.0 §5.0 "Extended AVI Header (dmlh)" / "Total
+        // Frames" (`docs/container/riff/opendml-avi-2.0.pdf` page 16):
+        // *"The dwTotalFrames field indicates the real size of the AVI
+        // file. Since the same field in the Main AVI Header 'avih'
+        // indicates the size within the first RIFF 'AVI' chunk."* The
+        // override stamps the supplied 32-bit value verbatim; it does
+        // NOT touch `avih.dwTotalFrames` (the primary-RIFF count stays
+        // auto-derived), nor any downstream `idx1` / `ix##` /
+        // `strh.dwLength` derivation — a caller that stamps a value
+        // incompatible with the file's actual cross-segment chunk count
+        // is creating an internally inconsistent file on purpose
+        // (half-written capture dumps, fixed-budget streamers, fuzz /
+        // regression fixtures).
         if let Some(off) = self.dmlh_total_frames_off {
+            let dmlh_total = self
+                .options
+                .dmlh_total_frames_override
+                .unwrap_or(total_video_frames);
             self.output.seek(SeekFrom::Start(off))?;
-            self.output.write_all(&total_video_frames.to_le_bytes())?;
+            self.output.write_all(&dmlh_total.to_le_bytes())?;
             self.output.seek(SeekFrom::Start(end_pos))?;
         }
         Ok(())
