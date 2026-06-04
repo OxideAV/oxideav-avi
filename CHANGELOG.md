@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-avi/compare/v0.0.8...v0.0.9) - 2026-06-04
+
+### Other
+
+- OpenDML dmlh.dwTotalFrames muxer-side override (round 234)
+- per-stream strh.dwLength parse + emit (round 229)
+- per-stream strh.dwSampleSize parse + emit (round 222)
+- per-stream strh.dwSuggestedBufferSize parse + emit (round 217)
+- per-stream strh.fccHandler parse + emit (round 210)
+- per-stream strh.dwStart parse + emit (round 203)
+- OpenDML super-index bIndexSubType surface (round 197)
+
 ### Added
 
 - **OpenDML `LIST odml dmlh.dwTotalFrames` muxer-side override
