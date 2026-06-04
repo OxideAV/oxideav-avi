@@ -736,6 +736,52 @@ pub struct AviMuxOptions {
     /// byte-faithful regardless of the chosen format.
     /// See [`Self::with_smpte_timecode`].
     pub smpte_timecode: Option<String>,
+    /// Optional `LIST odml dmlh.dwTotalFrames` override (round-234).
+    /// `None` (the default) keeps the long-standing auto-derived value
+    /// the muxer has back-patched since round-3: the primary video
+    /// stream's running `packet_count` (which already folds in every
+    /// AVIX continuation packet because `TrackState::packet_count` is
+    /// not reset across segments). `Some(n)` stamps `n` verbatim into
+    /// the 32-bit DWORD at the start of the `dmlh` chunk body inside
+    /// `LIST odml` per OpenDML 2.0 §5.0 "Extended AVI Header"
+    /// (`docs/container/riff/opendml-avi-2.0.pdf`): the single DWORD
+    /// `dwTotalFrames` is "the real total frame count across every
+    /// `RIFF AVIX` segment", whereas `avih.dwTotalFrames` only counts
+    /// the primary segment.
+    ///
+    /// The two counts can legitimately disagree in edge cases the
+    /// auto-derived value can't reach: a writer that knows ahead of
+    /// time the full sequence length (a fixed-budget capture that
+    /// pre-allocates a target frame count, an edit-list trimming the
+    /// physical packet stream, a streamer rounding to a known
+    /// playlist boundary), a chained AVIX continuation file that was
+    /// emitted by a separate process and concatenated post-hoc, or
+    /// a fuzz / regression fixture deliberately exercising the
+    /// demuxer's `super_index_duration_violations` cross-check
+    /// against a stamped mismatch. Use [`Self::with_dmlh_total_frames`].
+    ///
+    /// Passing `0` stamps a structurally-present `dmlh` chunk whose
+    /// body is the zero DWORD: the typed
+    /// `AviDemuxer::dmlh_total_frames()` returns `Some(0)` and the
+    /// `avi:total_frames_all_segments` metadata key is emitted as
+    /// `"0"`. The absence-vs-zero distinction in this surface is
+    /// *whether the chunk is emitted at all* — controlled by the
+    /// envelope variant ([`AviKind::OpenDml`] always emits `dmlh`;
+    /// [`AviKind::Avi10`] never does) — not the value stamped.
+    ///
+    /// Only meaningful in [`AviKind::OpenDml`] mode (AVI 1.0 doesn't
+    /// emit `LIST odml`); ignored in [`AviKind::Avi10`].
+    ///
+    /// The override only changes the 32-bit byte stamp inside `dmlh`;
+    /// it does NOT touch `avih.dwTotalFrames` (the primary-segment
+    /// count, derived from the video stream's `packet_count`), does
+    /// NOT touch any per-stream `strh.dwLength` (round-229 / its own
+    /// override surface), and does NOT alter any downstream
+    /// `idx1` / `ix##` derivation, so a stamp that disagrees with
+    /// the actual segment frame totals is internally inconsistent on
+    /// purpose and will surface through
+    /// `super_index_duration_violations()` on re-demux.
+    pub dmlh_total_frames: Option<u32>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1819,6 +1865,33 @@ impl AviMuxOptions {
     /// when the intent is to round-trip a value.
     pub fn with_smpte_timecode(mut self, timecode: impl Into<String>) -> Self {
         self.smpte_timecode = Some(timecode.into());
+        self
+    }
+
+    /// Builder helper: stamp the OpenDML 2.0 `dmlh.dwTotalFrames`
+    /// extended-header count (round-234). See
+    /// [`Self::dmlh_total_frames`] for placement and byte-layout
+    /// semantics.
+    ///
+    /// Per OpenDML 2.0 §5.0 ("Extended AVI Header",
+    /// `docs/container/riff/opendml-avi-2.0.pdf`): `dmlh`'s single
+    /// DWORD body is "the real total frame count across every
+    /// `RIFF AVIX` segment" — i.e. the cross-segment truth that
+    /// `avih.dwTotalFrames` (primary segment only) can't carry.
+    /// The muxer writes `n` verbatim into the `dmlh` body at the
+    /// `write_trailer` patch site, replacing the auto-derived
+    /// `total_video_frames` default. Only meaningful in
+    /// [`AviKind::OpenDml`] mode; in [`AviKind::Avi10`] mode no
+    /// `LIST odml` is emitted so the override has nothing to stamp.
+    ///
+    /// Duplicate calls replace the prior value. Passing `0` stamps
+    /// a structurally-present `dmlh` chunk with a zero body — the
+    /// demuxer reads it as `Some(0)` and emits the
+    /// `avi:total_frames_all_segments` metadata key as `"0"`. The
+    /// absence-vs-zero distinction is the chunk's presence (driven
+    /// by the envelope variant), not the value stamped.
+    pub fn with_dmlh_total_frames(mut self, n: u32) -> Self {
+        self.dmlh_total_frames = Some(n);
         self
     }
 }
@@ -3063,9 +3136,22 @@ impl AviMuxer {
         // frames are already summed into the primary video stream's
         // packet_count via TrackState::packet_count by the time
         // write_trailer runs).
+        //
+        // Round-234: an `AviMuxOptions::with_dmlh_total_frames`
+        // override replaces the auto-derived value at this patch site.
+        // The two counts can legitimately disagree in edge cases the
+        // auto-derived value can't reach (a writer that knows the full
+        // sequence length ahead of time, a chained AVIX continuation
+        // emitted by a separate process and concatenated post-hoc, a
+        // fuzz / regression fixture exercising the demuxer's
+        // `super_index_duration_violations` cross-check); a stamp
+        // that disagrees with the actual segment frame totals is
+        // internally inconsistent on purpose and surfaces through
+        // that demuxer accessor on re-demux.
         if let Some(off) = self.dmlh_total_frames_off {
+            let dmlh_value = self.options.dmlh_total_frames.unwrap_or(total_video_frames);
             self.output.seek(SeekFrom::Start(off))?;
-            self.output.write_all(&total_video_frames.to_le_bytes())?;
+            self.output.write_all(&dmlh_value.to_le_bytes())?;
             self.output.seek(SeekFrom::Start(end_pos))?;
         }
         Ok(())

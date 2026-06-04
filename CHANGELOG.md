@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenDML `LIST odml dmlh.dwTotalFrames` muxer-side override
+  (round 234).** Adds the
+  `AviMuxOptions::with_dmlh_total_frames(n)` builder writing the
+  supplied 32-bit value verbatim into the `dmlh` chunk body at the
+  `write_trailer` patch site, replacing the long-standing
+  auto-derived primary-video-stream `packet_count` default
+  (`TrackState::packet_count` is not reset across segments, so the
+  default already folds every AVIX continuation packet). Clean-room
+  source: `docs/container/riff/opendml-avi-2.0.pdf` §5.0 "Extended
+  AVI Header" defines `dmlh.dwTotalFrames` as the "real total frame
+  count across every `RIFF AVIX` segment", whereas
+  `avih.dwTotalFrames` only counts the primary segment.
+
+  The two counts can legitimately disagree in edge cases the
+  auto-derived value can't reach: a writer that knows the full
+  sequence length ahead of time (fixed-budget capture pre-allocating
+  a target frame count, an edit-list trimming the physical packet
+  stream, a streamer rounding to a known playlist boundary); a
+  chained AVIX continuation file that was emitted by a separate
+  process and concatenated post-hoc; or a fuzz / regression fixture
+  deliberately exercising the demuxer's
+  `super_index_duration_violations` cross-check against a stamped
+  mismatch. The override is dmlh-only — it does NOT touch
+  `avih.dwTotalFrames` (the primary-segment count, derived from the
+  video stream's `packet_count`), does NOT touch any per-stream
+  `strh.dwLength`, and does NOT alter any downstream `idx1` / `ix##`
+  derivation, so a stamp that disagrees with the actual segment
+  frame totals is internally inconsistent on purpose and surfaces
+  through `super_index_duration_violations()` on re-demux. Only
+  meaningful in `AviKind::OpenDml` mode; silently a no-op in
+  `AviKind::Avi10` (no `LIST odml` is emitted at all). Duplicate
+  builder calls replace the prior value; passing `0` stamps a
+  structurally-present `dmlh` chunk with a zero body — the typed
+  `AviDemuxer::dmlh_total_frames()` returns `Some(0)` and the
+  `avi:total_frames_all_segments` metadata key surfaces as `"0"`
+  (the absence-vs-zero distinction is *whether the chunk is
+  emitted*, controlled by the envelope variant, not the stamped
+  value).
+
+  Covered by a 12-test suite exercising the auto-derived baseline,
+  override round-trip via the typed accessor + metadata key,
+  builder idempotency (last call per builder wins), explicit `0`
+  round-tripping as `Some(0)` with the metadata key emitted as
+  `"0"`, boundary values (`1` / `u32::MAX` / 90 000 frames =
+  60 minutes @ 25 fps), mismatch-surfaces-via-violations on a
+  4 KiB-ceiling multi-segment file, `avih.dwTotalFrames` invariance
+  through the `duration_micros` derived value, `AviKind::Avi10`
+  no-op (the typed accessor returns `None` and the metadata key is
+  omitted), idx1 entry count invariance, and a hand-rolled minimal
+  RIFF fixture confirming the dmlh DWORD decodes verbatim via the
+  typed accessor.
+
 - **Per-stream `strh.dwLength` parse + emit + round-trip
   (round 229).** Surfaces the `dwLength` field at byte offset 32 of
   the 56-byte AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER".
