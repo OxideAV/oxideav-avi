@@ -397,6 +397,22 @@ fn open_avi_inner(
     // (some legacy capture filters pack driver-private flags in the
     // upper half-DWORD outside the spec's two documented bits).
     let mut stream_flags: Vec<Option<u32>> = Vec::new();
+    // Round-249: per-stream `(strh.dwScale, strh.dwRate)` timebase pair
+    // captured verbatim from byte offsets 20 + 24 of the AVISTREAMHEADER
+    // per AVI 1.0 §"AVISTREAMHEADER" (`dwScale` row line 241:
+    // *"Used with dwRate to specify the time scale that this stream will
+    // use. Dividing dwRate by dwScale gives the number of samples per
+    // second. For video streams, this is the frame rate. For audio
+    // streams, this rate corresponds to the time needed to play
+    // nBlockAlign bytes of audio, which for PCM audio is the just the
+    // sample rate."* + the `dwRate` cross-reference line 242).
+    // Parallel to `streams`: `Some((scale, rate))` when both raw DWORDs
+    // were non-zero, `None` when either was zero (a writer-skips-it /
+    // mathematically-undefined `rate/scale` ratio). Note the internal
+    // `time_base` derivation still applies `.max(1)` to each member so
+    // a degenerate file remains decodable; the raw-DWORD surface keeps
+    // the on-disk byte pattern observable for round-trip parity.
+    let mut stream_rates: Vec<Option<(u32, u32)>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -437,6 +453,7 @@ fn open_avi_inner(
         &mut stream_sample_sizes,
         &mut stream_lengths,
         &mut stream_flags,
+        &mut stream_rates,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -481,6 +498,7 @@ fn open_avi_inner(
                     &mut stream_sample_sizes,
                     &mut stream_lengths,
                     &mut stream_flags,
+                    &mut stream_rates,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -1151,6 +1169,31 @@ fn open_avi_inner(
         }
     }
 
+    // Round-249: AVI 1.0 §"AVISTREAMHEADER" `dwScale` + `dwRate`
+    // DWORDs at byte offsets 20 and 24 of the strh. Surfaced as
+    // `avi:strh.<index>.scale = <N>` and `avi:strh.<index>.rate = <N>`
+    // (decimal u32) for every stream whose strh declared both DWORDs
+    // non-zero per the `dwScale` row in
+    // `docs/container/riff/avi-riff-file-reference.md` (line 241) +
+    // the `dwRate` row (line 242). The "either zero" sentinel is
+    // omitted so an unspecified pair reads the same as an absent one,
+    // mirroring the round-247 `flags` / round-229 `length` /
+    // round-222 `sample_size` / round-217 `suggested_buffer_size` /
+    // round-210 `handler` / round-203 `start` / round-182 `priority`
+    // / round-176 `quality` / round-153 `initial_frames` / round-119
+    // `language` / round-115 `frame_rect` conventions. The two raw
+    // u32s are also reachable via the typed
+    // [`AviDemuxer::stream_timebase`] accessor. Decimal rendering
+    // matches the `avi:streams.<n>.<rate|scale>` convention rather
+    // than the hex-string `avi:strh.<n>.flags` since these are
+    // numeric magnitudes, not bit fields.
+    for (i, rate_opt) in stream_rates.iter().enumerate() {
+        if let Some((scale, rate)) = rate_opt {
+            metadata.push((format!("avi:strh.{i}.scale"), scale.to_string()));
+            metadata.push((format!("avi:strh.{i}.rate"), rate.to_string()));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1636,6 +1679,7 @@ fn open_avi_inner(
         stream_sample_sizes,
         stream_lengths,
         stream_flags,
+        stream_rates,
         digitization_date,
         smpte_timecode,
     })
@@ -1676,6 +1720,7 @@ fn walk_riff_body(
     stream_sample_sizes: &mut Vec<Option<u32>>,
     stream_lengths: &mut Vec<Option<u32>>,
     stream_flags: &mut Vec<Option<u32>>,
+    stream_rates: &mut Vec<Option<(u32, u32)>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1722,6 +1767,7 @@ fn walk_riff_body(
                         sample_sizes_vec,
                         lengths_vec,
                         flags_vec,
+                        rates_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1748,6 +1794,7 @@ fn walk_riff_body(
                     *stream_sample_sizes = sample_sizes_vec;
                     *stream_lengths = lengths_vec;
                     *stream_flags = flags_vec;
+                    *stream_rates = rates_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1993,6 +2040,10 @@ type HdrlOutput = (
     // Round-247: per-stream `strh.dwFlags` raw u32s, parallel to
     // `streams`. `None` for the `0` legacy "no flags set" default.
     Vec<Option<u32>>,
+    // Round-249: per-stream `(strh.dwScale, strh.dwRate)` raw timebase
+    // pair, parallel to `streams`. `None` for the writer-skips-it
+    // sentinel where either DWORD is zero.
+    Vec<Option<(u32, u32)>>,
     Option<String>,
     Option<String>,
 );
@@ -2055,6 +2106,18 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     // `dwSuggestedBufferSize` / round-210 `fccHandler` "default ==
     // absent" convention.
     let mut stream_flags: Vec<Option<u32>> = Vec::new();
+    // Round-249: per-stream `(strh.dwScale, strh.dwRate)` raw timebase
+    // pair captured from byte offsets 20 + 24 of each AVISTREAMHEADER
+    // per AVI 1.0 §"AVISTREAMHEADER" (`dwScale` row line 241 + `dwRate`
+    // row line 242). The writer-skips-it `(0, 0)` (or either-zero)
+    // sentinel maps to `None` so the absent / degenerate case reads
+    // the same as a default one — mirroring the precedent set by the
+    // round-247 `dwFlags` / round-229 `dwLength` / round-222
+    // `dwSampleSize` etc. "default == absent" convention. Both DWORDs
+    // are surfaced verbatim when present; the internal `time_base`
+    // derivation still applies `.max(1)` separately to keep the
+    // decoder functional on degenerate files.
+    let mut stream_rates: Vec<Option<(u32, u32)>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -2133,6 +2196,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         sample_size,
                         length,
                         flags,
+                        rate_scale,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -2155,6 +2219,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_sample_sizes.push(sample_size);
                         stream_lengths.push(length);
                         stream_flags.push(flags);
+                        stream_rates.push(rate_scale);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -2208,6 +2273,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_sample_sizes,
         stream_lengths,
         stream_flags,
+        stream_rates,
         digitization_date,
         smpte_timecode,
     ))
@@ -2344,6 +2410,8 @@ type StrlOutput = (
     Option<u32>,
     // Round-247: `strh.dwFlags` raw u32.
     Option<u32>,
+    // Round-249: `(strh.dwScale, strh.dwRate)` raw timebase pair.
+    Option<(u32, u32)>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2469,7 +2537,10 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
-            ))
+                // Round-249: per-stream (dwScale, dwRate) absent when
+                // the strl had no strh chunk.
+                None,
+            ));
         }
     };
     let strf = strf_buf.unwrap_or_default();
@@ -2495,6 +2566,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.13,
         parsed.14,
         parsed.15,
+        parsed.16,
     ))
 }
 
@@ -2992,6 +3064,11 @@ type BuildStreamOutput = (
     // Round-247: `strh.dwFlags` raw u32 (`None` for the `0` "no flags
     // set" legacy writer default; non-zero values surface verbatim).
     Option<u32>,
+    // Round-249: `(strh.dwScale, strh.dwRate)` raw timebase pair
+    // captured from byte offsets 20 + 24 of the AVISTREAMHEADER.
+    // `None` when either DWORD is zero (the writer-skips-it /
+    // mathematically-undefined `rate/scale` ratio).
+    Option<(u32, u32)>,
 );
 
 fn build_stream(
@@ -3022,10 +3099,35 @@ fn build_stream(
     fcc_type.copy_from_slice(&strh[0..4]);
     let mut fcc_handler = [0u8; 4];
     fcc_handler.copy_from_slice(&strh[4..8]);
-    let scale = u32::from_le_bytes([strh[20], strh[21], strh[22], strh[23]]).max(1);
-    let rate = u32::from_le_bytes([strh[24], strh[25], strh[26], strh[27]]).max(1);
+    // Round-249: raw `(dwScale, dwRate)` DWORDs from byte offsets 20
+    // and 24 per AVI 1.0 §"AVISTREAMHEADER" (`dwScale` row line 241 +
+    // `dwRate` row line 242: *"Used with dwRate to specify the time
+    // scale that this stream will use. Dividing dwRate by dwScale gives
+    // the number of samples per second. For video streams, this is the
+    // frame rate. For audio streams, this rate corresponds to the time
+    // needed to play nBlockAlign bytes of audio, which for PCM audio is
+    // the just the sample rate."*). The raw values surface verbatim
+    // for round-trip parity; the internal `time_base` derivation below
+    // still applies a `.max(1)` clamp on each DWORD to keep degenerate
+    // / zero-padded files decodable.
+    let scale_raw = u32::from_le_bytes([strh[20], strh[21], strh[22], strh[23]]);
+    let rate_raw = u32::from_le_bytes([strh[24], strh[25], strh[26], strh[27]]);
+    let scale = scale_raw.max(1);
+    let rate = rate_raw.max(1);
     let length = u32::from_le_bytes([strh[32], strh[33], strh[34], strh[35]]);
     let sample_size = u32::from_le_bytes([strh[44], strh[45], strh[46], strh[47]]);
+    // Round-249: surface the raw `(scale, rate)` pair as `Some` only
+    // when both DWORDs are non-zero. Either being zero is a
+    // writer-skips-it / mathematically-undefined `rate/scale` ratio
+    // and is mapped to `None` so an unspecified pair reads the same
+    // as an absent one — mirroring the round-247 `dwFlags` / round-229
+    // `dwLength` / round-222 `dwSampleSize` etc. "default == absent"
+    // convention.
+    let rate_scale: Option<(u32, u32)> = if scale_raw == 0 || rate_raw == 0 {
+        None
+    } else {
+        Some((scale_raw, rate_raw))
+    };
 
     // `wLanguage` (round-119): a 16-bit LANGID at byte offset 14 of the
     // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
@@ -3547,6 +3649,7 @@ fn build_stream(
         sample_size_opt,
         length_opt,
         flags,
+        rate_scale,
     ))
 }
 
@@ -4352,6 +4455,21 @@ pub struct AviDemuxer {
     /// documented set so undocumented vendor / driver bits round-trip
     /// observable.
     stream_flags: Vec<Option<u32>>,
+    /// Per-stream `(strh.dwScale, strh.dwRate)` raw timebase pair
+    /// captured from byte offsets 20 + 24 of each AVISTREAMHEADER
+    /// (round-249). Parallel to `streams`: `Some((scale, rate))` when
+    /// both raw DWORDs were non-zero, `None` when either was zero (a
+    /// writer-skips-it / mathematically-undefined `rate/scale` ratio,
+    /// matching the documented behaviour where `dwRate / dwScale`
+    /// gives the number of samples per second per AVI 1.0
+    /// §"AVISTREAMHEADER"). The internal `StreamInfo::time_base`
+    /// derivation still applies `.max(1)` to each member so a
+    /// degenerate file stays decodable; this raw-DWORD surface keeps
+    /// the on-disk byte pattern observable for round-trip parity.
+    /// Surfaced via the typed [`AviDemuxer::stream_timebase`]
+    /// accessor and the `avi:strh.<index>.scale` /
+    /// `avi:strh.<index>.rate` decimal metadata keys.
+    stream_rates: Vec<Option<(u32, u32)>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -6851,6 +6969,53 @@ impl AviDemuxer {
     /// undocumented vendor / driver bits stay observable.
     pub fn stream_flags_typed(&self, stream_index: u32) -> Option<StrhFlags> {
         self.stream_flags(stream_index).map(StrhFlags::from_bits)
+    }
+
+    /// `(strh.dwScale, strh.dwRate)` raw timebase pair for a stream,
+    /// as the two 32-bit DWORDs read little-endian off byte offsets 20
+    /// + 24 of the 56-byte AVISTREAMHEADER (round-249).
+    ///
+    /// Per AVI 1.0 §"AVISTREAMHEADER" (`dwScale` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` line 241): *"Used
+    /// with dwRate to specify the time scale that this stream will use.
+    /// Dividing dwRate by dwScale gives the number of samples per
+    /// second. For video streams, this is the frame rate. For audio
+    /// streams, this rate corresponds to the time needed to play
+    /// nBlockAlign bytes of audio, which for PCM audio is the just the
+    /// sample rate."* The `dwRate` row (line 242) cross-references
+    /// `dwScale` for the paired interpretation.
+    ///
+    /// The two DWORDs together define the stream's tick — a video
+    /// stream with `dwScale = 1001, dwRate = 30000` ticks at the NTSC
+    /// 29.97 fps, an audio stream with `dwScale = 1, dwRate = 48000`
+    /// ticks at one sample per audio frame, etc. The accessor surfaces
+    /// both raw values verbatim so callers that need byte-exact
+    /// round-trip parity (preserved-on-disk rate / scale pair, not the
+    /// `.max(1)`-clamped form used internally to keep
+    /// `StreamInfo::time_base` decodable on degenerate files) can read
+    /// the on-disk bytes back as written.
+    ///
+    /// Returns `None` when the strh carried a `0` in either DWORD —
+    /// the writer-skips-it / mathematically-undefined `rate/scale`
+    /// ratio (legitimate AVIs always populate both; a zero in either
+    /// DWORD indicates a truncated or zero-padded header that the
+    /// framework's `StreamInfo::time_base` derivation handles via
+    /// `.max(1)` for decode purposes). The convention mirrors the
+    /// round-247 `dwFlags` / round-229 `dwLength` / round-222
+    /// `dwSampleSize` / round-217 `dwSuggestedBufferSize` / round-210
+    /// `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+    /// round-176 `dwQuality` / round-153 `dwInitialFrames` / round-119
+    /// `wLanguage` / round-115 `rcFrame` "default == absent" pattern,
+    /// and an out-of-range stream index also returns `None`.
+    ///
+    /// The same values surface as the `avi:strh.<index>.scale` and
+    /// `avi:strh.<index>.rate` decimal metadata keys (both omitted when
+    /// absent), and round-trip a muxer-emitted timebase set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_timebase`].
+    pub fn stream_timebase(&self, stream_index: u32) -> Option<(u32, u32)> {
+        self.stream_rates
+            .get(stream_index as usize)
+            .and_then(|s| *s)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside

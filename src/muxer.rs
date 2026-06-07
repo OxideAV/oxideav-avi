@@ -666,6 +666,41 @@ pub struct AviMuxOptions {
     /// default) preserves the pre-round-247 byte layout (zero
     /// `dwFlags` on every stream).
     pub stream_flags: Vec<(u32, u32)>,
+    /// Per-stream `(strh.dwScale, strh.dwRate)` timebase overrides
+    /// (round-249). Each entry is `(stream_index, scale, rate)` and
+    /// stamps the supplied DWORD pair into byte offsets 20 and 24 of
+    /// that stream's 56-byte AVISTREAMHEADER per AVI 1.0
+    /// §"AVISTREAMHEADER" (`dwScale` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 241 +
+    /// the `dwRate` row line 242: *"Used with dwRate to specify the
+    /// time scale that this stream will use. Dividing dwRate by
+    /// dwScale gives the number of samples per second. For video
+    /// streams, this is the frame rate. For audio streams, this rate
+    /// corresponds to the time needed to play nBlockAlign bytes of
+    /// audio, which for PCM audio is the just the sample rate."*).
+    ///
+    /// Without an override the muxer keeps its packaging-derived
+    /// default (video: the per-stream `frame_rate` pair, audio: the
+    /// `sample_rate / 1` pair, mirroring the `time_base` the framework
+    /// exposes via [`oxideav_core::StreamInfo`]). The override replaces
+    /// both DWORDs verbatim at the byte-stamp site; it does NOT alter
+    /// the muxer's `(scale, rate)`-derived `dwLength` computation for
+    /// audio streams (which still uses the packaging-derived
+    /// `t.entry.{scale,rate}` to convert the running sample count into
+    /// `dwLength` units), does NOT touch `avih.dwMicroSecPerFrame` (the
+    /// file-global frame-rate hint, which the muxer derives
+    /// independently from the first video stream's packaging pair),
+    /// and does NOT cross-validate against the per-stream `dwLength`
+    /// or `dwStart` (stamping an audio sample rate on a video stream
+    /// is internally inconsistent on purpose). A `0` in either DWORD
+    /// stamps the writer-skips-it / mathematically-undefined sentinel
+    /// the demuxer maps back to `None`.
+    ///
+    /// Duplicate calls for the same stream index replace the prior
+    /// entry — see [`Self::with_stream_timebase`]. Empty list (the
+    /// default) preserves the pre-round-249 byte layout
+    /// (packaging-derived `dwScale` / `dwRate` on every stream).
+    pub stream_timebases: Vec<(u32, u32, u32)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1865,6 +1900,49 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp a `(scale, rate)` timebase pair into the
+    /// 56-byte AVISTREAMHEADER for `stream_index` (round-249). The two
+    /// 32-bit values are written little-endian at byte offsets 20 and
+    /// 24 of the strh per AVI 1.0 §"AVISTREAMHEADER" (`dwScale` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 241 +
+    /// the `dwRate` row line 242).
+    ///
+    /// Per the spec text: *"Used with dwRate to specify the time scale
+    /// that this stream will use. Dividing dwRate by dwScale gives the
+    /// number of samples per second. For video streams, this is the
+    /// frame rate. For audio streams, this rate corresponds to the
+    /// time needed to play nBlockAlign bytes of audio, which for PCM
+    /// audio is the just the sample rate."*
+    ///
+    /// Without an override the muxer keeps its packaging-derived
+    /// default — for video streams the per-stream `frame_rate` pair,
+    /// for audio streams the `sample_rate / 1` pair, both mirroring
+    /// the framework's [`oxideav_core::StreamInfo::time_base`]. The
+    /// override replaces both DWORDs verbatim at the byte-stamp site;
+    /// it does NOT alter the muxer's `(scale, rate)`-derived
+    /// `dwLength` computation for audio streams (which still uses the
+    /// packaging-derived `t.entry.{scale,rate}` to convert the running
+    /// sample count into `dwLength` units), does NOT touch
+    /// `avih.dwMicroSecPerFrame` (the file-global frame-rate hint,
+    /// which the muxer derives independently from the first video
+    /// stream's packaging pair), and does NOT cross-validate against
+    /// the per-stream `dwLength` or `dwStart`. Stamping an audio
+    /// sample-rate pair on a video stream is internally inconsistent
+    /// on purpose; a `0` in either DWORD stamps the writer-skips-it /
+    /// mathematically-undefined sentinel the demuxer maps back to
+    /// `None`.
+    ///
+    /// Duplicate calls for the same `stream_index` replace the prior
+    /// entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_timebase`] for a
+    /// round-trip raw-DWORD surface.
+    pub fn with_stream_timebase(mut self, stream_index: u32, scale: u32, rate: u32) -> Self {
+        self.stream_timebases
+            .retain(|(idx, _, _)| *idx != stream_index);
+        self.stream_timebases.push((stream_index, scale, rate));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -2495,6 +2573,21 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, f)| *f);
+            // Round-249: optional `(strh.dwScale, strh.dwRate)`
+            // timebase pair override for this stream (see
+            // `with_stream_timebase`'s retain-then-push pattern).
+            // `None` keeps the packaging-derived defaults
+            // (`t.entry.scale` / `t.entry.rate`) the muxer has used
+            // since round-3 — for video the per-stream `frame_rate`
+            // pair, for audio the `sample_rate / 1` pair, per AVI 1.0
+            // §"AVISTREAMHEADER" `dwScale` row line 241 + `dwRate`
+            // row line 242.
+            let timebase_override = self
+                .options
+                .stream_timebases
+                .iter()
+                .find(|(idx, _, _)| *idx == i as u32)
+                .map(|(_, s, r)| (*s, *r));
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -2515,6 +2608,7 @@ impl Muxer for AviMuxer {
                 handler_override,
                 sample_size_override,
                 flags_override,
+                timebase_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -4022,6 +4116,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     handler_override: Option<[u8; 4]>,
     sample_size_override: Option<u32>,
     flags_override: Option<u32>,
+    timebase_override: Option<(u32, u32)>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -4085,8 +4180,29 @@ fn write_strl<W: Write + Seek + ?Sized>(
     // 32-bit value is written verbatim; no validation against the
     // per-stream `dwLength`.
     strh.extend_from_slice(&initial_frames_override.unwrap_or(0).to_le_bytes()); // initial_frames
-    strh.extend_from_slice(&t.entry.scale.to_le_bytes());
-    strh.extend_from_slice(&t.entry.rate.to_le_bytes());
+                                                                                 // dwScale + dwRate (round-249): an
+                                                                                 // `AviMuxOptions::with_stream_timebase` override (when present)
+                                                                                 // stamps the per-stream `(scale, rate)` pair at byte offsets 20
+                                                                                 // and 24 per AVI 1.0 §"AVISTREAMHEADER" (`dwScale` row in
+                                                                                 // `docs/container/riff/avi-riff-file-reference.md` line 241 +
+                                                                                 // the `dwRate` row line 242: *"Used with dwRate to specify the
+                                                                                 // time scale that this stream will use. Dividing dwRate by
+                                                                                 // dwScale gives the number of samples per second."*); otherwise
+                                                                                 // the packaging-derived `t.entry.scale` / `t.entry.rate` defaults
+                                                                                 // stand (video: per-stream `frame_rate`, audio: `sample_rate / 1`).
+                                                                                 // The two 32-bit values are written verbatim; the override does
+                                                                                 // NOT alter the muxer's `(scale, rate)`-derived `dwLength`
+                                                                                 // computation for audio streams (which still uses
+                                                                                 // `t.entry.{scale,rate}` to convert running samples into
+                                                                                 // `dwLength` units), does NOT touch `avih.dwMicroSecPerFrame`
+                                                                                 // (independently derived from the first video stream's
+                                                                                 // packaging pair), and does NOT cross-validate against the
+                                                                                 // per-stream `dwLength` or `dwStart`. A `0` in either DWORD
+                                                                                 // stamps the writer-skips-it / mathematically-undefined
+                                                                                 // sentinel the demuxer maps back to `None`.
+    let (scale_bytes, rate_bytes) = timebase_override.unwrap_or((t.entry.scale, t.entry.rate));
+    strh.extend_from_slice(&scale_bytes.to_le_bytes());
+    strh.extend_from_slice(&rate_bytes.to_le_bytes());
     // dwStart (round-203): an `AviMuxOptions::with_stream_start` override
     // (when present) stamps the per-stream starting time at byte offset
     // 28 per AVI 1.0 §"AVISTREAMHEADER" (`dwStart` row in

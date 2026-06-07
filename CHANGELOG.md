@@ -9,6 +9,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `(strh.dwScale, strh.dwRate)` demux accessor + mux
+  override (round 249).** Adds the typed
+  `AviDemuxer::stream_timebase(stream_index) -> Option<(u32, u32)>`
+  raw-DWORD accessor surfacing the paired 32-bit DWORDs at byte
+  offsets 20 + 24 of the 56-byte AVISTREAMHEADER verbatim, the
+  `avi:strh.<n>.scale = "<N>"` + `avi:strh.<n>.rate = "<N>"` decimal
+  metadata keys (both omitted when either DWORD is zero), and the
+  `AviMuxOptions::with_stream_timebase(stream_index, scale, rate)`
+  builder writing the supplied pair verbatim at byte offsets 20 / 24
+  of the strh. Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md` §"AVISTREAMHEADER"
+  (`dwScale` row line 241 + `dwRate` row line 242): *"Used with dwRate
+  to specify the time scale that this stream will use. Dividing
+  dwRate by dwScale gives the number of samples per second. For video
+  streams, this is the frame rate. For audio streams, this rate
+  corresponds to the time needed to play nBlockAlign bytes of audio,
+  which for PCM audio is the just the sample rate."*
+
+  Without an override the muxer keeps its packaging-derived defaults
+  (video: per-stream `frame_rate` pair, audio: `sample_rate / 1`),
+  matching the framework's [`oxideav_core::StreamInfo::time_base`]
+  derivation. The override replaces both DWORDs verbatim at the
+  byte-stamp site; it does NOT alter the muxer's `(scale, rate)`-
+  derived `dwLength` computation for audio streams (which still uses
+  the packaging-derived `t.entry.{scale,rate}` to convert running
+  samples into `dwLength` units), does NOT touch
+  `avih.dwMicroSecPerFrame` (the file-global frame-rate hint, which
+  the muxer derives independently from the first video stream's
+  packaging pair), and does NOT cross-validate against the per-stream
+  `dwLength` or `dwStart`. Stamping an audio sample-rate pair on a
+  video stream is internally inconsistent on purpose — the round-3
+  long-standing convention that side-band byte stamps are
+  byte-stamp-only.
+
+  Mapping the writer-skips-it sentinel (`0` in either DWORD, the
+  mathematically-undefined `rate/scale` ratio) to `None` on the
+  accessor keeps the absent / degenerate case observable in
+  `Option::is_none()` and omits both metadata keys, mirroring the
+  round-247 `dwFlags` / round-229 `dwLength` / round-222
+  `dwSampleSize` / round-217 `dwSuggestedBufferSize` / round-210
+  `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+  round-176 `dwQuality` / round-153 `dwInitialFrames` / round-119
+  `wLanguage` / round-115 `rcFrame` "default == absent" convention
+  this crate has carried since round-115. The internal
+  `StreamInfo::time_base` derivation still applies `.max(1)`
+  separately to each DWORD so a degenerate file remains decodable;
+  the raw-DWORD surface keeps the on-disk byte pattern observable
+  for round-trip parity.
+
+  Logically distinct from the framework-level
+  `StreamInfo::time_base` (typed as `Rational` with `i64` members):
+  the framework's `time_base` is the normalised time-base the
+  framework's rescale / PTS arithmetic uses, while the raw `u32`
+  surface keeps the value byte-exact for callers that need to
+  compare against a separately-emitted writer's stamp or stamp an
+  identical pair on re-mux. The two values agree whenever the strh
+  pair has both members non-zero (which is the universal case in
+  legitimate AVIs — the `0` sentinel is the truncated / zero-padded
+  / hand-crafted edge case the `.max(1)` clamp covers).
+
+  Tests in `tests/round249_strh_timebase.rs` (14 cases) cover the
+  no-override packaging-default baseline (video 25 fps, audio 48 kHz),
+  video NTSC `(1001, 30000)` round-trip, audio CD `(1, 44100)`
+  round-trip, builder idempotency (last `with_stream_timebase` for
+  a given index wins), `u32::MAX` boundary on both members,
+  per-stream independence (an override on one stream doesn't
+  perturb the other's readback), sibling-DWORD independence
+  (`dwFlags` / `dwLength` / `dwSampleSize` /
+  `dwSuggestedBufferSize` / `fccHandler` / `dwStart` / `wPriority`
+  / `dwQuality` / `dwInitialFrames` / `wLanguage` all stay at
+  their packaging defaults), the override shifting the
+  framework-level `StreamInfo::time_base`, hand-rolled fixtures for
+  the non-zero / zero-scale / zero-rate / zero-both decode paths,
+  and out-of-range stream index returning `None`. All 471 crate
+  tests pass; `cargo fmt --check` and `cargo clippy --all-targets
+  --no-deps -- -D warnings` clean.
+
 - **Per-stream `strh.dwFlags` (`AVISF_*`) demux accessors + mux
   override (round 247).** Adds the typed
   `AviDemuxer::stream_flags(stream_index) -> Option<u32>` raw
