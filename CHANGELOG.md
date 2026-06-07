@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.dwFlags` (`AVISF_*`) demux accessors + mux
+  override (round 247).** Adds the typed
+  `AviDemuxer::stream_flags(stream_index) -> Option<u32>` raw
+  accessor + the typed
+  `AviDemuxer::stream_flags_typed(stream_index) -> Option<StrhFlags>`
+  decoded accessor exposing the two AVI 1.0-documented `AVISF_*` bits
+  as named `bool` fields, the public `AVISF_DISABLED`
+  (`0x0000_0001`) / `AVISF_VIDEO_PALCHANGES` (`0x0001_0000`)
+  constants, the `avi:strh.<n>.flags = "0xXXXXXXXX"` upper-case-hex
+  metadata key (omitted on the `0` "no flags set" legacy default),
+  and the `AviMuxOptions::with_stream_flags(stream_index, flags)`
+  builder writing the supplied 32-bit value verbatim into byte
+  offset 8 of the 56-byte AVISTREAMHEADER. Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md` §"AVISTREAMHEADER"
+  (`dwFlags` row line 237) + the *dwFlags values* table at lines
+  252–255: *"AVISF_DISABLED — Indicates this stream should not be
+  enabled by default."* and *"AVISF_VIDEO_PALCHANGES — Indicates this
+  video stream contains palette changes. This flag warns the playback
+  software that it will need to animate the palette."*
+
+  The typed-decode `StrhFlags` struct mirrors the round-10 candidate-3
+  `AvihFlags` shape: every documented bit gets its own `bool` and the
+  raw DWORD is preserved in `bits` so undocumented vendor / driver
+  bits in the upper half-DWORD (some legacy capture filters tag
+  driver-private state there) stay observable instead of being
+  silently masked. The demuxer does NOT validate against the spec's
+  two documented bits and the muxer does NOT cross-validate against
+  other strh fields — stamping `AVISF_VIDEO_PALCHANGES` on an audio
+  stream is internally inconsistent on purpose, mirroring the round-3
+  long-standing convention that side-band byte stamps are
+  byte-stamp-only.
+
+  Mapping the `0` default to `None` (rather than `Some(0)`) on the
+  accessor keeps the "no flags set" case observable in
+  `Option::is_none()` and omits the `avi:strh.<n>.flags` metadata
+  key, mirroring the round-229 `dwLength` / round-222 `dwSampleSize`
+  / round-217 `dwSuggestedBufferSize` / round-210 `fccHandler` /
+  round-203 `dwStart` / round-182 `wPriority` / round-176 `dwQuality`
+  / round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+  `rcFrame` "default == absent" convention this crate has carried
+  since round-115. The override only changes the byte stamp at strh
+  offset 8 and does NOT touch the file-global `avih.dwFlags` already
+  surfaced via `avih_flags()` / `AvihFlags` (round-10 candidate 3) —
+  the two flag DWORDs are spec-independent. The pre-round-247 muxer
+  has always stamped `0` here; the override pairs with the existing
+  per-packet palette-change `xxpc` chunk emission
+  (`AviMuxer::write_palette_change`) so a caller can produce a fully
+  AVI-1.0-conformant palette-animating video stream by stamping
+  `AVISF_VIDEO_PALCHANGES` alongside the per-packet palette records.
+
 - **OpenDML `LIST odml dmlh.dwTotalFrames` muxer-side override
   (round 234).** Adds the
   `AviMuxOptions::with_dmlh_total_frames(n)` builder writing the

@@ -379,6 +379,24 @@ fn open_avi_inner(
     // round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
     // `rcFrame` "default == absent" convention.
     let mut stream_sample_sizes: Vec<Option<u32>> = Vec::new();
+    // Round-247: per-stream `strh.dwFlags` raw u32 from byte offset 8 of
+    // the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwFlags` row
+    // in `docs/container/riff/avi-riff-file-reference.md` line 237 +
+    // the *dwFlags values* table at lines 252–255 carrying
+    // `AVISF_DISABLED` (`0x0000_0001`) and `AVISF_VIDEO_PALCHANGES`
+    // (`0x0001_0000`)). Parallel to `streams`: `Some(bits)` when the
+    // strh declared a non-zero flag field, `None` when it carried the
+    // `0` legacy "no flags set" writer default — so an unspecified
+    // flag DWORD reads the same as an absent one, mirroring the
+    // round-229 `dwLength` / round-222 `dwSampleSize` / round-217
+    // `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    // `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    // round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+    // `rcFrame` "default == absent" convention. Non-zero values
+    // surface verbatim — the demuxer does NOT mask undocumented bits
+    // (some legacy capture filters pack driver-private flags in the
+    // upper half-DWORD outside the spec's two documented bits).
+    let mut stream_flags: Vec<Option<u32>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -418,6 +436,7 @@ fn open_avi_inner(
         &mut stream_suggested_buffer_sizes,
         &mut stream_sample_sizes,
         &mut stream_lengths,
+        &mut stream_flags,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -461,6 +480,7 @@ fn open_avi_inner(
                     &mut stream_suggested_buffer_sizes,
                     &mut stream_sample_sizes,
                     &mut stream_lengths,
+                    &mut stream_flags,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -1105,6 +1125,32 @@ fn open_avi_inner(
         }
     }
 
+    // Round-247: AVI 1.0 §"AVISTREAMHEADER" `dwFlags` field at byte
+    // offset 8 of the strh. Surfaced as
+    // `avi:strh.<index>.flags = "0xXXXXXXXX"` (upper-case 8-hex) for
+    // every stream whose strh declared a non-zero flag DWORD per the
+    // `dwFlags` row in
+    // `docs/container/riff/avi-riff-file-reference.md` (line 237) +
+    // the spec's *dwFlags values* table at lines 252–255
+    // (`AVISF_DISABLED` `0x0000_0001` + `AVISF_VIDEO_PALCHANGES`
+    // `0x0001_0000`). The `0` legacy default is omitted so an
+    // unspecified flag DWORD reads the same as an absent one,
+    // mirroring the round-229 `length` / round-222 `sample_size` /
+    // round-217 `suggested_buffer_size` / round-210 `handler` /
+    // round-203 `start` / round-182 `priority` / round-176 `quality`
+    // / round-153 `initial_frames` / round-119 `language` / round-115
+    // `frame_rect` conventions. The raw 32-bit value is also reachable
+    // via the typed [`AviDemuxer::stream_flags`] /
+    // [`AviDemuxer::stream_flags_typed`] accessors. Hex-string
+    // rendering mirrors the file-global `avi:flags` key (`avih.dwFlags`,
+    // round-10) so callers walking metadata pairs see consistent
+    // formatting between the two flag DWORDs.
+    for (i, flags_opt) in stream_flags.iter().enumerate() {
+        if let Some(bits) = flags_opt {
+            metadata.push((format!("avi:strh.{i}.flags"), format!("0x{bits:08X}")));
+        }
+    }
+
     // Build the seek table from idx1 (if present). `build_idx_table` resolves
     // the per-file offset base (file-absolute vs movi-relative) by probing
     // the first entry against the known chunk header.
@@ -1589,6 +1635,7 @@ fn open_avi_inner(
         stream_suggested_buffer_sizes,
         stream_sample_sizes,
         stream_lengths,
+        stream_flags,
         digitization_date,
         smpte_timecode,
     })
@@ -1628,6 +1675,7 @@ fn walk_riff_body(
     stream_suggested_buffer_sizes: &mut Vec<Option<u32>>,
     stream_sample_sizes: &mut Vec<Option<u32>>,
     stream_lengths: &mut Vec<Option<u32>>,
+    stream_flags: &mut Vec<Option<u32>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1673,6 +1721,7 @@ fn walk_riff_body(
                         suggested_buffer_sizes_vec,
                         sample_sizes_vec,
                         lengths_vec,
+                        flags_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1698,6 +1747,7 @@ fn walk_riff_body(
                     *stream_suggested_buffer_sizes = suggested_buffer_sizes_vec;
                     *stream_sample_sizes = sample_sizes_vec;
                     *stream_lengths = lengths_vec;
+                    *stream_flags = flags_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -1940,6 +1990,9 @@ type HdrlOutput = (
     Vec<Option<u32>>,
     Vec<Option<u32>>,
     Vec<Option<u32>>,
+    // Round-247: per-stream `strh.dwFlags` raw u32s, parallel to
+    // `streams`. `None` for the `0` legacy "no flags set" default.
+    Vec<Option<u32>>,
     Option<String>,
     Option<String>,
 );
@@ -1993,6 +2046,15 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     // `dwSuggestedBufferSize` / round-210 `fccHandler` "default ==
     // absent" convention.
     let mut stream_lengths: Vec<Option<u32>> = Vec::new();
+    // Round-247: per-stream `strh.dwFlags` (raw u32 at byte offset 8 of
+    // each AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER", `dwFlags`
+    // row + the spec's *dwFlags values* table at lines 252–255). The `0`
+    // "no flags set" value maps to `None` so an unspecified flag field
+    // reads the same as an absent one — mirroring the round-229
+    // `dwLength` / round-222 `dwSampleSize` / round-217
+    // `dwSuggestedBufferSize` / round-210 `fccHandler` "default ==
+    // absent" convention.
+    let mut stream_flags: Vec<Option<u32>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -2070,6 +2132,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         suggested_buffer_size,
                         sample_size,
                         length,
+                        flags,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -2091,6 +2154,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_suggested_buffer_sizes.push(suggested_buffer_size);
                         stream_sample_sizes.push(sample_size);
                         stream_lengths.push(length);
+                        stream_flags.push(flags);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -2143,6 +2207,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_suggested_buffer_sizes,
         stream_sample_sizes,
         stream_lengths,
+        stream_flags,
         digitization_date,
         smpte_timecode,
     ))
@@ -2277,6 +2342,8 @@ type StrlOutput = (
     Option<u32>,
     Option<u32>,
     Option<u32>,
+    // Round-247: `strh.dwFlags` raw u32.
+    Option<u32>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2401,6 +2468,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 None,
                 None,
                 None,
+                None,
             ))
         }
     };
@@ -2426,6 +2494,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.12,
         parsed.13,
         parsed.14,
+        parsed.15,
     ))
 }
 
@@ -2920,6 +2989,9 @@ type BuildStreamOutput = (
     Option<u32>,
     Option<u32>,
     Option<u32>,
+    // Round-247: `strh.dwFlags` raw u32 (`None` for the `0` "no flags
+    // set" legacy writer default; non-zero values surface verbatim).
+    Option<u32>,
 );
 
 fn build_stream(
@@ -3098,6 +3170,36 @@ fn build_stream(
         }
     } else {
         None
+    };
+
+    // `dwFlags` (round-247): a u32 at byte offset 8 of the 56-byte
+    // AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (`dwFlags` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, line 237 + the
+    // *dwFlags values* table at lines 252–255). Two bits are spec-
+    // documented:
+    // - `AVISF_DISABLED` (`0x0000_0001`): *"Indicates this stream
+    //   should not be enabled by default."*
+    // - `AVISF_VIDEO_PALCHANGES` (`0x0001_0000`): *"Indicates this
+    //   video stream contains palette changes. This flag warns the
+    //   playback software that it will need to animate the palette."*
+    // The `0` "no flags set" value is the legacy writer default (the
+    // muxer has stamped zero since round-3 and the wild's
+    // disabled-by-default / palette-animating files are a minority);
+    // it maps here to `None` so an unspecified flag field reads the
+    // same as an absent one, mirroring the round-229 `dwLength` /
+    // round-222 `dwSampleSize` / round-217 `dwSuggestedBufferSize` /
+    // round-210 `fccHandler` / round-203 `dwStart` / round-182
+    // `wPriority` / round-176 `dwQuality` / round-153
+    // `dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame`
+    // "default == absent" convention. Non-zero values surface
+    // verbatim — the demuxer does not mask bits outside the
+    // documented set (some legacy capture filters pack driver-private
+    // bits in the upper half-DWORD that the spec does not pin).
+    let flags_raw = u32::from_le_bytes([strh[8], strh[9], strh[10], strh[11]]);
+    let flags: Option<u32> = if flags_raw == 0 {
+        None
+    } else {
+        Some(flags_raw)
     };
 
     // `fccHandler` (round-210): a 4-byte FourCC at byte offset 4 of
@@ -3444,6 +3546,7 @@ fn build_stream(
         suggested_buffer_size,
         sample_size_opt,
         length_opt,
+        flags,
     ))
 }
 
@@ -4229,6 +4332,26 @@ pub struct AviDemuxer {
     /// semantics or comparison against a separately-emitted writer's
     /// stamp.
     stream_lengths: Vec<Option<u32>>,
+    /// Per-stream `strh.dwFlags` raw value from byte offset 8 of the
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-247).
+    /// Indexed by stream number; `Some(bits)` when the strh declared a
+    /// non-zero flag DWORD, `None` when it carried the `0` "no flags
+    /// set" legacy writer default so an unspecified flag field reads
+    /// the same as an absent one. Per the `dwFlags` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (line 237) +
+    /// the *dwFlags values* table at lines 252–255: two `AVISF_*`
+    /// bits are spec-documented — `AVISF_DISABLED` (`0x0000_0001`,
+    /// stream should not be enabled by default) and
+    /// `AVISF_VIDEO_PALCHANGES` (`0x0001_0000`, video stream contains
+    /// palette changes). Surfaced via the typed
+    /// [`AviDemuxer::stream_flags`] (raw u32) and
+    /// [`AviDemuxer::stream_flags_typed`] ([`StrhFlags`] decode)
+    /// accessors in addition to the `avi:strh.<index>.flags`
+    /// hex-string metadata key (`0xXXXXXXXX` upper-case, omitted on
+    /// the `0` default). The demuxer does NOT mask bits outside the
+    /// documented set so undocumented vendor / driver bits round-trip
+    /// observable.
+    stream_flags: Vec<Option<u32>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -4293,6 +4416,21 @@ pub const AVIF_TRUSTCKTYPE: u32 = 0x0000_0800;
 pub const AVIF_WASCAPTUREFILE: u32 = 0x0001_0000;
 /// `AVIF_COPYRIGHTED` per `vfw.h` — file contains copyrighted data.
 pub const AVIF_COPYRIGHTED: u32 = 0x0002_0000;
+
+/// `AVISF_DISABLED` per AVI 1.0 §"AVISTREAMHEADER" dwFlags table
+/// (`docs/container/riff/avi-riff-file-reference.md`, line 254):
+/// *"Indicates this stream should not be enabled by default."* Players
+/// honouring the bit start playback with the stream muted / hidden
+/// unless the user opts in.
+pub const AVISF_DISABLED: u32 = 0x0000_0001;
+/// `AVISF_VIDEO_PALCHANGES` per AVI 1.0 §"AVISTREAMHEADER" dwFlags
+/// table (`docs/container/riff/avi-riff-file-reference.md`, line 255):
+/// *"Indicates this video stream contains palette changes. This flag
+/// warns the playback software that it will need to animate the
+/// palette."* Pairs with the per-stream `xxpc` palette-change chunks
+/// already surfaced via [`AviDemuxer::palette_change_count`] /
+/// [`AviDemuxer::palette_change_data`].
+pub const AVISF_VIDEO_PALCHANGES: u32 = 0x0001_0000;
 
 // --- WAVEFORMATEX format-tag constants (mmreg.h) used by the round-14
 // candidate 2 audio sample-size VBR/CBR validator. -------------------
@@ -4450,6 +4588,50 @@ impl AvihFlags {
             trust_ck_type: bits & AVIF_TRUSTCKTYPE != 0,
             was_capture_file: bits & AVIF_WASCAPTUREFILE != 0,
             copyrighted: bits & AVIF_COPYRIGHTED != 0,
+            bits,
+        }
+    }
+}
+
+/// Typed decode of `AVISTREAMHEADER.dwFlags` per AVI 1.0
+/// §"AVISTREAMHEADER" `dwFlags` row + the spec's *dwFlags values*
+/// table (`docs/container/riff/avi-riff-file-reference.md`, line 237
+/// + lines 252–255, round-247).
+///
+/// Each documented `AVISF_*` bit decodes to its own `bool`; the raw
+/// `bits` field carries the original DWORD so callers wanting to
+/// inspect undocumented or vendor-extension bits don't lose
+/// information.
+///
+/// Returned by [`AviDemuxer::stream_flags_typed`]; the same DWORD
+/// surfaces as the `avi:strh.<index>.flags` hex-string metadata key
+/// when non-zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StrhFlags {
+    /// `AVISF_DISABLED` (`0x0000_0001`) — stream should not be enabled
+    /// by default. Players honouring the bit start playback with the
+    /// stream muted / hidden unless the user opts in.
+    pub disabled: bool,
+    /// `AVISF_VIDEO_PALCHANGES` (`0x0001_0000`) — video stream
+    /// contains palette changes. Pairs with the per-stream `xxpc`
+    /// palette-change chunks already surfaced via
+    /// [`AviDemuxer::palette_change_count`] /
+    /// [`AviDemuxer::palette_change_data`].
+    pub video_palchanges: bool,
+    /// Raw `dwFlags` DWORD as parsed from `strh`. Non-zero bits
+    /// outside the documented set are vendor-extension / future-spec
+    /// bits and are exposed verbatim — the spec carries only two
+    /// `AVISF_*` constants, but writers in the wild occasionally pack
+    /// driver-private bits in the upper half-DWORD.
+    pub bits: u32,
+}
+
+impl StrhFlags {
+    /// Decode a raw `strh.dwFlags` u32 into a structured [`StrhFlags`].
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            disabled: bits & AVISF_DISABLED != 0,
+            video_palchanges: bits & AVISF_VIDEO_PALCHANGES != 0,
             bits,
         }
     }
@@ -6617,6 +6799,58 @@ impl AviDemuxer {
         self.stream_lengths
             .get(stream_index as usize)
             .and_then(|s| *s)
+    }
+
+    /// Round-247: per-stream `strh.dwFlags` raw u32 from byte offset 8
+    /// of the AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER"
+    /// (`dwFlags` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 237).
+    /// Two `AVISF_*` bits are spec-documented in the *dwFlags values*
+    /// table at lines 252–255:
+    ///
+    /// - [`AVISF_DISABLED`] (`0x0000_0001`): *"Indicates this stream
+    ///   should not be enabled by default."*
+    /// - [`AVISF_VIDEO_PALCHANGES`] (`0x0001_0000`): *"Indicates this
+    ///   video stream contains palette changes. This flag warns the
+    ///   playback software that it will need to animate the palette."*
+    ///
+    /// Returns `None` when the strh carried the `0` "no flags set"
+    /// legacy writer default — so an unspecified flag field reads the
+    /// same as an absent one (mirroring the round-229 `dwLength` /
+    /// round-222 `dwSampleSize` / round-217 `dwSuggestedBufferSize` /
+    /// round-210 `fccHandler` / round-203 `dwStart` / round-182
+    /// `wPriority` / round-176 `dwQuality` / round-153
+    /// `dwInitialFrames` / round-119 `wLanguage` / round-115
+    /// `rcFrame` / round-80 `strn` / round-107 `IDIT` "default ==
+    /// absent" convention), or for an out-of-range stream index. The
+    /// same value surfaces as the `avi:strh.<index>.flags` metadata
+    /// key (`0xXXXXXXXX` upper-case hex, also omitted when absent),
+    /// and round-trips a muxer-emitted override set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_flags`].
+    ///
+    /// The raw u32 is preserved verbatim — the demuxer does NOT mask
+    /// bits outside the documented set (some legacy capture filters
+    /// pack driver-private bits in the upper half-DWORD). For a
+    /// structured decode of the documented `AVISF_*` bits, use
+    /// [`Self::stream_flags_typed`] instead.
+    pub fn stream_flags(&self, stream_index: u32) -> Option<u32> {
+        self.stream_flags
+            .get(stream_index as usize)
+            .and_then(|s| *s)
+    }
+
+    /// Round-247: typed [`StrhFlags`] decode of `strh.dwFlags` (the
+    /// same DWORD surfaced raw via [`Self::stream_flags`]).
+    ///
+    /// Returns `None` for streams whose strh carried the `0` "no
+    /// flags set" default — so the absence stays observable via
+    /// `Option::is_none()` — and for out-of-range stream indices.
+    /// Streams with any non-zero bit return `Some(StrhFlags { ... })`
+    /// with the two documented `AVISF_*` bits decoded into named
+    /// fields and the raw u32 preserved in `StrhFlags::bits` so
+    /// undocumented vendor / driver bits stay observable.
+    pub fn stream_flags_typed(&self, stream_index: u32) -> Option<StrhFlags> {
+        self.stream_flags(stream_index).map(StrhFlags::from_bits)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside

@@ -630,6 +630,42 @@ pub struct AviMuxOptions {
     /// default) preserves the pre-round-229 byte layout
     /// (auto-derived `dwLength` on every stream).
     pub stream_lengths: Vec<(u32, u32)>,
+    /// Per-stream `strh.dwFlags` overrides (round-247). Each entry is
+    /// `(stream_index, flags)` and stamps the given 32-bit DWORD into
+    /// byte offset 8 of that stream's 56-byte AVISTREAMHEADER per AVI
+    /// 1.0 §"AVISTREAMHEADER" (`dwFlags` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 237 +
+    /// the *dwFlags values* table at lines 252–255 carrying
+    /// `AVISF_DISABLED` (`0x0000_0001`) and `AVISF_VIDEO_PALCHANGES`
+    /// (`0x0001_0000`)).
+    ///
+    /// Without an override the muxer keeps its pre-round-247 default
+    /// of `0` (no flags set) — the legacy writer behaviour the muxer
+    /// has used since round-3 and the dominant value in the wild
+    /// (disabled-by-default streams and palette-animating video are
+    /// the minority). The override is byte-stamp-only — it does NOT
+    /// validate the supplied bits against the spec's two documented
+    /// constants (so a caller can round-trip undocumented vendor /
+    /// driver bits in the upper half-DWORD), does NOT touch
+    /// `avih.dwFlags` (the file-global `AVIF_*` flags handled
+    /// independently via `with_avih_flags` and friends), and does NOT
+    /// cross-validate against other strh fields (e.g. stamping
+    /// `AVISF_VIDEO_PALCHANGES` on an audio stream is internally
+    /// inconsistent on purpose).
+    ///
+    /// Passing `0` stamps the legacy "no flags set" value — the
+    /// demuxer maps that back to `None`, mirroring the round-229
+    /// `dwLength` / round-222 `dwSampleSize` / round-217
+    /// `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    /// `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    /// round-153 `dwInitialFrames` / round-119 `wLanguage` /
+    /// round-115 `rcFrame` "default == absent" convention.
+    ///
+    /// Duplicate calls for the same stream index replace the prior
+    /// entry — see [`Self::with_stream_flags`]. Empty list (the
+    /// default) preserves the pre-round-247 byte layout (zero
+    /// `dwFlags` on every stream).
+    pub stream_flags: Vec<(u32, u32)>,
     /// `avih.dwPaddingGranularity` for stream-aligned remuxes (round-92).
     ///
     /// Per AVI 1.0 §"AVIMAINHEADER" (docs/container/riff/
@@ -1780,6 +1816,55 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp a `dwFlags` DWORD into the 56-byte
+    /// AVISTREAMHEADER for `stream_index` (round-247). The 32-bit
+    /// value is written little-endian at byte offset 8 of the strh
+    /// per AVI 1.0 §"AVISTREAMHEADER" (`dwFlags` row in
+    /// `docs/container/riff/avi-riff-file-reference.md`, line 237).
+    ///
+    /// The spec's *dwFlags values* table at lines 252–255 documents
+    /// two bits:
+    ///
+    /// - [`crate::demuxer::AVISF_DISABLED`] (`0x0000_0001`):
+    ///   *"Indicates this stream should not be enabled by default."*
+    /// - [`crate::demuxer::AVISF_VIDEO_PALCHANGES`] (`0x0001_0000`):
+    ///   *"Indicates this video stream contains palette changes.
+    ///   This flag warns the playback software that it will need to
+    ///   animate the palette."*
+    ///
+    /// The muxer writes whatever 32-bit value the caller supplies
+    /// verbatim and does **not** validate against the documented set
+    /// — so a caller may stamp vendor-extension / driver-private bits
+    /// in the upper half-DWORD that the spec does not pin, and they
+    /// round-trip exactly through
+    /// [`crate::demuxer::AviDemuxer::stream_flags`].
+    ///
+    /// Passing `0` is equivalent to omitting the override — the
+    /// demuxer maps the `0` legacy writer default back to `None` (the
+    /// pre-round-247 muxer behaviour) so a stamp of `0` reads as
+    /// "no flags recorded" on re-demux, mirroring the round-229
+    /// `dwLength` / round-222 `dwSampleSize` / round-217
+    /// `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+    /// `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+    /// round-153 `dwInitialFrames` / round-119 `wLanguage` /
+    /// round-115 `rcFrame` "default == absent" convention.
+    ///
+    /// The override is byte-stamp-only: it does NOT touch
+    /// `avih.dwFlags` (the file-global `AVIF_*` flags handled
+    /// independently via [`Self::with_avih_flags`] and friends), and
+    /// it does NOT cross-validate against other strh fields (e.g.
+    /// stamping `AVISF_VIDEO_PALCHANGES` on an audio stream is
+    /// internally inconsistent on purpose). Duplicate calls for the
+    /// same `stream_index` replace the prior entry. Pairs with
+    /// [`crate::demuxer::AviDemuxer::stream_flags`] and
+    /// [`crate::demuxer::AviDemuxer::stream_flags_typed`] for the
+    /// raw and typed-decode round-trip surfaces.
+    pub fn with_stream_flags(mut self, stream_index: u32, flags: u32) -> Self {
+        self.stream_flags.retain(|(idx, _)| *idx != stream_index);
+        self.stream_flags.push((stream_index, flags));
+        self
+    }
+
     /// Builder helper: enable stream-aligned packet emission with
     /// `n`-byte granularity (round-92). See
     /// [`Self::padding_granularity`] for semantics. `n` must be a
@@ -2397,6 +2482,19 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, s)| *s);
+            // Round-247: optional `strh.dwFlags` override for this
+            // stream (see `with_stream_flags`'s retain-then-push
+            // pattern). `None` keeps the legacy `0` writer default the
+            // demuxer maps back to `None` (per AVI 1.0
+            // §"AVISTREAMHEADER" `dwFlags` row + the *dwFlags values*
+            // table at lines 252–255 carrying `AVISF_DISABLED` /
+            // `AVISF_VIDEO_PALCHANGES`).
+            let flags_override = self
+                .options
+                .stream_flags
+                .iter()
+                .find(|(idx, _)| *idx == i as u32)
+                .map(|(_, f)| *f);
             let (indx_count_off, indx_entries_off) = write_strl(
                 self.output.as_mut(),
                 i as u32,
@@ -2416,6 +2514,7 @@ impl Muxer for AviMuxer {
                 start_override,
                 handler_override,
                 sample_size_override,
+                flags_override,
             )?;
             if with_indx {
                 self.indx_entries_count_off = indx_count_off;
@@ -3922,6 +4021,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     start_override: Option<u32>,
     handler_override: Option<[u8; 4]>,
     sample_size_override: Option<u32>,
+    flags_override: Option<u32>,
 ) -> Result<(Option<u64>, Option<u64>)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
@@ -3945,17 +4045,28 @@ fn write_strl<W: Write + Seek + ?Sized>(
                                                 // verbatim; printability is not validated.
     let handler_bytes = handler_override.unwrap_or(t.entry.handler_fourcc);
     strh.extend_from_slice(&handler_bytes);
-    strh.extend_from_slice(&0u32.to_le_bytes()); // flags
-                                                 // wPriority (round-182): an `AviMuxOptions::with_stream_priority`
-                                                 // override (when present) stamps the per-stream selection hint at
-                                                 // byte offset 12 per AVI 1.0 §"AVISTREAMHEADER" (`wPriority` row in
-                                                 // `docs/container/riff/avi-riff-file-reference.md` Appendix B line
-                                                 // 238: *"Priority of a stream type. For example, in a file with
-                                                 // multiple audio streams, the one with the highest priority might
-                                                 // be the default stream."*); otherwise the legacy default is `0`
-                                                 // (the muxer's own default since round-3, which the demuxer maps
-                                                 // back to `None`). The 16-bit value is written verbatim; the spec
-                                                 // does not normatively pin a value range or a tie-break rule.
+    // dwFlags (round-247): an `AviMuxOptions::with_stream_flags`
+    // override (when present) stamps the per-stream flag DWORD at byte
+    // offset 8 per AVI 1.0 §"AVISTREAMHEADER" (`dwFlags` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, line 237 + the
+    // *dwFlags values* table at lines 252–255 carrying `AVISF_DISABLED`
+    // / `AVISF_VIDEO_PALCHANGES`); otherwise the legacy default is `0`
+    // ("no flags set" — the muxer's own default since round-3, which
+    // the demuxer maps back to `None`). The 32-bit value is written
+    // verbatim; the muxer does not validate against the spec's two
+    // documented bits so callers may stamp vendor / driver-private
+    // bits in the upper half-DWORD for round-trippability.
+    strh.extend_from_slice(&flags_override.unwrap_or(0).to_le_bytes()); // flags
+                                                                        // wPriority (round-182): an `AviMuxOptions::with_stream_priority`
+                                                                        // override (when present) stamps the per-stream selection hint at
+                                                                        // byte offset 12 per AVI 1.0 §"AVISTREAMHEADER" (`wPriority` row in
+                                                                        // `docs/container/riff/avi-riff-file-reference.md` Appendix B line
+                                                                        // 238: *"Priority of a stream type. For example, in a file with
+                                                                        // multiple audio streams, the one with the highest priority might
+                                                                        // be the default stream."*); otherwise the legacy default is `0`
+                                                                        // (the muxer's own default since round-3, which the demuxer maps
+                                                                        // back to `None`). The 16-bit value is written verbatim; the spec
+                                                                        // does not normatively pin a value range or a tie-break rule.
     strh.extend_from_slice(&priority_override.unwrap_or(0).to_le_bytes()); // priority
 
     // wLanguage (round-119): an `AviMuxOptions::with_stream_language`
