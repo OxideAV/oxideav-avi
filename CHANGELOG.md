@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream `strh.fccType` demux accessor + mux override
+  (round 253).** Adds the typed
+  `AviDemuxer::stream_fcc_type(stream_index) -> Option<[u8; 4]>`
+  raw-FOURCC accessor surfacing the 4 bytes at byte offset 0 of the
+  56-byte AVISTREAMHEADER verbatim, the `avi:strh.<n>.fcc_type =
+  "<fourcc-or-hex>"` metadata key (printable-vs-hex rendering, omitted
+  when the strh carried the all-zero sentinel), and the
+  `AviMuxOptions::with_stream_fcc_type(stream_index, fcc_type)`
+  builder writing the supplied 4 bytes verbatim at byte offset 0 of
+  the strh. Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md` §"AVISTREAMHEADER"
+  (`fccType` row line 235 + the `fcc` row line 234): *"A FOURCC code
+  that specifies the type of data contained in the stream. The
+  following standard AVI values are defined: `auds` (audio stream),
+  `mids` (MIDI stream), `txts` (text stream), `vids` (video stream)."*
+
+  Without an override the muxer keeps its packaging-derived default
+  (`vids` for video streams, `auds` for audio streams, per
+  `packaging::StrfEntry::strh_type`). The override replaces the
+  4 bytes verbatim at the byte-stamp site; it does NOT alter the
+  muxer's media-kind routing (which is driven by the framework's
+  `StreamInfo::params.media_type`, not the on-disk strh `fccType`),
+  does NOT touch any sibling strh DWORD, and is NOT cross-validated
+  against the encoder's chosen media kind. Stamping a `txts` type on
+  a stream that's actually carrying PCM audio is internally
+  inconsistent on purpose — the long-standing convention that
+  side-band byte stamps are byte-stamp-only.
+
+  Mapping the all-zero `[0, 0, 0, 0]` sentinel to `None` on the
+  accessor keeps the absent / writer-skipped case observable in
+  `Option::is_none()` and omits the metadata key, mirroring the
+  round-249 `(dwScale, dwRate)` / round-247 `dwFlags` / round-229
+  `dwLength` / round-222 `dwSampleSize` / round-217
+  `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+  `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+  round-153 `dwInitialFrames` / round-119 `wLanguage` / round-115
+  `rcFrame` "default == absent" convention this crate has carried
+  since round-115. Non-standard FOURCCs outside the spec's documented
+  `{auds, mids, txts, vids}` set (e.g. the legacy `iavs` interleaved
+  DV stream FOURCC) surface verbatim — the spec phrases the standard
+  values as illustrative rather than exhaustive, and the demuxer
+  does NOT validate membership in the standard set. The metadata
+  rendering follows the same printable-vs-hex split the
+  `avi:strh.<n>.handler` key uses (`0x20..=0x7e` ASCII renders as
+  four printable characters, otherwise `0xHHHHHHHH` lower-case hex).
+
+  Tests in `tests/round253_strh_fcc_type.rs` (12 cases) cover the
+  no-override packaging-default baseline (video `vids`, audio
+  `auds`), video `mids` override round-trip, audio `txts` override
+  round-trip, builder idempotency (last `with_stream_fcc_type` for
+  a given index wins), vendor-FOURCC `iavs` round-trip, per-stream
+  independence (an override on one stream doesn't perturb the
+  other's readback), sibling-DWORD independence (`dwFlags` /
+  `dwLength` / `dwSampleSize` / `dwSuggestedBufferSize` /
+  `fccHandler` / `dwStart` / `wPriority` / `dwQuality` /
+  `dwInitialFrames` / `wLanguage` / `(dwScale, dwRate)` all stay at
+  their packaging defaults), hand-rolled fixtures for the
+  printable / all-zero decode paths, non-printable bytes rendering
+  as `0x00112233` hex in the metadata, and out-of-range stream
+  index returning `None`. All 483 crate tests pass; `cargo fmt
+  --check` and `cargo clippy --all-targets --no-deps -- -D warnings`
+  clean.
+
 - **Per-stream `(strh.dwScale, strh.dwRate)` demux accessor + mux
   override (round 249).** Adds the typed
   `AviDemuxer::stream_timebase(stream_index) -> Option<(u32, u32)>`

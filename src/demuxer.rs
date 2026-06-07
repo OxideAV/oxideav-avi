@@ -413,6 +413,24 @@ fn open_avi_inner(
     // a degenerate file remains decodable; the raw-DWORD surface keeps
     // the on-disk byte pattern observable for round-trip parity.
     let mut stream_rates: Vec<Option<(u32, u32)>> = Vec::new();
+    // Round-253: per-stream `strh.fccType` raw FOURCC captured verbatim
+    // from byte offset 0 of the AVISTREAMHEADER per AVI 1.0
+    // §"AVISTREAMHEADER" (`fccType` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, Appendix B line
+    // 235 + the `fcc` row at line 234: *"A FOURCC code that specifies
+    // the type of data contained in the stream. The following standard
+    // AVI values are defined: `auds` (audio stream), `mids` (MIDI
+    // stream), `txts` (text stream), `vids` (video stream)."*).
+    // Parallel to `streams`: `Some(fcc)` when the strh declared a
+    // non-zero FOURCC, `None` when it carried the all-zero
+    // `[0, 0, 0, 0]` sentinel so an unspecified type reads the same as
+    // an absent one — mirroring the round-249 `(dwScale, dwRate)` /
+    // round-247 `dwFlags` / round-229 `dwLength` "default == absent"
+    // convention. The 4 bytes surface verbatim and are NOT validated
+    // against the spec-documented `{auds, mids, txts, vids}` set —
+    // the spec does not pin a closed registry, and vendor-specific
+    // FOURCCs are surfaced for the caller to interpret.
+    let mut stream_fcc_types: Vec<Option<[u8; 4]>> = Vec::new();
     // Round-107: the optional `IDIT` digitization-date text chunk inside
     // `LIST hdrl` (RIFF *Hdrl Tags* namespace; `DateTimeOriginal`).
     // `None` until/unless the primary RIFF's `hdrl` carries an `IDIT`
@@ -454,6 +472,7 @@ fn open_avi_inner(
         &mut stream_lengths,
         &mut stream_flags,
         &mut stream_rates,
+        &mut stream_fcc_types,
         &mut digitization_date,
         &mut smpte_timecode,
         codecs,
@@ -499,6 +518,7 @@ fn open_avi_inner(
                     &mut stream_lengths,
                     &mut stream_flags,
                     &mut stream_rates,
+                    &mut stream_fcc_types,
                     &mut digitization_date,
                     &mut smpte_timecode,
                     codecs,
@@ -1034,6 +1054,37 @@ fn open_avi_inner(
     for (i, start_opt) in stream_starts.iter().enumerate() {
         if let Some(s) = start_opt {
             metadata.push((format!("avi:strh.{i}.start"), s.to_string()));
+        }
+    }
+
+    // Round-253: AVI 1.0 §"AVISTREAMHEADER" `fccType` field at byte
+    // offset 0 of the strh. Surfaced as
+    // `avi:strh.<index>.fcc_type = "<fourcc-or-hex>"` for every
+    // stream whose strh declared a non-zero type FOURCC ("A FOURCC
+    // code that specifies the type of data contained in the stream.
+    // The following standard AVI values are defined: `auds` (audio
+    // stream), `mids` (MIDI stream), `txts` (text stream), `vids`
+    // (video stream)." per AVI 1.0 §"AVISTREAMHEADER" Appendix B
+    // `fccType` row line 235 + the `fcc` row at line 234). The
+    // all-zero `\0\0\0\0` "no declared type" sentinel is omitted so
+    // an unspecified type reads the same as an absent one,
+    // mirroring the `avi:strh.<n>.handler` / `scale` / `rate` /
+    // `flags` / `length` / `sample_size` / `suggested_buffer_size` /
+    // `start` / `priority` / `quality` / `initial_frames` /
+    // `language` conventions. The raw 4-byte value is also reachable
+    // via the typed [`AviDemuxer::stream_fcc_type`] accessor; the
+    // demuxer surfaces the bytes verbatim. The metadata-string form
+    // renders as four printable ASCII characters when every byte is
+    // in the `0x20..=0x7e` printable range (so e.g. `vids` /
+    // `auds` / `mids` / `txts` round-trip legibly), otherwise as
+    // eight lower-case hex characters with a `0x` prefix (so vendor
+    // FOURCCs containing non-printable bytes stay round-trippable
+    // without colliding with any ASCII tag) — matching the
+    // printable-vs-hex split this crate uses for the
+    // `avi:strh.<n>.handler` and `avi:<fourcc>` unknown-tag keys.
+    for (i, fcc_opt) in stream_fcc_types.iter().enumerate() {
+        if let Some(f) = fcc_opt {
+            metadata.push((format!("avi:strh.{i}.fcc_type"), format_fourcc_or_hex(f)));
         }
     }
 
@@ -1680,6 +1731,7 @@ fn open_avi_inner(
         stream_lengths,
         stream_flags,
         stream_rates,
+        stream_fcc_types,
         digitization_date,
         smpte_timecode,
     })
@@ -1721,6 +1773,7 @@ fn walk_riff_body(
     stream_lengths: &mut Vec<Option<u32>>,
     stream_flags: &mut Vec<Option<u32>>,
     stream_rates: &mut Vec<Option<(u32, u32)>>,
+    stream_fcc_types: &mut Vec<Option<[u8; 4]>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     codecs: &dyn CodecResolver,
@@ -1768,6 +1821,7 @@ fn walk_riff_body(
                         lengths_vec,
                         flags_vec,
                         rates_vec,
+                        fcc_types_vec,
                         idit,
                         ismp,
                     ) = parse_hdrl(input, body_end, codecs)?;
@@ -1795,6 +1849,7 @@ fn walk_riff_body(
                     *stream_lengths = lengths_vec;
                     *stream_flags = flags_vec;
                     *stream_rates = rates_vec;
+                    *stream_fcc_types = fcc_types_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
                 }
@@ -2044,6 +2099,9 @@ type HdrlOutput = (
     // pair, parallel to `streams`. `None` for the writer-skips-it
     // sentinel where either DWORD is zero.
     Vec<Option<(u32, u32)>>,
+    // Round-253: per-stream `strh.fccType` raw FOURCC, parallel to
+    // `streams`. `None` for the all-zero `[0, 0, 0, 0]` sentinel.
+    Vec<Option<[u8; 4]>>,
     Option<String>,
     Option<String>,
 );
@@ -2118,6 +2176,18 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     // derivation still applies `.max(1)` separately to keep the
     // decoder functional on degenerate files.
     let mut stream_rates: Vec<Option<(u32, u32)>> = Vec::new();
+    // Round-253: per-stream `strh.fccType` raw FOURCC captured verbatim
+    // from byte offset 0 of each AVISTREAMHEADER per AVI 1.0
+    // §"AVISTREAMHEADER" (`fccType` row at line 235 + the `fcc` row at
+    // line 234 documenting the standard `auds` / `mids` / `txts` /
+    // `vids` values). The all-zero `[0, 0, 0, 0]` sentinel maps to
+    // `None` so an absent / writer-skipped type reads the same as a
+    // default one — mirroring the round-249 `(dwScale, dwRate)` /
+    // round-247 `dwFlags` / round-229 `dwLength` "default == absent"
+    // convention. Non-standard FOURCCs outside the spec's
+    // `{auds, mids, txts, vids}` set are surfaced verbatim for the
+    // caller to interpret.
+    let mut stream_fcc_types: Vec<Option<[u8; 4]>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
@@ -2197,6 +2267,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         length,
                         flags,
                         rate_scale,
+                        fcc_type,
                     ) = parse_strl(r, body_end, streams.len() as u32, codecs)?;
                     if let Some(si) = si {
                         streams.push(si);
@@ -2220,6 +2291,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                         stream_lengths.push(length);
                         stream_flags.push(flags);
                         stream_rates.push(rate_scale);
+                        stream_fcc_types.push(fcc_type);
                     }
                 } else if &list_type == b"odml" {
                     // OpenDML 2.0 extended AVI header: `LIST odml dmlh`.
@@ -2274,6 +2346,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_lengths,
         stream_flags,
         stream_rates,
+        stream_fcc_types,
         digitization_date,
         smpte_timecode,
     ))
@@ -2412,6 +2485,9 @@ type StrlOutput = (
     Option<u32>,
     // Round-249: `(strh.dwScale, strh.dwRate)` raw timebase pair.
     Option<(u32, u32)>,
+    // Round-253: `strh.fccType` raw FOURCC (`None` for the all-zero
+    // sentinel).
+    Option<[u8; 4]>,
 );
 
 /// Parse a `strl` LIST. Returns the `StreamInfo`, expected packet
@@ -2540,6 +2616,9 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 // Round-249: per-stream (dwScale, dwRate) absent when
                 // the strl had no strh chunk.
                 None,
+                // Round-253: per-stream `strh.fccType` absent when the
+                // strl had no strh chunk.
+                None,
             ));
         }
     };
@@ -2567,6 +2646,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         parsed.14,
         parsed.15,
         parsed.16,
+        parsed.17,
     ))
 }
 
@@ -3069,6 +3149,12 @@ type BuildStreamOutput = (
     // `None` when either DWORD is zero (the writer-skips-it /
     // mathematically-undefined `rate/scale` ratio).
     Option<(u32, u32)>,
+    // Round-253: `strh.fccType` raw FOURCC captured from byte offset
+    // 0 of the AVISTREAMHEADER. `None` when the 4 bytes were all
+    // zero (the writer-skips-it sentinel mirroring the round-247
+    // `dwFlags` / round-229 `dwLength` etc. "default == absent"
+    // convention).
+    Option<[u8; 4]>,
 );
 
 fn build_stream(
@@ -3127,6 +3213,24 @@ fn build_stream(
         None
     } else {
         Some((scale_raw, rate_raw))
+    };
+
+    // Round-253: surface the raw `fccType` FOURCC from byte offset 0
+    // verbatim. The all-zero `[0, 0, 0, 0]` sentinel is the
+    // writer-skips-it / "no declared type" default and maps to `None`
+    // so an unspecified type reads the same as an absent one —
+    // mirroring the round-249 `(dwScale, dwRate)` / round-247
+    // `dwFlags` / round-229 `dwLength` "default == absent" convention.
+    // Non-standard FOURCCs outside the spec's `{auds, mids, txts,
+    // vids}` set are surfaced verbatim for the caller to interpret;
+    // the demuxer's own internal codec classification (which switches
+    // on `&fcc_type` for media-kind routing below) is independent of
+    // this surface and remains free to fall through to the
+    // `Unknown / Data` arm for non-standard types.
+    let fcc_type_opt: Option<[u8; 4]> = if fcc_type == [0, 0, 0, 0] {
+        None
+    } else {
+        Some(fcc_type)
     };
 
     // `wLanguage` (round-119): a 16-bit LANGID at byte offset 14 of the
@@ -3650,6 +3754,7 @@ fn build_stream(
         length_opt,
         flags,
         rate_scale,
+        fcc_type_opt,
     ))
 }
 
@@ -4470,6 +4575,33 @@ pub struct AviDemuxer {
     /// accessor and the `avi:strh.<index>.scale` /
     /// `avi:strh.<index>.rate` decimal metadata keys.
     stream_rates: Vec<Option<(u32, u32)>>,
+    /// Per-stream `strh.fccType` raw FOURCC from byte offset 0 of the
+    /// AVISTREAMHEADER per AVI 1.0 §"AVISTREAMHEADER" (round-253).
+    /// Indexed by stream number; `Some(fcc)` when the strh declared a
+    /// non-zero FOURCC, `None` when it carried the all-zero
+    /// `[0, 0, 0, 0]` sentinel so an unspecified type reads the same
+    /// as an absent one (mirroring the round-249 `(dwScale, dwRate)`
+    /// / round-247 `dwFlags` / round-229 `dwLength` "default ==
+    /// absent" convention).
+    ///
+    /// Per the `fccType` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (Appendix B
+    /// line 235) the field is *"Same as `fcc` (in the avifmt.h
+    /// definition; see Remarks)."*, and the `fcc` row (line 234)
+    /// documents the standard `{auds, mids, txts, vids}` set: *"A
+    /// FOURCC code that specifies the type of data contained in the
+    /// stream."* The demuxer surfaces the raw 4 bytes verbatim and
+    /// does NOT validate membership in the spec-documented set —
+    /// the spec does not pin a closed registry, and vendor-specific
+    /// FOURCCs are surfaced for the caller to interpret. The
+    /// demuxer's own internal codec classification (which switches on
+    /// the strh `fccType` for media-kind routing) is independent of
+    /// this surface; this raw-FOURCC surface keeps the on-disk byte
+    /// pattern observable for round-trip parity.
+    ///
+    /// Surfaced via the typed [`AviDemuxer::stream_fcc_type`] accessor
+    /// and the `avi:strh.<index>.fcc_type` metadata key.
+    stream_fcc_types: Vec<Option<[u8; 4]>>,
     /// Digitization-date text from the optional `IDIT` chunk inside
     /// `LIST hdrl` (round-107). `IDIT` is a member of the RIFF *Hdrl
     /// Tags* namespace (`DateTimeOriginal`) per
@@ -7016,6 +7148,48 @@ impl AviDemuxer {
         self.stream_rates
             .get(stream_index as usize)
             .and_then(|s| *s)
+    }
+
+    /// `strh.fccType` raw FOURCC for a stream, as the verbatim 4 bytes
+    /// read off byte offset 0 of the 56-byte AVISTREAMHEADER per AVI
+    /// 1.0 §"AVISTREAMHEADER" (round-253). Per the `fccType` row in
+    /// `docs/container/riff/avi-riff-file-reference.md` (Appendix B
+    /// line 235 + the `fcc` row at line 234 documenting the standard
+    /// values): *"A FOURCC code that specifies the type of data
+    /// contained in the stream. The following standard AVI values are
+    /// defined: `auds` (audio stream), `mids` (MIDI stream), `txts`
+    /// (text stream), `vids` (video stream)."*
+    ///
+    /// The FOURCC determines the stream's high-level media-kind
+    /// routing inside the demuxer, but the raw on-disk byte pattern
+    /// surfaces here verbatim so callers comparing against a
+    /// separately-emitted writer's stamp, or stamping an identical
+    /// FOURCC on re-mux, can do so byte-exactly. Non-standard
+    /// FOURCCs outside the spec's `{auds, mids, txts, vids}` set
+    /// (legacy capture filters occasionally invented vendor types
+    /// such as `iavs` for interleaved DV streams) surface verbatim
+    /// for the caller to interpret — the spec phrases the standard
+    /// values as illustrative rather than exhaustive, and the
+    /// demuxer does NOT validate membership in the standard set.
+    ///
+    /// Returns `None` when the strh carried the all-zero
+    /// `[0, 0, 0, 0]` sentinel (a writer-skips-it / "no declared
+    /// type" default) so an unspecified type reads the same as an
+    /// absent one — mirroring the round-249 `(dwScale, dwRate)` /
+    /// round-247 `dwFlags` / round-229 `dwLength` / round-222
+    /// `dwSampleSize` / round-217 `dwSuggestedBufferSize` / round-210
+    /// `fccHandler` / round-203 `dwStart` / round-182 `wPriority` /
+    /// round-176 `dwQuality` / round-153 `dwInitialFrames` / round-119
+    /// `wLanguage` / round-115 `rcFrame` "default == absent"
+    /// convention this crate has carried since round-115, or for an
+    /// out-of-range stream index. The same value surfaces as the
+    /// `avi:strh.<index>.fcc_type` metadata key (also omitted when
+    /// absent), and round-trips a muxer-emitted type set via
+    /// [`crate::muxer::AviMuxOptions::with_stream_fcc_type`].
+    pub fn stream_fcc_type(&self, stream_index: u32) -> Option<[u8; 4]> {
+        self.stream_fcc_types
+            .get(stream_index as usize)
+            .and_then(|f| *f)
     }
 
     /// Digitization-date string from the optional `IDIT` chunk inside
