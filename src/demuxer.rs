@@ -2837,10 +2837,10 @@ fn parse_ix_chunk(body: &[u8]) -> Option<StdIndex> {
 
 /// Walk the per-segment `movi` LIST scanning for `ix##` AVISTDINDEX
 /// chunks. Used for OpenDML 2.0 random-access seek when no `idx1`
-/// table is present (typical for files written by recent ffmpeg /
-/// VirtualDub2 with `--max_riff_size` set). Returns the parsed
-/// std-index per `ix##` chunk found (each maps back to one stream via
-/// the `##` ASCII digits in its FourCC).
+/// table is present (typical for files segmented by modern AVI
+/// writers that cap RIFF size). Returns the parsed std-index per
+/// `ix##` chunk found (each maps back to one stream via the `##`
+/// ASCII digits in its FourCC).
 fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
     r: &mut R,
     movi_segments: &[(u64, u64)],
