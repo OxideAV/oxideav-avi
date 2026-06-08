@@ -646,6 +646,22 @@ fn open_avi_inner(
         if h.initial_frames > 0 {
             metadata.push(("avi:initial_frames".into(), h.initial_frames.to_string()));
         }
+        // Round-256: surface the file-global `avih.dwMicroSecPerFrame`
+        // so a downstream tool can detect the writer's stamped
+        // frame-period without re-parsing the AVIMAINHEADER. The `0`
+        // writer-skips-it sentinel ("frame period unspecified" — most
+        // legitimate AVIs stamp a non-zero value derived from the first
+        // video stream's `(scale, rate)` pair, but a capture-card crash
+        // dump or hand-edited fixture may leave it 0) is omitted from
+        // the metadata Vec so the key is observable only when the value
+        // is actually present, mirroring the `avi:padding_granularity` /
+        // `avi:initial_frames` conventions.
+        if h.micro_sec_per_frame > 0 {
+            metadata.push((
+                "avi:micro_sec_per_frame".into(),
+                h.micro_sec_per_frame.to_string(),
+            ));
+        }
     }
     // Truncated-head signal: capture-card crash dumps, copy-aborted
     // recordings. The demuxer is best-effort for this case (see
@@ -1710,6 +1726,7 @@ fn open_avi_inner(
         avih_suggested_buffer_size: avih.as_ref().map(|h| h.suggested_buffer_size).unwrap_or(0),
         avih_padding_granularity: avih.as_ref().map(|h| h.padding_granularity).unwrap_or(0),
         avih_initial_frames: avih.as_ref().map(|h| h.initial_frames).unwrap_or(0),
+        avih_micro_sec_per_frame: avih.as_ref().map(|h| h.micro_sec_per_frame).unwrap_or(0),
         vprps,
         dmlh_total_frames,
         palette_change_data,
@@ -4282,6 +4299,24 @@ pub struct AviDemuxer {
     /// round-153 / round-119 / round-115 / round-80 "default ==
     /// absent" convention).
     avih_initial_frames: u32,
+    /// Raw `dwMicroSecPerFrame` from `AVIMAINHEADER` (round-256). The
+    /// file-global frame-period DWORD at byte offset 0 of the 56-byte
+    /// AVIMAINHEADER body. Per AVI 1.0 §"AVIMAINHEADER" (line 195):
+    /// *"Number of microseconds between frames. Indicates the overall
+    /// timing for the file."* The demuxer already consumes this DWORD
+    /// internally to derive `duration_micros = total_frames *
+    /// micro_sec_per_frame` (see `parse_hdrl`), but pre-round-256 the
+    /// value was not surfaced verbatim — only the derived duration
+    /// reached callers. Captured here so [`AviDemuxer::micro_sec_per_frame`]
+    /// can hand out the raw u32 for callers that want to inspect the
+    /// file-global frame period independently of the per-stream
+    /// `(dwScale, dwRate)` pair (round-249) — for example to detect a
+    /// file written by a capture pipeline that stamped a non-standard
+    /// frame period that doesn't match `1_000_000 * stream0_scale /
+    /// stream0_rate`. `0` is the writer-skips-it sentinel mapped to
+    /// `None` by the accessor, mirroring the round-249 / round-247 /
+    /// round-229 etc. "default == absent" convention.
+    avih_micro_sec_per_frame: u32,
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -6134,6 +6169,47 @@ impl AviDemuxer {
             None
         } else {
             Some(self.avih_initial_frames)
+        }
+    }
+
+    /// `AVIMAINHEADER.dwMicroSecPerFrame` per AVI 1.0 §"AVIMAINHEADER"
+    /// (round-256).
+    ///
+    /// Returns the file-global frame-period DWORD from byte offset 0
+    /// of the 56-byte AVIMAINHEADER body, or `None` when the file
+    /// declared the writer-skips-it sentinel
+    /// (`dwMicroSecPerFrame == 0`). Per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A:
+    /// *"Number of microseconds between frames. Indicates the overall
+    /// timing for the file."*
+    ///
+    /// This is the file-global frame-period hint. Most legitimate AVIs
+    /// derive it from the first video stream's `(dwScale, dwRate)`
+    /// pair as `1_000_000 * scale / rate`; the per-stream pair stays
+    /// authoritative for individual stream timing and is surfaced
+    /// independently via [`Self::stream_timebase`] (round-249). The
+    /// two surfaces can disagree — a capture pipeline may stamp a
+    /// non-standard frame period here, or leave it `0` even when the
+    /// per-stream pair is populated — and the demuxer reports both
+    /// verbatim so a downstream tool can detect (or repair) any
+    /// mismatch.
+    ///
+    /// Internally the demuxer also folds this DWORD into the
+    /// `duration_micros = total_frames * micro_sec_per_frame`
+    /// computation surfaced via `Demuxer::duration`; this raw accessor
+    /// keeps the on-disk byte pattern observable for round-trip parity
+    /// independent of the derived duration.
+    ///
+    /// Round-trips byte-equal with
+    /// [`crate::muxer::AviMuxOptions::with_micro_sec_per_frame`]. Same
+    /// data also surfaces under the `avi:micro_sec_per_frame` metadata
+    /// key (omitted entirely when the value is 0 so absence of the key
+    /// is observable).
+    pub fn micro_sec_per_frame(&self) -> Option<u32> {
+        if self.avih_micro_sec_per_frame == 0 {
+            None
+        } else {
+            Some(self.avih_micro_sec_per_frame)
         }
     }
 

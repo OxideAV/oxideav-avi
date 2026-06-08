@@ -807,6 +807,40 @@ pub struct AviMuxOptions {
     /// `avi:initial_frames` metadata key) for a builder→writer→
     /// demuxer round-trip. Use [`Self::with_initial_frames`].
     pub initial_frames: Option<u32>,
+    /// Optional `avih.dwMicroSecPerFrame` override (round-256). `None`
+    /// (the default) keeps the legacy `build_avih`-computed value: the
+    /// muxer derives the file-global frame period from the first
+    /// video stream's `(dwScale, dwRate)` pair as
+    /// `1_000_000 * scale / rate`, or `0` when no video stream is
+    /// present (audio-only files). `Some(n)` stamps `n` verbatim into
+    /// the 32-bit DWORD at byte offset 0 of the 56-byte AVIMAINHEADER
+    /// body (i.e. byte 8 of the `avih` chunk).
+    ///
+    /// Per AVI 1.0 §"AVIMAINHEADER" (line 195,
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A):
+    /// *"Number of microseconds between frames. Indicates the overall
+    /// timing for the file."* Useful for capture pipelines that need
+    /// to stamp a frame-period independent of any per-stream
+    /// `(dwScale, dwRate)` pair (e.g. an audio-only file that still
+    /// wants to advertise a nominal playback frame period to a
+    /// downstream player, or a fixture exercising the demuxer's
+    /// `micro_sec_per_frame` accessor on a non-standard period).
+    ///
+    /// The override is `avih`-only — it does NOT touch the per-stream
+    /// `(strh.dwScale, strh.dwRate)` pair (round-249), nor the muxer's
+    /// internal duration / `dwMaxBytesPerSec` derivation, which both
+    /// continue to source the frame period from the same first-video-
+    /// stream packaging pair as before. Stamping a value here that
+    /// disagrees with `1_000_000 * stream0_scale / stream0_rate` is
+    /// internally inconsistent on purpose — the long-standing
+    /// convention that file-global byte-stamp overrides are byte-stamp-
+    /// only.
+    ///
+    /// Pairs with the round-256 demuxer accessor
+    /// [`crate::demuxer::AviDemuxer::micro_sec_per_frame`] (and the
+    /// `avi:micro_sec_per_frame` metadata key) for a builder→writer→
+    /// demuxer round-trip. Use [`Self::with_micro_sec_per_frame`].
+    pub micro_sec_per_frame_override: Option<u32>,
     /// Digitization-date text emitted as an `IDIT` chunk inside
     /// `LIST hdrl` (round-107).
     ///
@@ -2062,6 +2096,35 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: stamp the file-global `avih.dwMicroSecPerFrame`
+    /// frame period (round-256). See [`Self::micro_sec_per_frame_override`]
+    /// for semantics. The muxer writes `n` verbatim into the 32-bit
+    /// DWORD at byte offset 0 of the 56-byte AVIMAINHEADER body
+    /// (byte 8 of the `avih` chunk), replacing the default value the
+    /// muxer would otherwise derive from the first video stream's
+    /// `(dwScale, dwRate)` pair as `1_000_000 * scale / rate`.
+    ///
+    /// Per AVI 1.0 §"AVIMAINHEADER" (line 195,
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A):
+    /// *"Number of microseconds between frames. Indicates the overall
+    /// timing for the file."* Passing `0` is equivalent to omitting
+    /// the override — the demuxer maps the all-zero default back to
+    /// `None` so a stamp of `0` reads as "no frame period declared"
+    /// on re-demux.
+    ///
+    /// The override is `avih`-only — it does NOT touch the per-stream
+    /// `(strh.dwScale, strh.dwRate)` pair (which the muxer continues
+    /// to derive from the packaging-layer `frame_rate` for each stream
+    /// and which a caller can override independently via
+    /// [`Self::with_stream_timebase`]), nor the muxer's internal
+    /// duration / `dwMaxBytesPerSec` derivation. Pairs with
+    /// [`crate::demuxer::AviDemuxer::micro_sec_per_frame`] for a
+    /// round-trip of any non-zero frame period.
+    pub fn with_micro_sec_per_frame(mut self, n: u32) -> Self {
+        self.micro_sec_per_frame_override = Some(n);
+        self
+    }
+
     /// Builder helper: stamp a digitization-date `IDIT` chunk into
     /// `LIST hdrl` (round-107). See [`Self::digitization_date`] for
     /// placement and byte-layout semantics.
@@ -2504,6 +2567,7 @@ impl Muxer for AviMuxer {
             self.options.avih_flags_override,
             self.options.padding_granularity,
             self.options.initial_frames,
+            self.options.micro_sec_per_frame_override,
         );
         write_chunk(self.output.as_mut(), b"avih", &avih)?;
         // For OpenDML, embed the super-index in the FIRST stream's strl
@@ -4124,11 +4188,19 @@ pub const DEFAULT_AVIH_FLAGS: u32 = 0x0000_0810;
 /// (byte offset 16 of the body) from `AviMuxOptions::initial_frames`
 /// (None → 0, the legacy "noninterleaved file" sentinel per AVI 1.0
 /// §"AVIMAINHEADER" line 200; Some(n) → n verbatim).
+///
+/// Round-256: `micro_sec_per_frame_override` stamps
+/// `avih.dwMicroSecPerFrame` (byte offset 0 of the body) when set,
+/// replacing the default derivation from the first video stream's
+/// `(dwScale, dwRate)` pair. `None` keeps the legacy compute-from-
+/// video-stream behaviour (`1_000_000 * scale / rate`, or `0` for
+/// audio-only files).
 fn build_avih(
     tracks: &[TrackState],
     flags_override: Option<u32>,
     padding_granularity: Option<u32>,
     initial_frames: Option<u32>,
+    micro_sec_per_frame_override: Option<u32>,
 ) -> Vec<u8> {
     let (video_micro_per_frame, width, height) = tracks
         .iter()
@@ -4150,9 +4222,16 @@ fn build_avih(
     let flags: u32 = flags_override.unwrap_or(DEFAULT_AVIH_FLAGS);
     let total_frames: u32 = 0; // patched post-hoc
     let streams = tracks.len() as u32;
+    // Round-256: caller may override `dwMicroSecPerFrame` verbatim
+    // (e.g. an audio-only file that still wants to advertise a
+    // nominal frame period, or a fixture exercising a non-standard
+    // period that doesn't match `1_000_000 * stream0_scale /
+    // stream0_rate`). Otherwise fall back to the computed value from
+    // the first video stream's `(scale, rate)` pair.
+    let micro_per_frame: u32 = micro_sec_per_frame_override.unwrap_or(video_micro_per_frame);
 
     let mut body = Vec::with_capacity(56);
-    body.extend_from_slice(&video_micro_per_frame.to_le_bytes());
+    body.extend_from_slice(&micro_per_frame.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // MaxBytesPerSec
     body.extend_from_slice(&padding_granularity.unwrap_or(0).to_le_bytes()); // PaddingGranularity
     body.extend_from_slice(&flags.to_le_bytes());

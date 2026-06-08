@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **File-global `avih.dwMicroSecPerFrame` demux accessor + mux
+  override (round 256).** Adds the typed
+  `AviDemuxer::micro_sec_per_frame() -> Option<u32>` raw accessor
+  returning the verbatim 32-bit value at byte offset 0 of the 56-byte
+  AVIMAINHEADER body, the `avi:micro_sec_per_frame = "<N>"` decimal
+  metadata key (omitted when the field carried the all-zero
+  writer-skips-it sentinel), and the
+  `AviMuxOptions::with_micro_sec_per_frame(n)` builder writing the
+  supplied 32 bits verbatim at byte offset 0 of the AVIMAINHEADER body.
+  Clean-room source: `docs/container/riff/avi-riff-file-reference.md`
+  §"AVIMAINHEADER" Appendix A `dwMicroSecPerFrame` row (line 195):
+  *"Number of microseconds between frames. Indicates the overall
+  timing for the file."*
+
+  Pre-round-256 the demuxer already parsed this DWORD internally to
+  derive `duration_micros = total_frames * micro_sec_per_frame` (the
+  source of truth for `Demuxer::duration`), but did not surface the
+  raw 32-bit value verbatim — only the derived duration reached
+  callers. This round adds the raw surface so a downstream tool can
+  inspect the file-global frame-period independently of the derived
+  duration and independently of the per-stream `(dwScale, dwRate)`
+  pair surfaced via `stream_timebase` (round-249).
+
+  The two surfaces — file-global `avih.dwMicroSecPerFrame` and
+  per-stream `(strh.dwScale, strh.dwRate)` — can disagree. A capture
+  pipeline may stamp a non-standard frame-period in the avih, or
+  leave the avih field `0` even when the per-stream pair is
+  populated. The demuxer reports both verbatim so a downstream tool
+  can detect or repair any mismatch.
+
+  Without an override the muxer keeps its long-standing computed
+  default: derive the file-global frame period from the first video
+  stream's `(dwScale, dwRate)` pair as `1_000_000 * scale / rate`, or
+  `0` when no video stream is present (audio-only files). The
+  override is `avih`-only — it does NOT touch the per-stream
+  `(strh.dwScale, strh.dwRate)` pair (which a caller can override
+  independently via `with_stream_timebase`, round-249), nor the
+  muxer's internal duration / `dwMaxBytesPerSec` derivation, which
+  both continue to source the frame period from the same
+  first-video-stream packaging pair as before. Stamping a value that
+  disagrees with `1_000_000 * stream0_scale / stream0_rate` is
+  internally inconsistent on purpose — the long-standing convention
+  that file-global byte-stamp overrides are byte-stamp-only.
+
+  Mapping the all-zero sentinel to `None` on the accessor keeps the
+  absent / writer-skipped case observable in `Option::is_none()` and
+  omits the metadata key, mirroring the round-253 `fccType` /
+  round-249 `(dwScale, dwRate)` / round-247 `dwFlags` / round-229
+  `dwLength` / round-222 `dwSampleSize` / round-217
+  `dwSuggestedBufferSize` / round-210 `fccHandler` / round-203
+  `dwStart` / round-182 `wPriority` / round-176 `dwQuality` /
+  round-157 file-global `dwInitialFrames` / round-153 per-stream
+  `dwInitialFrames` / round-119 `wLanguage` / round-115 `rcFrame`
+  "default == absent" convention this crate has carried since
+  round-115.
+
+  10 new tests in `tests/round256_avih_micro_sec_per_frame.rs`
+  exercise: builder→writer→demuxer round-trip of a non-default frame
+  period; the muxer's computed-default baseline (25fps video →
+  40000us); audio-only baseline (no video stream → 0 → None); the
+  override on an audio-only file stamping a nominal period anyway;
+  builder idempotency; explicit-zero round-trip as `None`;
+  `0xFFFF_FFFF` all-bits round-trip; independence from the per-stream
+  `(scale, rate)` pair; and a pair of hand-rolled fixtures asserting
+  the exact LE-byte-stamping at body offset 0 of the AVIMAINHEADER.
+
 - **Per-stream `strh.fccType` demux accessor + mux override
   (round 253).** Adds the typed
   `AviDemuxer::stream_fcc_type(stream_index) -> Option<[u8; 4]>`
