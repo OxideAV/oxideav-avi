@@ -1727,6 +1727,7 @@ fn open_avi_inner(
         avih_padding_granularity: avih.as_ref().map(|h| h.padding_granularity).unwrap_or(0),
         avih_initial_frames: avih.as_ref().map(|h| h.initial_frames).unwrap_or(0),
         avih_micro_sec_per_frame: avih.as_ref().map(|h| h.micro_sec_per_frame).unwrap_or(0),
+        avih_max_bytes_per_sec: avih.as_ref().map(|h| h.max_bytes_per_sec).unwrap_or(0),
         vprps,
         dmlh_total_frames,
         palette_change_data,
@@ -4317,6 +4318,27 @@ pub struct AviDemuxer {
     /// `None` by the accessor, mirroring the round-249 / round-247 /
     /// round-229 etc. "default == absent" convention.
     avih_micro_sec_per_frame: u32,
+    /// Raw `dwMaxBytesPerSec` from `AVIMAINHEADER` (round-260). The
+    /// file-global maximum-data-rate DWORD at byte offset 4 of the
+    /// 56-byte AVIMAINHEADER body. Per AVI 1.0 §"AVIMAINHEADER"
+    /// (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
+    /// `dwMaxBytesPerSec` row, line 196): *"Approximate maximum data
+    /// rate of the file. Number of bytes per second the system must
+    /// handle to present an AVI sequence as specified by the other
+    /// parameters in the main header and stream header chunks."*
+    ///
+    /// Pre-round-260 this DWORD was already parsed and surfaced via
+    /// the `avi:max_bytes_per_sec` metadata key (round-14) plus the
+    /// internal "stamped-rate is generous" advisory check that
+    /// compares the value against the post-mux observed peak; round-260
+    /// surfaces the raw u32 verbatim through a typed
+    /// [`AviDemuxer::max_bytes_per_sec`] accessor so a downstream
+    /// remuxer / capture-info dumper can inspect the writer's stamped
+    /// data-rate hint without scanning the metadata Vec. `0` is the
+    /// writer-skips-it sentinel mapped to `None` by the accessor,
+    /// mirroring the round-256 / round-249 / round-247 / round-229 etc.
+    /// "default == absent" convention.
+    avih_max_bytes_per_sec: u32,
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -6210,6 +6232,49 @@ impl AviDemuxer {
             None
         } else {
             Some(self.avih_micro_sec_per_frame)
+        }
+    }
+
+    /// `AVIMAINHEADER.dwMaxBytesPerSec` per AVI 1.0 §"AVIMAINHEADER"
+    /// (round-260).
+    ///
+    /// Returns the file-global maximum-data-rate DWORD from byte
+    /// offset 4 of the 56-byte AVIMAINHEADER body, or `None` when the
+    /// file declared the writer-skips-it sentinel
+    /// (`dwMaxBytesPerSec == 0`). Per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A:
+    /// *"Approximate maximum data rate of the file. Number of bytes
+    /// per second the system must handle to present an AVI sequence as
+    /// specified by the other parameters in the main header and stream
+    /// header chunks."*
+    ///
+    /// This is the file-global data-rate hint a capture-card player
+    /// uses to size its disk-read pacing. Most legitimate AVIs derive
+    /// it from `sum(per_track_total_bytes) / file_duration_seconds`;
+    /// the muxer's [`crate::muxer::AviMuxOptions::with_max_bytes_per_sec`]
+    /// builder lets the caller override the computed value verbatim
+    /// (round-14 candidate 1). Pre-round-260 the raw DWORD was already
+    /// surfaced via the `avi:max_bytes_per_sec` metadata key, but no
+    /// typed accessor was offered — round-260 closes that gap.
+    ///
+    /// The accessor is independent of any per-stream rate the demuxer
+    /// also tracks (per-stream `dwScale` / `dwRate` via
+    /// [`Self::stream_timebase`] from round-249); the file-global
+    /// value can disagree with the sum of per-stream rates (e.g. a
+    /// capture pipeline that stamped a conservative ceiling) and the
+    /// demuxer surfaces both verbatim so a downstream tool can detect
+    /// or repair any mismatch.
+    ///
+    /// Round-trips byte-equal with
+    /// [`crate::muxer::AviMuxOptions::with_max_bytes_per_sec`]. Same
+    /// data also surfaces under the `avi:max_bytes_per_sec` metadata
+    /// key (omitted entirely when the value is 0 so absence of the key
+    /// is observable).
+    pub fn max_bytes_per_sec(&self) -> Option<u32> {
+        if self.avih_max_bytes_per_sec == 0 {
+            None
+        } else {
+            Some(self.avih_max_bytes_per_sec)
         }
     }
 

@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **File-global `avih.dwMaxBytesPerSec` typed demux accessor
+  (round 260).** Adds the typed
+  `AviDemuxer::max_bytes_per_sec() -> Option<u32>` raw accessor
+  returning the verbatim 32-bit value at byte offset 4 of the 56-byte
+  AVIMAINHEADER body (the file-global "approximate maximum data rate"
+  hint). The all-zero writer-skips-it sentinel maps to `None`,
+  mirroring the round-256 / round-249 / round-247 / round-229 etc.
+  "default == absent" idiom. Clean-room source:
+  `docs/container/riff/avi-riff-file-reference.md` §"AVIMAINHEADER"
+  Appendix A `dwMaxBytesPerSec` row (line 196): *"Approximate maximum
+  data rate of the file. Number of bytes per second the system must
+  handle to present an AVI sequence as specified by the other
+  parameters in the main header and stream header chunks."*
+
+  Pre-round-260 the demuxer already parsed this DWORD and surfaced
+  it as the `avi:max_bytes_per_sec` decimal metadata key (round-14),
+  and the muxer's `AviMuxOptions::with_max_bytes_per_sec` builder
+  was already wired (round-14). Round-260 closes the typed-accessor
+  gap so a downstream remuxer or capture-info dumper can reach
+  `Option<u32>` without scanning the metadata Vec — matching the
+  shape of `micro_sec_per_frame` (round-256) / `padding_granularity`
+  (round-92) / `initial_frames` (round-157). The accessor and the
+  metadata key agree on the on-disk byte pattern; the `0` sentinel
+  is observable both as the accessor's `None` and as the absence of
+  the metadata key. Round-trips byte-equal with
+  `AviMuxOptions::with_max_bytes_per_sec(n)`.
+
+  Tests in `tests/round260_avih_max_bytes_per_sec.rs` (8 cases)
+  cover: mux→demux override round-trip via accessor + metadata,
+  no-override baseline (accessor agrees with the metadata key on the
+  muxer-computed value), builder idempotency (last call wins), the
+  `0` zero override (accessor reads `None`; metadata key absent),
+  `0xFFFF_FFFF` all-bits round-trip, independence from neighbouring
+  AVIMAINHEADER fields (round-256 `dwMicroSecPerFrame`, round-92
+  `dwPaddingGranularity`) and per-stream `(dwScale, dwRate)`
+  (round-249), plus two hand-rolled fixtures stamping an explicit
+  non-zero / zero `dwMaxBytesPerSec` at body offset 4 of a 56-byte
+  AVIMAINHEADER and checking the demuxer surface.
+
 - **File-global `avih.dwMicroSecPerFrame` demux accessor + mux
   override (round 256).** Adds the typed
   `AviDemuxer::micro_sec_per_frame() -> Option<u32>` raw accessor
