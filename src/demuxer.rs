@@ -1744,6 +1744,8 @@ fn open_avi_inner(
         avih_micro_sec_per_frame: avih.as_ref().map(|h| h.micro_sec_per_frame).unwrap_or(0),
         avih_max_bytes_per_sec: avih.as_ref().map(|h| h.max_bytes_per_sec).unwrap_or(0),
         avih_total_frames: avih.as_ref().map(|h| h.total_frames).unwrap_or(0),
+        avih_width: avih.as_ref().map(|h| h.width).unwrap_or(0),
+        avih_height: avih.as_ref().map(|h| h.height).unwrap_or(0),
         vprps,
         dmlh_total_frames,
         palette_change_data,
@@ -4377,6 +4379,28 @@ pub struct AviDemuxer {
     /// the round-260 / round-256 / round-249 etc. "default == absent"
     /// convention.
     avih_total_frames: u32,
+    /// Raw `dwWidth` from `AVIMAINHEADER` (round-275). The file-global
+    /// movie-rectangle width DWORD at byte offset 32 of the 56-byte
+    /// AVIMAINHEADER body. Per AVI 1.0 §"AVIMAINHEADER"
+    /// (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
+    /// `dwWidth` row, line 203): *"Width of the AVI file in pixels."*
+    /// Captured so [`AviDemuxer::avih_movie_rect`] can hand back the
+    /// `(width, height)` pair the per-stream `strh.rcFrame` destination
+    /// rectangle (round-119) is expressed relative to. `0` is the
+    /// writer-skips-it / unspecified sentinel mapped to `None`,
+    /// mirroring the round-268 / round-260 / round-256 "default ==
+    /// absent" convention. Already surfaced as `avi:width` metadata.
+    avih_width: u32,
+    /// Raw `dwHeight` from `AVIMAINHEADER` (round-275). The file-global
+    /// movie-rectangle height DWORD at byte offset 36 of the 56-byte
+    /// AVIMAINHEADER body. Per AVI 1.0 §"AVIMAINHEADER"
+    /// (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
+    /// `dwHeight` row, line 204): *"Height of the AVI file in pixels."*
+    /// Captured so [`AviDemuxer::avih_movie_rect`] can hand back the
+    /// `(width, height)` pair. `0` is the writer-skips-it / unspecified
+    /// sentinel mapped to `None`. Already surfaced as `avi:height`
+    /// metadata.
+    avih_height: u32,
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -6356,6 +6380,57 @@ impl AviDemuxer {
             None
         } else {
             Some(self.avih_total_frames)
+        }
+    }
+
+    /// `AVIMAINHEADER.dwWidth` / `dwHeight` movie rectangle per AVI 1.0
+    /// §"AVIMAINHEADER" (round-275).
+    ///
+    /// Returns the file-global movie-rectangle dimensions as a
+    /// `(width, height)` pair from byte offsets 32 + 36 of the 56-byte
+    /// AVIMAINHEADER body, or `None` when either DWORD is the
+    /// writer-skips-it / unspecified `0` sentinel. Per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A:
+    /// *"`dwWidth` — Width of the AVI file in pixels."* and *"`dwHeight`
+    /// — Height of the AVI file in pixels."*
+    ///
+    /// This is the file-global rectangle the per-stream
+    /// `strh.rcFrame` destination rectangle surfaced via
+    /// [`Self::stream_frame_rect`] (round-119) is expressed relative
+    /// to: per the spec's `rcFrame` row, the destination rectangle's
+    /// upper-left corner is *"relative to the upper-left corner of the
+    /// movie rectangle specified by the `dwWidth` and `dwHeight`
+    /// members of the AVI main header structure."* A reader laying out
+    /// multiple video / text streams onto a composite surface needs
+    /// this pair to position each stream's `rcFrame` correctly.
+    ///
+    /// The dimensions are logically distinct from any single video
+    /// stream's coded `BITMAPINFOHEADER.biWidth` / `biHeight`
+    /// (surfaced through `Demuxer::streams` per-stream
+    /// `CodecParameters`): the movie rectangle is the overall
+    /// composition canvas, which for a single-video file equals that
+    /// stream's frame size but for a multi-video file is the union
+    /// rectangle. The demuxer surfaces the raw `avih` DWORDs verbatim
+    /// with no cross-validation against any stream's coded size.
+    ///
+    /// Either dimension being `0` collapses the whole pair to `None`
+    /// (a movie rectangle is only meaningful when both dimensions are
+    /// non-zero), matching the round-249 `stream_timebase` "zero in
+    /// either DWORD ⇒ `None`" shape. The same data also surfaces under
+    /// the `avi:width` / `avi:height` metadata keys, which are emitted
+    /// verbatim including `0` — this typed accessor adds the
+    /// "default == absent" mapping the metadata keys don't, mirroring
+    /// the round-268 / round-260 / round-256 convention.
+    ///
+    /// The muxer's counterpart is auto-derived from the first video
+    /// stream's coded dimensions at `write_header`; no override builder
+    /// exists, so the file-global rectangle tracks the leading video
+    /// stream's frame size.
+    pub fn avih_movie_rect(&self) -> Option<(u32, u32)> {
+        if self.avih_width == 0 || self.avih_height == 0 {
+            None
+        } else {
+            Some((self.avih_width, self.avih_height))
         }
     }
 
