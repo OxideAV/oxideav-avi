@@ -662,6 +662,21 @@ fn open_avi_inner(
                 h.micro_sec_per_frame.to_string(),
             ));
         }
+        // Round-268: surface the file-global `avih.dwTotalFrames` so a
+        // downstream tool can inspect the writer's stamped frame count
+        // without re-parsing the AVIMAINHEADER. Per AVI 1.0
+        // §"AVIMAINHEADER" (line 199): *"Total number of frames of
+        // data in the file."* For a multi-segment OpenDML file this
+        // only carries the primary segment's count (per OpenDML 2.0
+        // §5.0); `avi:total_frames_all_segments` (from `dmlh`) carries
+        // the cross-segment truth. The `0` writer-skips-it /
+        // empty-file sentinel is omitted from the metadata Vec so the
+        // key is observable only when the writer actually stamped a
+        // count, mirroring the `avi:micro_sec_per_frame` /
+        // `avi:max_bytes_per_sec` / `avi:initial_frames` conventions.
+        if h.total_frames > 0 {
+            metadata.push(("avi:total_frames".into(), h.total_frames.to_string()));
+        }
     }
     // Truncated-head signal: capture-card crash dumps, copy-aborted
     // recordings. The demuxer is best-effort for this case (see
@@ -676,8 +691,8 @@ fn open_avi_inner(
     // (per spec/06 §5.0 "Required Information"); a multi-segment file
     // built with the OpenDML envelope writes the cross-segment count
     // here. Surface as a separate key so the avih-derived
-    // `avi:total_frames` (from `avih.total_frames`) stays
-    // single-segment for legacy callers, while
+    // `avi:total_frames` (from `avih.total_frames`, emitted above as
+    // of round-268) stays single-segment for legacy callers, while
     // `avi:total_frames_all_segments` carries the OpenDML truth.
     if let Some(total) = dmlh_total_frames {
         metadata.push(("avi:total_frames_all_segments".into(), total.to_string()));
@@ -1728,6 +1743,7 @@ fn open_avi_inner(
         avih_initial_frames: avih.as_ref().map(|h| h.initial_frames).unwrap_or(0),
         avih_micro_sec_per_frame: avih.as_ref().map(|h| h.micro_sec_per_frame).unwrap_or(0),
         avih_max_bytes_per_sec: avih.as_ref().map(|h| h.max_bytes_per_sec).unwrap_or(0),
+        avih_total_frames: avih.as_ref().map(|h| h.total_frames).unwrap_or(0),
         vprps,
         dmlh_total_frames,
         palette_change_data,
@@ -4339,6 +4355,28 @@ pub struct AviDemuxer {
     /// mirroring the round-256 / round-249 / round-247 / round-229 etc.
     /// "default == absent" convention.
     avih_max_bytes_per_sec: u32,
+    /// Raw `dwTotalFrames` from `AVIMAINHEADER` (round-268). The
+    /// file-global frame-count DWORD at byte offset 16 of the 56-byte
+    /// AVIMAINHEADER body. Per AVI 1.0 §"AVIMAINHEADER"
+    /// (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
+    /// `dwTotalFrames` row, line 199): *"Total number of frames of
+    /// data in the file."*
+    ///
+    /// Pre-round-268 this DWORD was already parsed and consumed
+    /// internally to derive `duration_micros = total_frames *
+    /// micro_sec_per_frame` (the source of `Demuxer::duration`), but
+    /// the raw value was never surfaced — neither a typed accessor
+    /// nor a metadata key existed, only the derived duration reached
+    /// callers. Captured here so [`AviDemuxer::avih_total_frames`] can
+    /// hand out the raw u32 verbatim. For a multi-segment OpenDML
+    /// file this field only carries the primary `RIFF AVI ` segment's
+    /// frame count (per OpenDML 2.0 §5.0); the cross-segment truth is
+    /// the separate `dmlh.dwTotalFrames` surfaced via
+    /// [`AviDemuxer::dmlh_total_frames`]. `0` is the writer-skips-it /
+    /// empty-file sentinel mapped to `None` by the accessor, mirroring
+    /// the round-260 / round-256 / round-249 etc. "default == absent"
+    /// convention.
+    avih_total_frames: u32,
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -6275,6 +6313,49 @@ impl AviDemuxer {
             None
         } else {
             Some(self.avih_max_bytes_per_sec)
+        }
+    }
+
+    /// `AVIMAINHEADER.dwTotalFrames` per AVI 1.0 §"AVIMAINHEADER"
+    /// (round-268).
+    ///
+    /// Returns the file-global frame-count DWORD from byte offset 16
+    /// of the 56-byte AVIMAINHEADER body, or `None` when the file
+    /// declared the writer-skips-it / empty-file sentinel
+    /// (`dwTotalFrames == 0`). Per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A:
+    /// *"Total number of frames of data in the file."*
+    ///
+    /// Internally the demuxer already consumes this DWORD to derive
+    /// `duration_micros = total_frames * micro_sec_per_frame` (the
+    /// source of `Demuxer::duration`); this raw accessor keeps the
+    /// on-disk byte pattern observable independent of the derived
+    /// duration, matching the shape of [`Self::micro_sec_per_frame`]
+    /// (round-256) / [`Self::max_bytes_per_sec`] (round-260).
+    ///
+    /// For a multi-segment OpenDML file this field only carries the
+    /// **primary** `RIFF AVI ` segment's frame count (per OpenDML 2.0
+    /// §5.0 — `AVIX` continuation packets are invisible to an AVI 1.0
+    /// reader, so writers stamp only what such a reader can see); the
+    /// cross-segment truth is the separate `dmlh.dwTotalFrames`
+    /// surfaced via [`Self::dmlh_total_frames`]. The two values are
+    /// spec-independent and the demuxer reports both verbatim so a
+    /// downstream tool can detect (or repair) any mismatch — the
+    /// existing [`Self::super_index_duration_violations`] cross-check
+    /// validates the dmlh side against the super-index, not this one.
+    ///
+    /// The muxer's counterpart is auto-derived: `write_trailer`
+    /// patches the first video stream's emitted packet count into
+    /// this DWORD (first-track packet count for video-less files; no
+    /// override builder exists — the file-global stamp tracks actual
+    /// emitted packets). Same data also surfaces under
+    /// the `avi:total_frames` metadata key (omitted entirely when the
+    /// value is 0 so absence of the key is observable).
+    pub fn avih_total_frames(&self) -> Option<u32> {
+        if self.avih_total_frames == 0 {
+            None
+        } else {
+            Some(self.avih_total_frames)
         }
     }
 

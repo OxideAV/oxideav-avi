@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **File-global `avih.dwTotalFrames` typed demux accessor +
+  `avi:total_frames` metadata key (round 268).** Adds the typed
+  `AviDemuxer::avih_total_frames() -> Option<u32>` raw accessor
+  returning the verbatim 32-bit value at byte offset 16 of the
+  56-byte AVIMAINHEADER body, plus the `avi:total_frames = "<N>"`
+  decimal metadata key (omitted when the field carried the all-zero
+  writer-skips-it / empty-file sentinel so absence stays observable).
+  The `0` sentinel maps to `None` on the accessor, mirroring the
+  round-260 / round-256 / round-249 etc. "default == absent" idiom.
+  Clean-room source: `docs/container/riff/avi-riff-file-reference.md`
+  §"AVIMAINHEADER" Appendix A `dwTotalFrames` row (line 199): *"Total
+  number of frames of data in the file."*
+
+  Pre-round-268 the demuxer already parsed this DWORD and consumed it
+  internally to derive `duration_micros = total_frames *
+  micro_sec_per_frame` (the source of `Demuxer::duration`), but never
+  surfaced the raw value — neither a typed accessor nor a metadata
+  key existed (a code comment even referenced the `avi:total_frames`
+  key without it ever being emitted; that comment is now accurate).
+  Round-268 closes both gaps so the on-disk byte pattern stays
+  observable independent of the derived duration, completing the
+  AVIMAINHEADER typed-accessor series alongside
+  `micro_sec_per_frame` (offset 0, round-256), `max_bytes_per_sec`
+  (offset 4, round-260), `padding_granularity` (offset 8, round-92),
+  `avih_flags` (offset 12), `initial_frames` (offset 20, round-157)
+  and `avih_suggested_buffer_size` (offset 28).
+
+  The accessor is named `avih_total_frames` (not bare `total_frames`)
+  to keep it unambiguous next to the OpenDML `dmlh_total_frames()`
+  accessor: per OpenDML 2.0 §5.0 the avih DWORD only carries the
+  primary `RIFF AVI ` segment's frame count while `dmlh` carries the
+  cross-segment truth — the two are spec-independent and both
+  round-trip verbatim. Muxer-side no change was needed: the
+  long-standing `write_trailer` patch already stamps the first video
+  stream's emitted packet count at body offset 16 (file offset 48),
+  and that auto-derived stamp round-trips verbatim through the new
+  surface.
+
+  Tests in `tests/round268_avih_total_frames.rs` (6 cases) cover:
+  mux→demux round-trip of the muxer's auto-derived stamp via accessor
+  + metadata key, accessor / metadata agreement, hand-rolled fixtures
+  stamping an explicit non-zero (`0xDEAD_BEEF`) / zero
+  `dwTotalFrames` at body offset 16 of a 56-byte AVIMAINHEADER,
+  independence from `dmlh.dwTotalFrames` (a fixture stamping avih=5 /
+  dmlh=99 surfaces both verbatim), and independence from the
+  neighbouring AVIMAINHEADER DWORDs (offsets 0 / 4 / 20).
+
 - **File-global `avih.dwMaxBytesPerSec` typed demux accessor
   (round 260).** Adds the typed
   `AviDemuxer::max_bytes_per_sec() -> Option<u32>` raw accessor
