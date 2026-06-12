@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **idx1 `rec ` LIST entries — `AVIIF_LIST` round-trip (round 285).**
+  Per AVI 1.0 §"AVI Index Entries" the idx1 chunk *"consists of an
+  AVIOLDINDEX structure with entries for each data chunk, including
+  'rec ' chunks"*, and per Appendix C the `AVIIF_LIST` flag marks an
+  entry whose chunk *"is a 'rec ' list."* Pre-round-285 the muxer's
+  `LIST rec ` clustering (round-3 packet-cap / round-4 byte-budget)
+  indexed only the grouped packet chunks, and the demuxer silently
+  dropped any `rec ` entry it met.
+
+  Muxer: every `LIST rec ` cluster now gets its own idx1 entry —
+  ckid `rec `, `AVIIF_LIST` flag, `dwOffset` at the cluster's `LIST`
+  header in the same movi-relative base as the packet entries, and
+  `dwSize` patched to the LIST size-field value (the `rec ` form-type
+  FourCC plus the grouped chunk bytes) when the cluster closes. The
+  entry is pushed at cluster open so idx1 stays in file order ahead
+  of the grouped packets' entries. Primary segment only (idx1 never
+  spans `RIFF AVIX` continuations); the `synthesise_idx1_from_ix`
+  rebuild path indexes per-packet `ix##` records only and is
+  documented as carrying no `rec ` entries.
+
+  Demuxer: new typed `AviDemuxer::idx1_rec_list_entries() ->
+  &[Idx1RecEntry]` accessor (public `Idx1RecEntry { flags, offset,
+  size }` struct — raw `dwFlags` verbatim, `offset` resolved
+  file-absolute via the same movi-relative / file-absolute base
+  detection as the seek table, `dwSize` verbatim), plus
+  `idx1_rec_list_count()` and an `avi:idx1.rec_lists = "<N>"`
+  metadata key omitted when zero so absence stays observable. `rec `
+  entries carry no stream index and stay out of every per-stream
+  surface (seek table, `idx1_flags_for_packet`, side-band scans).
+
+  Clean-room source: `docs/container/riff/avi-riff-file-reference.md`
+  §"AVI Index Entries" + Appendix C (AVIOLDINDEX / `AVIIF_LIST`).
+  Round-trip + probe-robustness coverage in
+  `tests/round285_idx1_rec_lists.rs` (5 tests).
+
 - **File-global `avih.dwTotalFrames` typed demux accessor +
   `avi:total_frames` metadata key (round 268).** Adds the typed
   `AviDemuxer::avih_total_frames() -> Option<u32>` raw accessor
@@ -705,6 +740,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "default == absent" convention). Three regression tests cover the
   2-field round-trip, the default-subtype default-suppression, and
   the AVI 1.0 "no super-index" case.
+
+### Fixed
+
+- **idx1 offset-base probe no longer anchors on non-per-stream
+  entries (round 285).** The movi-relative vs file-absolute detection
+  probed the FIRST non-zero-offset idx1 entry; for a `rec ` LIST
+  entry the bytes at the recorded offset are the `LIST` FourCC, not
+  the recorded ckid, so a file whose idx1 leads with a `rec ` entry
+  (the natural order for cluster-writing muxers) could never match
+  either base and silently fell back to the movi-relative default —
+  mis-resolving every offset in a file-absolute idx1. Both the
+  seek-table builder and the side-band (`xxpc`/`xxtx`) chunk reader
+  now skip entries whose ckid doesn't name a per-stream data chunk
+  when picking the probe.
 
 ## [0.0.8](https://github.com/OxideAV/oxideav-avi/compare/v0.0.7...v0.0.8) - 2026-05-29
 

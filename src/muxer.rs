@@ -2384,6 +2384,7 @@ pub fn open_avi(
         segments: Vec::new(),
         current_segment_packets: 0,
         current_segment_indexed_packets: 0,
+        rec_open_idx1_slot: None,
         rec_open_size_off: None,
         rec_packets_in_cluster: 0,
         rec_bytes_in_cluster: 0,
@@ -2490,6 +2491,17 @@ pub struct AviMuxer {
     /// one-tick-per-frame video stream is that stream's per-segment
     /// frame count — *not* the all-stream packet total. Round-101.
     current_segment_indexed_packets: u32,
+    /// Index into [`Self::index`] of the idx1 entry recorded for the
+    /// currently open `LIST rec ` cluster (round-285). Per AVI 1.0
+    /// §"AVI Index Entries" idx1 carries "entries for each data chunk,
+    /// including 'rec ' chunks"; the entry is pushed (with a zero size
+    /// placeholder) when the cluster opens so it precedes the grouped
+    /// chunks' entries in file order, and its size is patched in
+    /// [`Self::close_rec_cluster`] once the cluster body is known.
+    /// `None` outside an open cluster, in AVIX continuation segments
+    /// (idx1 only covers the primary RIFF), or when the cluster's
+    /// movi-relative offset doesn't fit the 32-bit `dwOffset`.
+    rec_open_idx1_slot: Option<usize>,
     /// File offset of the `LIST rec ` size field for the currently
     /// open cluster (when [`AviMuxOptions::rec_cluster_packets`] is
     /// `Some`). `None` between clusters.
@@ -3544,6 +3556,12 @@ impl AviMuxer {
     /// All fields (chunk fourcc, flags, idx1-relative offset, size)
     /// are pre-baked into the [`PrimaryIxSnapshot`] at packet-write
     /// time so the offset/flags math here stays trivial.
+    ///
+    /// Scope note: `ix##` standard indexes record per-packet chunks
+    /// only, so an idx1 rebuilt from them carries no `rec ` LIST
+    /// entries (round-285) — the running [`IndexEntry`] path is the
+    /// one that indexes `LIST rec ` clusters per AVI 1.0 §"AVI Index
+    /// Entries".
     fn serialize_idx1_from_ix(&self) -> Vec<u8> {
         let mut idx_body = Vec::with_capacity(self.primary_ix_snapshot.len() * 16);
         for s in &self.primary_ix_snapshot {
@@ -3670,6 +3688,7 @@ impl AviMuxer {
         self.movi_start_off = self.movi_size_off + 4;
         self.current_segment_packets = 0;
         self.current_segment_indexed_packets = 0;
+        self.rec_open_idx1_slot = None;
         self.rec_open_size_off = None;
         self.rec_packets_in_cluster = 0;
         self.rec_bytes_in_cluster = 0;
@@ -3681,18 +3700,56 @@ impl AviMuxer {
     /// size placeholder; the size is patched in [`close_rec_cluster`]
     /// when the cluster fills its packet quota or `movi` closes.
     fn open_rec_cluster(&mut self) -> Result<()> {
+        let list_hdr_off = self.output.stream_position()?;
         let off = begin_list(self.output.as_mut(), &LIST, b"rec ")?;
         self.rec_open_size_off = Some(off);
         self.rec_packets_in_cluster = 0;
         self.rec_bytes_in_cluster = 0;
+        // Round-285: record the cluster's own idx1 entry. Per AVI 1.0
+        // §"AVI Index Entries" the idx1 chunk "consists of an
+        // AVIOLDINDEX structure with entries for each data chunk,
+        // including 'rec ' chunks", and per Appendix C the entry is
+        // flagged `AVIIF_LIST` ("The chunk is a 'rec ' list."). The
+        // ckid is the `rec ` form-type, the offset is the `LIST`
+        // header's position relative to the `movi` FourCC (same base
+        // as every packet entry), and the size — the LIST's size-field
+        // value — isn't known yet, so a zero placeholder is patched in
+        // `close_rec_cluster`. Pushing now (before the grouped packets
+        // append their own entries) keeps idx1 in file order. Primary
+        // segment only: idx1 never spans `RIFF AVIX` continuations.
+        self.rec_open_idx1_slot = None;
+        if self.segments.is_empty() {
+            if let Some(rel) = list_hdr_off.checked_sub(self.movi_start_off) {
+                if rel <= u32::MAX as u64 {
+                    self.rec_open_idx1_slot = Some(self.index.len());
+                    self.index.push(IndexEntry {
+                        ckid: *b"rec ",
+                        flags: crate::demuxer::AVIIF_LIST,
+                        offset: rel as u32,
+                        size: 0,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
     /// Close the open `LIST rec ` cluster (no-op if none is open). Patches
-    /// the cluster's size field so a later scan walks past it cleanly.
+    /// the cluster's size field so a later scan walks past it cleanly,
+    /// and back-fills the cluster's idx1 entry (round-285) with the
+    /// same size-field value: everything after the 4-byte LIST size
+    /// field, i.e. the `rec ` form-type FourCC plus the grouped chunks.
     fn close_rec_cluster(&mut self) -> Result<()> {
         if let Some(off) = self.rec_open_size_off.take() {
+            // Mirror `finish_chunk`'s size math BEFORE it runs (it may
+            // append a pad byte, which the size field excludes).
+            let body_size = self.output.stream_position()?.saturating_sub(off + 4);
             finish_chunk(self.output.as_mut(), off)?;
+            if let Some(slot) = self.rec_open_idx1_slot.take() {
+                if body_size <= u32::MAX as u64 {
+                    self.index[slot].size = body_size as u32;
+                }
+            }
             self.rec_packets_in_cluster = 0;
             self.rec_bytes_in_cluster = 0;
         }

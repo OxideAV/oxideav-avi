@@ -1302,6 +1302,11 @@ fn open_avi_inner(
     let mut palette_change_data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); streams.len()];
     let mut text_chunk_data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); streams.len()];
     let mut sideband_data_loaded = false;
+    // Round-285: `rec ` LIST entries recorded in idx1 (AVI 1.0 §"AVI
+    // Index Entries": idx1 carries "entries for each data chunk,
+    // including 'rec ' chunks"). Collected by `build_idx_table` while
+    // it walks the raw entries; empty when no idx1 or no rec entries.
+    let mut idx1_rec_entries: Vec<Idx1RecEntry> = Vec::new();
     let idx_table = if let Some(raw) = idx1_raw {
         scan_idx1_for_suffix(&raw, &streams, *b"pc", &mut palette_change_counts);
         scan_idx1_for_suffix(&raw, &streams, *b"tx", &mut text_chunk_counts);
@@ -1322,7 +1327,9 @@ fn open_avi_inner(
             &mut text_chunk_data,
         );
         sideband_data_loaded = true;
-        build_idx_table(&mut *input, &raw, movi_start, &streams)?
+        let (table, recs) = build_idx_table(&mut *input, &raw, movi_start, &streams)?;
+        idx1_rec_entries = recs;
+        table
     } else {
         Vec::new()
     };
@@ -1339,6 +1346,16 @@ fn open_avi_inner(
         if count > 0 {
             metadata.push((format!("avi:text_chunk.{s}"), count.to_string()));
         }
+    }
+    // Round-285: surface the `rec ` LIST entry count from idx1 so
+    // callers walking `Demuxer::metadata()` can detect CD-ROM-style
+    // `LIST rec ` interleave grouping without the typed accessor.
+    // Omitted entirely when zero so absence stays observable.
+    if !idx1_rec_entries.is_empty() {
+        metadata.push((
+            "avi:idx1.rec_lists".into(),
+            idx1_rec_entries.len().to_string(),
+        ));
     }
 
     // OpenDML 2.0 standard-index scan: walk every `movi` segment looking
@@ -1731,6 +1748,7 @@ fn open_avi_inner(
         metadata,
         duration_micros,
         idx_table,
+        idx1_rec_entries,
         super_indexes,
         std_indexes,
         audio_cbr_block_aligns,
@@ -3985,18 +4003,24 @@ fn read_sideband_data_from_idx1<R: ReadSeek + ?Sized>(
     if raw.len() < 16 || out.len() < streams.len() {
         return;
     }
-    // Same offset-base probe as `build_idx_table` so the two stay in sync.
+    // Same offset-base probe as `build_idx_table` so the two stay in
+    // sync — including the round-285 rule that non-per-stream entries
+    // (`rec ` LIST entries, whose offset points at a `LIST` FourCC
+    // rather than the recorded ckid) can't anchor the probe.
     let n = raw.len() / 16;
     let movi_fourcc_pos = movi_start.saturating_sub(4);
     let mut probe_raw_offset: Option<u32> = None;
     let mut probe_ckid: Option<[u8; 4]> = None;
     for i in 0..n {
         let base = i * 16;
+        let mut ckid = [0u8; 4];
+        ckid.copy_from_slice(&raw[base..base + 4]);
+        if parse_stream_index(&ckid).is_none() {
+            continue;
+        }
         let off =
             u32::from_le_bytes([raw[base + 8], raw[base + 9], raw[base + 10], raw[base + 11]]);
         if off != 0 {
-            let mut ckid = [0u8; 4];
-            ckid.copy_from_slice(&raw[base..base + 4]);
             probe_raw_offset = Some(off);
             probe_ckid = Some(ckid);
             break;
@@ -4058,21 +4082,29 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
     raw: &[u8],
     movi_start: u64,
     streams: &[StreamInfo],
-) -> Result<Vec<IdxEntry>> {
+) -> Result<(Vec<IdxEntry>, Vec<Idx1RecEntry>)> {
     if raw.len() < 16 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let n = raw.len() / 16;
-    // Pick the first entry with a non-zero offset as a probe.
+    // Pick the first per-stream entry with a non-zero offset as a probe.
+    // Entries whose ckid doesn't name a per-stream data chunk (e.g. the
+    // `rec ` LIST entries of AVI 1.0 §"AVI Index Entries") are skipped:
+    // the bytes at a `rec ` entry's offset are the `LIST` FourCC, not
+    // the recorded ckid, so they can never anchor the offset-base probe
+    // and would silently force the conservative default below.
     let mut probe_raw_offset: Option<u32> = None;
     let mut probe_ckid: Option<[u8; 4]> = None;
     for i in 0..n {
         let base = i * 16;
+        let mut ckid = [0u8; 4];
+        ckid.copy_from_slice(&raw[base..base + 4]);
+        if parse_stream_index(&ckid).is_none() {
+            continue;
+        }
         let off =
             u32::from_le_bytes([raw[base + 8], raw[base + 9], raw[base + 10], raw[base + 11]]);
         if off != 0 {
-            let mut ckid = [0u8; 4];
-            ckid.copy_from_slice(&raw[base..base + 4]);
             probe_raw_offset = Some(off);
             probe_ckid = Some(ckid);
             break;
@@ -4108,8 +4140,17 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
     let base_off = if movi_relative { movi_fourcc_pos } else { 0 };
 
     // First pass: build entries with file-absolute offsets. Drop entries
-    // for unknown stream indexes (tolerate stray junk).
+    // for unknown stream indexes (tolerate stray junk), but collect
+    // `rec ` LIST entries separately — per AVI 1.0 §"AVI Index Entries"
+    // idx1 carries "entries for each data chunk, including 'rec '
+    // chunks", and those describe the grouping LISTs themselves rather
+    // than any per-stream payload (Appendix C: `AVIIF_LIST` — "The
+    // chunk is a 'rec ' list."). They carry no stream index, so they
+    // never enter the per-stream seek table; the typed
+    // [`AviDemuxer::idx1_rec_list_entries`] surface keeps them
+    // observable verbatim.
     let mut entries: Vec<IdxEntry> = Vec::with_capacity(n);
+    let mut rec_entries: Vec<Idx1RecEntry> = Vec::new();
     for i in 0..n {
         let base = i * 16;
         let mut ckid = [0u8; 4];
@@ -4126,7 +4167,16 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
         ]);
         let stream = match parse_stream_index(&ckid) {
             Some(s) => s,
-            None => continue,
+            None => {
+                if ckid == *b"rec " {
+                    rec_entries.push(Idx1RecEntry {
+                        flags,
+                        offset: base_off.saturating_add(raw_off as u64),
+                        size,
+                    });
+                }
+                continue;
+            }
         };
         if (stream as usize) >= streams.len() {
             continue;
@@ -4151,7 +4201,7 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
         per_stream_pts[s] = per_stream_pts[s].saturating_add(bump);
     }
 
-    Ok(entries)
+    Ok((entries, rec_entries))
 }
 
 /// Read the 4-byte ckid at `offset` (no seek restore) and check whether
@@ -4230,6 +4280,17 @@ pub struct AviDemuxer {
     duration_micros: i64,
     /// Optional idx1-derived seek table (empty = not available).
     idx_table: Vec<IdxEntry>,
+    /// `rec ` LIST entries recorded in idx1, in file order (round-285).
+    ///
+    /// Per AVI 1.0 §"AVI Index Entries" the idx1 chunk holds "entries
+    /// for each data chunk, including 'rec ' chunks"; per Appendix C
+    /// the `AVIIF_LIST` flag marks an entry whose chunk "is a 'rec '
+    /// list". These describe the grouping LISTs themselves, carry no
+    /// stream index, and never enter [`Self::idx_table`]. Surfaced via
+    /// [`AviDemuxer::idx1_rec_list_entries`] +
+    /// `avi:idx1.rec_lists` metadata. Empty when the file has no idx1
+    /// or its idx1 indexes no `rec ` lists.
+    idx1_rec_entries: Vec<Idx1RecEntry>,
     /// Optional OpenDML 2.0 super-index per stream (parallel to `streams`,
     /// indexed by stream number). Empty `SuperIndex` for streams that
     /// didn't declare an `indx` chunk in their strl. Used as a probe
@@ -5077,6 +5138,40 @@ impl Idx1Flags {
     pub fn compressor_bits(self) -> u32 {
         self.bits & AVIIF_COMPRESSOR
     }
+}
+
+/// One `rec ` LIST entry recorded in the legacy `idx1` index
+/// (round-285).
+///
+/// Per AVI 1.0 §"AVI Index Entries" the idx1 chunk "consists of an
+/// AVIOLDINDEX structure with entries for each data chunk, including
+/// 'rec ' chunks", and per Appendix C the `AVIIF_LIST` flag marks an
+/// entry whose chunk "is a 'rec ' list". Such an entry describes one
+/// `LIST rec ` CD-ROM-interleave grouping cluster inside `movi` rather
+/// than any per-stream payload chunk — the recorded ckid is the `rec `
+/// form-type, not a `NNxx` stream chunk id — so it carries no stream
+/// index and never appears in the per-stream seek table. This struct
+/// surfaces the entries verbatim for round-trip parity and
+/// interleave-structure inspection via
+/// [`AviDemuxer::idx1_rec_list_entries`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Idx1RecEntry {
+    /// Raw `dwFlags` DWORD as recorded in idx1 — decode via
+    /// [`Idx1Flags::from_bits`]. Writers conforming to Appendix C set
+    /// `AVIIF_LIST` (0x0001); the value is surfaced unmasked so
+    /// non-conforming / vendor bits stay observable.
+    pub flags: u32,
+    /// File-absolute offset of the cluster's `LIST` chunk header,
+    /// resolved with the same movi-relative vs file-absolute base
+    /// detection as the per-stream seek table (idx1's `dwOffset` is
+    /// ambiguous between the two conventions; see
+    /// [`build_idx_table`]'s probe).
+    pub offset: u64,
+    /// `dwSize` as recorded in idx1 — the `LIST` chunk's size-field
+    /// value (the 4-byte `rec ` form-type FourCC plus the grouped
+    /// chunk bytes), surfaced verbatim with no cross-validation
+    /// against the on-disk LIST header.
+    pub size: u32,
 }
 
 /// One palette entry inside a [`PaletteChange`] body — `PALETTEENTRY`
@@ -6474,6 +6569,33 @@ impl AviDemuxer {
     ) -> Option<Idx1Flags> {
         self.idx1_flags_for_packet(stream_index, packet_seq)
             .map(Idx1Flags::from_bits)
+    }
+
+    /// `rec ` LIST entries recorded in idx1, in file order (round-285).
+    ///
+    /// Per AVI 1.0 §"AVI Index Entries" idx1 holds "entries for each
+    /// data chunk, including 'rec ' chunks" — one per `LIST rec `
+    /// CD-ROM-interleave grouping cluster inside `movi`, flagged
+    /// `AVIIF_LIST` per Appendix C. They carry no stream index, so the
+    /// per-stream surfaces ([`Self::idx1_flags_for_packet`], the seek
+    /// table, `next_packet`) never see them; this accessor keeps the
+    /// recorded `(flags, offset, size)` triples observable verbatim,
+    /// with each `offset` resolved file-absolute via the same
+    /// movi-relative / file-absolute base detection the seek table
+    /// uses. Empty slice when the file has no idx1, or its idx1 indexes
+    /// no `rec ` lists (the common case — writers that don't cluster,
+    /// and pre-round-285 cluster-writing muxers that indexed only the
+    /// grouped chunks, both leave it empty).
+    pub fn idx1_rec_list_entries(&self) -> &[Idx1RecEntry] {
+        &self.idx1_rec_entries
+    }
+
+    /// Convenience count of [`Self::idx1_rec_list_entries`] — the
+    /// number of `LIST rec ` clusters idx1 declares. Mirrors the
+    /// `avi:idx1.rec_lists` metadata key (which is only emitted when
+    /// this count is non-zero, so key absence == `0`).
+    pub fn idx1_rec_list_count(&self) -> u32 {
+        self.idx1_rec_entries.len().min(u32::MAX as usize) as u32
     }
 
     pub fn field2_offset_for_packet(&self, stream_index: u32, packet_seq: usize) -> Option<u32> {
