@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **File-global `avih.dwStreams` declared stream count + cross-check
+  (round 292).** Per AVI 1.0 §"AVIMAINHEADER"
+  (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
+  `dwStreams` row): *"Number of streams in the file. For example, a
+  file with audio and video has two streams."* The DWORD at byte
+  offset 24 of the 56-byte AVIMAINHEADER body was already parsed and
+  surfaced as the `avi:streams` metadata key, but no typed surface
+  existed.
+
+  Demuxer: `AviDemuxer::avih_declared_stream_count() -> Option<u32>`
+  returns the verbatim declared count (the writer-skips-it `0`
+  sentinel maps to `None`, mirroring the round-275 / round-268 /
+  round-260 "default == absent" convention). A second accessor,
+  `declared_vs_actual_stream_count_mismatch() -> Option<(u32, u32)>`,
+  cross-checks the non-zero declared count against the number of
+  `strl` LISTs the demuxer actually walked in `hdrl`, returning
+  `(declared, actual)` on a divergence. The cross-check is
+  informational — it never fails `open()`, in the same family as
+  `super_index_duration_violations` /
+  `cbr_audio_block_alignment_violations` — and the demuxer always
+  trusts the streams it physically parsed; `dwStreams` is advisory.
+  A mismatch is a hallmark of a truncated capture crash dump (header
+  stamped up-front for N streams, file cut off before all N `strl`
+  LISTs were written) or a hand-edited header, so a downstream repair
+  tool can decide which count to trust.
+
+  Muxer: the existing auto-derived `tracks.len()` stamp at
+  `write_header` is unchanged, so a round-trip through this crate's
+  own writer always agrees with `Demuxer::streams().len()` (no
+  override builder).
+
+  Tested in `tests/round292_avih_streams.rs` (7 cases): mux→demux
+  round-trip + accessor/metadata agreement, plus hand-rolled fixtures
+  for matched / zero-sentinel / over-declared (truncated-capture) /
+  under-declared `dwStreams`, and independence from the neighbouring
+  `dwTotalFrames` / `dwInitialFrames` / `dwWidth`/`dwHeight` DWORDs.
+
 - **idx1 `rec ` LIST entries — `AVIIF_LIST` round-trip (round 285).**
   Per AVI 1.0 §"AVI Index Entries" the idx1 chunk *"consists of an
   AVIOLDINDEX structure with entries for each data chunk, including

@@ -1762,6 +1762,7 @@ fn open_avi_inner(
         avih_micro_sec_per_frame: avih.as_ref().map(|h| h.micro_sec_per_frame).unwrap_or(0),
         avih_max_bytes_per_sec: avih.as_ref().map(|h| h.max_bytes_per_sec).unwrap_or(0),
         avih_total_frames: avih.as_ref().map(|h| h.total_frames).unwrap_or(0),
+        avih_streams: avih.as_ref().map(|h| h.streams).unwrap_or(0),
         avih_width: avih.as_ref().map(|h| h.width).unwrap_or(0),
         avih_height: avih.as_ref().map(|h| h.height).unwrap_or(0),
         vprps,
@@ -4440,6 +4441,23 @@ pub struct AviDemuxer {
     /// the round-260 / round-256 / round-249 etc. "default == absent"
     /// convention.
     avih_total_frames: u32,
+    /// Raw `dwStreams` from `AVIMAINHEADER` (round-292). The
+    /// file-global declared stream-count DWORD at byte offset 24 of the
+    /// 56-byte AVIMAINHEADER body. Per AVI 1.0 §"AVIMAINHEADER"
+    /// (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
+    /// `dwStreams` row, line 201): *"Number of streams in the file. For
+    /// example, a file with audio and video has two streams."*
+    ///
+    /// Captured so [`AviDemuxer::avih_declared_stream_count`] can hand
+    /// back the writer-declared count verbatim, and so
+    /// [`AviDemuxer::declared_vs_actual_stream_count_mismatch`] can
+    /// cross-check it against the number of `strl` LISTs actually walked
+    /// in `hdrl`. `0` is the writer-skips-it / unspecified sentinel
+    /// mapped to `None` by the accessor, mirroring the round-275 /
+    /// round-268 / round-260 / round-256 "default == absent" convention.
+    /// Already surfaced as the `avi:streams` metadata key (emitted
+    /// verbatim, omitted only for the `0` sentinel).
+    avih_streams: u32,
     /// Raw `dwWidth` from `AVIMAINHEADER` (round-275). The file-global
     /// movie-rectangle width DWORD at byte offset 32 of the 56-byte
     /// AVIMAINHEADER body. Per AVI 1.0 §"AVIMAINHEADER"
@@ -6475,6 +6493,77 @@ impl AviDemuxer {
             None
         } else {
             Some(self.avih_total_frames)
+        }
+    }
+
+    /// `AVIMAINHEADER.dwStreams` per AVI 1.0 §"AVIMAINHEADER"
+    /// (round-292).
+    ///
+    /// Returns the file-global writer-declared stream count from byte
+    /// offset 24 of the 56-byte AVIMAINHEADER body, or `None` when the
+    /// file declared the writer-skips-it / unspecified sentinel
+    /// (`dwStreams == 0`). Per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A:
+    /// *"Number of streams in the file. For example, a file with audio
+    /// and video has two streams."*
+    ///
+    /// This is the count the **writer claimed**, not the number of
+    /// `strl` LISTs the demuxer actually walked in `hdrl` — those agree
+    /// for a well-formed file but can diverge for a truncated capture
+    /// crash dump or a hand-edited header (the on-disk DWORD says "2
+    /// streams" while only one `strl` is physically present). The
+    /// number of streams actually parsed is the length of
+    /// [`Demuxer::streams`]; [`Self::declared_vs_actual_stream_count_mismatch`]
+    /// surfaces the `(declared, actual)` pair whenever the two disagree.
+    /// This accessor keeps the raw declared DWORD observable on its own,
+    /// matching the shape of [`Self::avih_total_frames`] (round-268) /
+    /// [`Self::max_bytes_per_sec`] (round-260) / [`Self::micro_sec_per_frame`]
+    /// (round-256). The same data also surfaces under the `avi:streams`
+    /// metadata key (omitted entirely when the value is 0 so absence of
+    /// the key is observable).
+    ///
+    /// The muxer's counterpart is auto-derived: `write_header` stamps
+    /// the actual number of streams passed to `open_muxer`, so a
+    /// round-trip through this crate's own writer always agrees with
+    /// [`Demuxer::streams`]`.len()`.
+    pub fn avih_declared_stream_count(&self) -> Option<u32> {
+        if self.avih_streams == 0 {
+            None
+        } else {
+            Some(self.avih_streams)
+        }
+    }
+
+    /// Cross-check of `AVIMAINHEADER.dwStreams` against the number of
+    /// `strl` LISTs actually walked in `hdrl` (round-292).
+    ///
+    /// Returns `Some((declared, actual))` when the writer-declared
+    /// stream count (byte offset 24 of the AVIMAINHEADER body) is
+    /// non-zero **and** disagrees with the number of streams the
+    /// demuxer physically parsed (the length of [`Demuxer::streams`]),
+    /// otherwise `None`. A non-zero declared count that matches the
+    /// parsed count, or the writer-skips-it `0` sentinel (which carries
+    /// no claim to validate against), both return `None`.
+    ///
+    /// This is an informational diagnostic in the same family as
+    /// [`Self::super_index_duration_violations`] /
+    /// [`Self::cbr_audio_block_alignment_violations`]: it never fails
+    /// `open()`. A mismatch is a hallmark of a truncated capture crash
+    /// dump (the header was stamped up-front for N streams but the file
+    /// was cut off before all N `strl` LISTs were written) or a
+    /// hand-edited / repacked header; a downstream repair tool can use
+    /// the pair to decide whether to trust the declared count or the
+    /// physically-present streams. The demuxer always trusts the
+    /// streams it actually parsed — `dwStreams` is advisory.
+    pub fn declared_vs_actual_stream_count_mismatch(&self) -> Option<(u32, u32)> {
+        if self.avih_streams == 0 {
+            return None;
+        }
+        let actual = self.streams.len() as u32;
+        if self.avih_streams != actual {
+            Some((self.avih_streams, actual))
+        } else {
+            None
         }
     }
 
