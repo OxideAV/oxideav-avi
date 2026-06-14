@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **File-global `avih.dwSuggestedBufferSize` typed accessor (round
+  298).** Per AVI 1.0 §"AVIMAINHEADER"
+  (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
+  `dwSuggestedBufferSize` row): *"Suggested buffer size for reading
+  the file. Generally, large enough to contain the largest chunk in
+  the file. … For interleaved files, the buffer size should be large
+  enough to read an entire record (not just a chunk)."* The DWORD at
+  byte offset 28 of the 56-byte AVIMAINHEADER body was already parsed
+  and surfaced as the `avi:suggested_buffer_size` metadata key and the
+  round-13 bare-`u32` `avih_suggested_buffer_size()` accessor, but the
+  latter could not distinguish "writer stamped 0 because the size was
+  unknown" from "field genuinely held 0".
+
+  Demuxer: `AviDemuxer::avih_suggested_buffer_size_typed() -> Option<u32>`
+  returns the verbatim file-global read-ahead hint with the
+  writer-skips-it / "do not know" `0` sentinel folded to `None`,
+  mirroring the round-292 `dwStreams` / round-275 `dwWidth`/`dwHeight`
+  / round-268 `dwTotalFrames` / round-260 `dwMaxBytesPerSec` /
+  round-256 `dwMicroSecPerFrame` "default == absent" convention. The
+  legacy bare-`u32` accessor is retained for backward compatibility.
+  The avih flavour is the file-global largest-chunk read-ahead bound
+  across every stream, spec-independent from the per-stream
+  `strh.dwSuggestedBufferSize` surfaced via
+  `stream_suggested_buffer_size()` (round 217).
+
+  Muxer: no new builder — the auto-derived default
+  (`max(per_track max_chunk_size)` rounded up to a 4-byte boundary)
+  and the pre-existing `AviMuxOptions::with_suggested_buffer_size`
+  override both round-trip verbatim through the new typed accessor; an
+  explicit `0` override maps back to `None`.
+
+  Tests: `tests/round298_avih_suggested_buffer_size.rs` (7 cases) —
+  hand-rolled non-zero / zero fixtures, typed-vs-metadata agreement,
+  independence from the neighbouring AVIMAINHEADER DWORDs (offsets
+  16/20/24/32/36), and mux-override / zero-override / auto-derived
+  round-trips.
+
 - **File-global `avih.dwStreams` declared stream count + cross-check
   (round 292).** Per AVI 1.0 §"AVIMAINHEADER"
   (`docs/container/riff/avi-riff-file-reference.md`, Appendix A

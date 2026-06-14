@@ -6227,8 +6227,68 @@ impl AviDemuxer {
     ///
     /// Returns `0` when the field was zero on disk (some legacy writers
     /// leave it unpopulated) or the file had no parsable `avih`.
+    ///
+    /// This is the legacy bare-`u32` accessor; the
+    /// [`Self::avih_suggested_buffer_size_typed`] companion (round-298)
+    /// folds the `0` "do not know / unpopulated" sentinel to `None` so
+    /// an unspecified hint reads the same as an absent one, matching the
+    /// "default == absent" convention every later file-global accessor
+    /// adopted.
     pub fn avih_suggested_buffer_size(&self) -> u32 {
         self.avih_suggested_buffer_size
+    }
+
+    /// `AVIMAINHEADER.dwSuggestedBufferSize` per AVI 1.0 §"AVIMAINHEADER"
+    /// (round-298), as `Option<u32>`.
+    ///
+    /// Returns the file-global read-ahead allocation hint from byte
+    /// offset 28 of the 56-byte AVIMAINHEADER body, or `None` when the
+    /// field carried the writer-skips-it / unpopulated `0` sentinel. Per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A: *"Suggested
+    /// buffer size for reading the file. Generally, large enough to
+    /// contain the largest chunk in the file. If set to zero or too
+    /// small, playback software will have to reallocate memory during
+    /// playback, which will reduce performance. For interleaved files,
+    /// the buffer size should be large enough to read an entire record
+    /// (not just a chunk)."*
+    ///
+    /// This is the typed companion of the legacy bare-`u32`
+    /// [`Self::avih_suggested_buffer_size`] accessor (round-13), which is
+    /// retained for backward compatibility. The legacy accessor cannot
+    /// distinguish "writer stamped 0 because it did not know the size"
+    /// from "field genuinely held 0"; this typed surface folds both to
+    /// `None`, matching the "default == absent" convention of
+    /// [`Self::avih_total_frames`] (round-268) /
+    /// [`Self::max_bytes_per_sec`] (round-260) /
+    /// [`Self::micro_sec_per_frame`] (round-256) /
+    /// [`Self::avih_declared_stream_count`] (round-292).
+    ///
+    /// The avih flavour is the file-global read-ahead bound — generally
+    /// the largest chunk (or, for interleaved files, the largest `rec `
+    /// record) across every stream — and is logically distinct from the
+    /// per-stream `strh.dwSuggestedBufferSize` surfaced via
+    /// [`Self::stream_suggested_buffer_size`] (round-217), which is a
+    /// per-stream upper bound. The two are spec-independent: a writer
+    /// may stamp consistent values, set only one, or leave both at `0`,
+    /// and the demuxer surfaces each verbatim with no validation against
+    /// the actual largest chunk seen in `movi` since over-declaration is
+    /// the documented intent of the field. The same value also surfaces
+    /// under the `avi:suggested_buffer_size` metadata key, which is
+    /// omitted entirely when the value is `0` so absence of the key is
+    /// observable.
+    ///
+    /// The muxer's counterpart is auto-derived (the largest chunk-body
+    /// size observed across all streams) unless overridden via
+    /// [`crate::muxer::AviMuxOptions::with_suggested_buffer_size`]; a
+    /// round-trip through this crate's own writer reproduces the stamped
+    /// value verbatim, and an explicit `0` override maps back to `None`
+    /// here.
+    pub fn avih_suggested_buffer_size_typed(&self) -> Option<u32> {
+        if self.avih_suggested_buffer_size == 0 {
+            None
+        } else {
+            Some(self.avih_suggested_buffer_size)
+        }
     }
 
     /// Per-stream `xxtx` text/subtitle chunk bodies in file order
