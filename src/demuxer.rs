@@ -1471,6 +1471,33 @@ fn open_avi_inner(
         }
     }
 
+    // Round-304: surface the `indx` super-index's own `wLongsPerEntry`
+    // WORD. Per the AVISUPERINDEX layout in
+    // `docs/container/riff/avi-riff-file-reference.md` Appendix F
+    // (`wLongsPerEntry` row: *"4 (each entry is 16 bytes)."*) and the
+    // base AVIMETAINDEX in Appendix E (`wLongsPerEntry` row: *"Size of
+    // each index entry, in 4-byte units."*), this WORD is the
+    // super-index's per-entry stride in 4-byte DWORD units. For a
+    // well-formed AVI 2.0 super-index it is always `4` — each
+    // `_avisuperindex_entry` is `(qwOffset, dwSize, dwDuration)` = 16
+    // bytes = 4 longs. Skip the spec-default `4` so absence of the key
+    // stays observable (the typed `super_index_longs_per_entry`
+    // accessor returns the raw value verbatim either way), mirroring
+    // the round-197 `sub_type_2field` / round-176/153 "default ==
+    // absent" convention. Skip empty super-indexes so the post-pad to
+    // `streams.len()` zero-slots produce no spurious keys.
+    for (i, sx) in super_indexes.iter().enumerate() {
+        if sx.entries.is_empty() {
+            continue;
+        }
+        if sx.w_longs_per_entry != 4 {
+            metadata.push((
+                format!("avi:indx.{i}.longs_per_entry"),
+                sx.w_longs_per_entry.to_string(),
+            ));
+        }
+    }
+
     // Round-5 candidate 2: when an idx1 table is present alongside
     // an `AVI_INDEX_2FIELD` ix## for the same stream, surface a
     // per-stream "interlaced via idx1" hint at the idx1 layer. The
@@ -7002,6 +7029,44 @@ impl AviDemuxer {
         self.super_index_sub_type(stream_index) == Some(AVI_INDEX_SUB_2FIELD)
     }
 
+    /// Raw `wLongsPerEntry` WORD of a stream's `indx` super-index
+    /// (round-304).
+    ///
+    /// Per AVISUPERINDEX (clean-room source:
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix F,
+    /// `wLongsPerEntry` row: *"4 (each entry is 16 bytes)."*) and the
+    /// base AVIMETAINDEX in Appendix E (`wLongsPerEntry` row: *"Size of
+    /// each index entry, in 4-byte units."*), this WORD declares the
+    /// per-entry stride of the super-index's `aIndex[]` table in units
+    /// of 4-byte DWORDs. For a well-formed AVI 2.0 super-index it is
+    /// always `4` — each `_avisuperindex_entry` is `(qwOffset:8,
+    /// dwSize:4, dwDuration:4)` = 16 bytes = 4 longs — but the demuxer
+    /// surfaces whatever value the file declared so a reader can detect
+    /// a malformed / future-extended super-index table whose entry
+    /// stride differs from the spec's `4` *before* trusting the
+    /// 16-byte-stride entry walk in `parse_indx`.
+    ///
+    /// Returns the raw u16 verbatim (no normalisation). Returns `None`
+    /// for `stream_index` out of range or streams that didn't declare
+    /// an `indx` super-index (the AVI-1.0 case and OpenDML streams
+    /// whose `strl` reserved no super-index slot). This is the
+    /// super-index counterpart of the per-segment `ix##`
+    /// stride — distinct from the per-stream `(scale, rate)` timebase
+    /// and from the `bIndexSubType` exposed via
+    /// [`Self::super_index_sub_type`]; the sub-type selects 8-byte vs
+    /// 12-byte `ix##` *standard-index* entries, whereas this WORD is
+    /// the *super-index's* own entry stride and is independent of the
+    /// pointed-to segments' field carriage.
+    pub fn super_index_longs_per_entry(&self, stream_index: u32) -> Option<u16> {
+        let sx = self.super_indexes.get(stream_index as usize)?;
+        if sx.entries.is_empty() {
+            // Pad slot (no indx declared) — distinguishable from a
+            // genuine super-index, mirroring `super_index_sub_type`.
+            return None;
+        }
+        Some(sx.w_longs_per_entry)
+    }
+
     /// Per-stream `vprp` `VIDEO_FIELD_DESC` records (round-9
     /// candidate 1).
     ///
@@ -8279,6 +8344,57 @@ mod tests {
             "field-2 offset must round-trip from the 12-byte entry layout"
         );
         assert!(parsed.entries[0].is_keyframe);
+    }
+
+    /// Round-304: `parse_indx` must surface the super-index's own
+    /// `wLongsPerEntry` WORD verbatim. Build a well-formed AVI 2.0
+    /// super-index (Appendix F: `wLongsPerEntry = 4`, each entry 16 B)
+    /// and a malformed one declaring a non-spec stride; the parser
+    /// stores both verbatim into `SuperIndex::w_longs_per_entry`.
+    fn build_indx_body(w_longs_per_entry: u16, entries: &[(u64, u32, u32)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&w_longs_per_entry.to_le_bytes()); // wLongsPerEntry
+        body.push(0); // bIndexSubType
+        body.push(AVI_INDEX_OF_INDEXES); // bIndexType (super)
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes()); // nEntriesInUse
+        body.extend_from_slice(b"00dc"); // dwChunkId
+        body.extend_from_slice(&[0u8; 12]); // dwReserved[3]
+        for (qw_offset, dw_size, dw_duration) in entries {
+            body.extend_from_slice(&qw_offset.to_le_bytes());
+            body.extend_from_slice(&dw_size.to_le_bytes());
+            body.extend_from_slice(&dw_duration.to_le_bytes());
+        }
+        body
+    }
+
+    #[test]
+    fn parse_indx_surfaces_default_longs_per_entry() {
+        let body = build_indx_body(4, &[(0x1000, 0x200, 30), (0x4000, 0x200, 30)]);
+        let sx = parse_indx(&body).unwrap();
+        assert_eq!(
+            sx.w_longs_per_entry, 4,
+            "spec-default AVISUPERINDEX stride must round-trip verbatim"
+        );
+        assert_eq!(sx.entries.len(), 2);
+        assert_eq!(sx.entries[0].qw_offset, 0x1000);
+        assert_eq!(sx.entries[0].dw_duration, 30);
+    }
+
+    #[test]
+    fn parse_indx_surfaces_nondefault_longs_per_entry() {
+        // A super-index whose entry-stride WORD is *not* the spec's
+        // `4`. The 16-byte entry walk still reads each
+        // `(qwOffset, dwSize, dwDuration)` triple; the parser preserves
+        // the declared stride so a reader can detect the malformed /
+        // future-extended table.
+        let body = build_indx_body(8, &[(0x2000, 0x100, 15)]);
+        let sx = parse_indx(&body).unwrap();
+        assert_eq!(
+            sx.w_longs_per_entry, 8,
+            "non-default AVISUPERINDEX stride must be surfaced verbatim, not normalised to 4"
+        );
+        assert_eq!(sx.entries.len(), 1);
+        assert_eq!(sx.entries[0].qw_offset, 0x2000);
     }
 
     #[test]

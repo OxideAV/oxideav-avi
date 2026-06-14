@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenDML 2.0 super-index `wLongsPerEntry` entry-stride accessor
+  (round 304).** Per the AVISUPERINDEX layout in
+  `docs/container/riff/avi-riff-file-reference.md` Appendix F
+  (`wLongsPerEntry` row: *"4 (each entry is 16 bytes)."*) and the base
+  AVIMETAINDEX in Appendix E (`wLongsPerEntry` row: *"Size of each
+  index entry, in 4-byte units."*), this WORD declares the
+  super-index's own `aIndex[]` per-entry stride in 4-byte DWORD units.
+  For a well-formed AVI 2.0 super-index it is always `4` — each
+  `_avisuperindex_entry` is `(qwOffset:8, dwSize:4, dwDuration:4)` =
+  16 bytes = 4 longs. The WORD was already parsed (it drives the
+  16-byte-stride entry walk in `parse_indx`) but never surfaced.
+
+  Demuxer: `AviDemuxer::super_index_longs_per_entry(stream) ->
+  Option<u16>` returns the raw WORD verbatim (no normalisation),
+  `None` for streams without an `indx` super-index so "no super-index
+  declared" stays distinguishable from "stride 4". The
+  `avi:indx.<n>.longs_per_entry` metadata key is emitted only when the
+  stride differs from the spec-default `4` (default omitted so absence
+  stays observable, per the round-197/176/153 convention). Container
+  surface only — no codec decode logic. Tests: 2 `parse_indx` unit
+  tests (default `4` + non-default stride surfaced verbatim) + 2
+  integration tests (`round304_super_index_longs_per_entry`).
+
 - **File-global `avih.dwSuggestedBufferSize` typed accessor (round
   298).** Per AVI 1.0 §"AVIMAINHEADER"
   (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
