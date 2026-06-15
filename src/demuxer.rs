@@ -1498,6 +1498,42 @@ fn open_avi_inner(
         }
     }
 
+    // Round-312: surface the `indx` super-index's own `dwChunkId`
+    // FOURCC. Per the AVISUPERINDEX layout in
+    // `docs/container/riff/avi-riff-file-reference.md` Appendix F
+    // (`dwChunkId` row: *"FOURCC of chunks indexed (e.g., '00dc')."*)
+    // and the base AVIMETAINDEX in Appendix E (`dwChunkId` row: *"FOURCC
+    // of chunks indexed (e.g., '00dc'); for super index only."*), this
+    // DWORD declares which `movi` data-chunk FOURCC every `ix##` segment
+    // referenced by this super-index points at. For a well-formed AVI
+    // 2.0 file it spells the stream's own packet FourCC — `00dc` /
+    // `00wb` for stream 0, `01dc` / `01wb` for stream 1, and so on — so
+    // the canonical value is fully redundant with the stream slot the
+    // super-index lives in. We surface it verbatim only when the parsed
+    // FOURCC's two leading ASCII stream-digits do NOT decode to the
+    // super-index's own stream slot `i`: a divergent `dwChunkId` means
+    // the super-index declares it indexes a *different* stream's chunks
+    // than the `strl` it sits in (a malformed / cross-wired file), and
+    // surfacing the raw FOURCC lets a downstream repair tool detect that
+    // before trusting the `ix##` scan. The canonical-matching value is
+    // skipped so absence of the key stays observable, mirroring the
+    // round-304 `longs_per_entry` / round-197 `sub_type_2field` "default
+    // == absent" convention. Skip empty super-indexes so the post-pad to
+    // `streams.len()` zero-slots produce no spurious keys; the all-zero
+    // chunk_id of a `default()` slot is therefore never emitted.
+    for (i, sx) in super_indexes.iter().enumerate() {
+        if sx.entries.is_empty() {
+            continue;
+        }
+        let declares_own_slot = parse_stream_index(&sx.chunk_id) == Some(i as u32);
+        if !declares_own_slot {
+            metadata.push((
+                format!("avi:indx.{i}.chunk_id"),
+                format_fourcc_or_hex(&sx.chunk_id),
+            ));
+        }
+    }
+
     // Round-5 candidate 2: when an idx1 table is present alongside
     // an `AVI_INDEX_2FIELD` ix## for the same stream, surface a
     // per-stream "interlaced via idx1" hint at the idx1 layer. The
@@ -7065,6 +7101,48 @@ impl AviDemuxer {
             return None;
         }
         Some(sx.w_longs_per_entry)
+    }
+
+    /// Raw `dwChunkId` FOURCC of a stream's `indx` super-index
+    /// (round-312).
+    ///
+    /// Per AVISUPERINDEX (clean-room source:
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix F,
+    /// `dwChunkId` row: *"FOURCC of chunks indexed (e.g., '00dc')."*)
+    /// and the base AVIMETAINDEX in Appendix E (`dwChunkId` row: *"FOURCC
+    /// of chunks indexed (e.g., '00dc'); for super index only."*), this
+    /// DWORD declares which `movi` data-chunk FOURCC every `ix##`
+    /// standard-index segment referenced by this super-index points at.
+    /// For a well-formed AVI 2.0 file it spells the indexed stream's own
+    /// packet FourCC — `00dc` / `00wb` for stream 0, `01dc` / `01wb` for
+    /// stream 1, and so forth — i.e. the two leading ASCII digits encode
+    /// the same stream number as the `strl` the super-index lives in.
+    ///
+    /// Returns the raw 4 bytes verbatim (no normalisation), so a reader
+    /// can detect a cross-wired / malformed super-index whose declared
+    /// `dwChunkId` points at a *different* stream's chunks than the
+    /// `strl` it sits in *before* trusting the in-`movi` `ix##` scan that
+    /// backs the OpenDML seek path. The companion
+    /// `avi:indx.<n>.chunk_id` metadata key surfaces the same value as a
+    /// printable-or-hex string but only when it diverges from the
+    /// canonical own-slot FOURCC; this accessor always returns the bytes
+    /// so a caller can cross-check the canonical case too.
+    ///
+    /// Returns `None` for `stream_index` out of range or streams that
+    /// didn't declare an `indx` super-index (the AVI-1.0 case and
+    /// OpenDML streams whose `strl` reserved no super-index slot, plus a
+    /// super-index with a non-`AVI_INDEX_OF_INDEXES` `bIndexType` which
+    /// `parse_indx` folds to an empty `default()` slot) — mirroring the
+    /// `None`-for-no-`indx` shape of [`Self::super_index_sub_type`] and
+    /// [`Self::super_index_longs_per_entry`].
+    pub fn super_index_chunk_id(&self, stream_index: u32) -> Option<[u8; 4]> {
+        let sx = self.super_indexes.get(stream_index as usize)?;
+        if sx.entries.is_empty() {
+            // Pad slot (no indx declared) — distinguishable from a
+            // genuine super-index, mirroring `super_index_sub_type`.
+            return None;
+        }
+        Some(sx.chunk_id)
     }
 
     /// Per-stream `vprp` `VIDEO_FIELD_DESC` records (round-9

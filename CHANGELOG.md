@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenDML 2.0 super-index `dwChunkId` indexed-chunk FOURCC accessor
+  (round 312).** Per the AVISUPERINDEX layout in
+  `docs/container/riff/avi-riff-file-reference.md` Appendix F
+  (`dwChunkId` row: *"FOURCC of chunks indexed (e.g., '00dc')."*) and
+  the base AVIMETAINDEX in Appendix E (`dwChunkId` row: *"FOURCC of
+  chunks indexed (e.g., '00dc'); for super index only."*), this DWORD
+  declares which `movi` data-chunk FOURCC every `ix##` standard-index
+  segment referenced by the super-index points at. For a well-formed
+  AVI 2.0 file it spells the indexed stream's own packet FourCC
+  (`00dc` / `00wb` for stream 0), so its two leading ASCII digits
+  encode the same stream number as the `strl` the super-index lives in.
+  The FOURCC was already parsed (it tags every `ix##` slot) but never
+  surfaced.
+
+  Demuxer: `AviDemuxer::super_index_chunk_id(stream) -> Option<[u8; 4]>`
+  returns the raw 4 bytes verbatim (no normalisation), `None` for
+  `stream_index` out of range or streams that didn't declare an `indx`
+  super-index (the AVI-1.0 case and the `parse_indx`
+  non-`AVI_INDEX_OF_INDEXES` fold). Companion `avi:indx.<n>.chunk_id`
+  metadata key emits the printable-or-hex FOURCC only when it diverges
+  from the canonical own-slot value (a cross-wired / malformed file);
+  the canonical case is omitted so absence stays observable, per the
+  round-304/197/176/153 "default == absent" convention. Mirrors the
+  `super_index_sub_type` / `super_index_longs_per_entry` accessor
+  family.
+
 - **OpenDML 2.0 super-index `wLongsPerEntry` entry-stride accessor
   (round 304).** Per the AVISUPERINDEX layout in
   `docs/container/riff/avi-riff-file-reference.md` Appendix F
