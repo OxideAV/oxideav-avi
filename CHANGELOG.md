@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- per-stream `ix##` AVISTDINDEX `qwBaseOffset` accessor + `movi`-region cross-check validator (round 317)
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-avi/compare/v0.0.8...v0.0.9) - 2026-06-15
 
 ### Other

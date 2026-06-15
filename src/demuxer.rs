@@ -1420,6 +1420,42 @@ fn open_avi_inner(
         }
     }
 
+    // Round-317: surface an `ix##` standard-index whose `qwBaseOffset`
+    // anchors outside every `movi` LIST region. Per AVISTDINDEX
+    // (`docs/container/riff/avi-riff-file-reference.md` Appendix G,
+    // `qwBaseOffset` row: *"Base offset (typically the file offset of the
+    // 'movi' list)."*) the base every entry resolves against is expected
+    // to point inside the enclosing `movi`. When it doesn't, emit
+    // `avi:ix.<stream>.<segment>.base_outside_movi = "<qwBaseOffset>"` so
+    // a downstream tool can flag the malformed anchor even if seek still
+    // limps along on the verbatim value. The well-formed in-`movi` case
+    // emits no key, so absence stays observable, mirroring the
+    // "default == absent" convention used across the other `avi:ix.*` /
+    // `avi:indx.*` keys. Mirrors the typed
+    // [`AviDemuxer::std_index_base_offset_violations`] surface.
+    {
+        let mut seg_per_stream: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        for ix in &std_indexes {
+            let stream = match parse_stream_index(&ix.chunk_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let seg = seg_per_stream.entry(stream).or_default();
+            let segment_index = *seg;
+            *seg += 1;
+            let inside_movi = movi_segments
+                .iter()
+                .any(|&(start, end)| ix.qw_base_offset >= start && ix.qw_base_offset < end);
+            if !inside_movi {
+                metadata.push((
+                    format!("avi:ix.{stream}.{segment_index}.base_outside_movi"),
+                    ix.qw_base_offset.to_string(),
+                ));
+            }
+        }
+    }
+
     // Round-5 candidate 4: surface a soft-cap warning when a parsed
     // `indx` super-index declared more entries than the conventional
     // 256-slot reserve. Per OpenDML 2.0 §3.0 "Super Index Chunk" the
@@ -3224,6 +3260,44 @@ pub struct SuperIndexDurationViolation {
     pub super_index_duration_total: u64,
     /// The file's `dmlh.dwTotalFrames` the total was compared against.
     pub dmlh_total_frames: u64,
+}
+
+/// One `ix##` standard-index whose `qwBaseOffset` does not anchor
+/// inside any of the file's `movi` LIST regions (round-317).
+///
+/// Per AVISTDINDEX (clean-room source:
+/// `docs/container/riff/avi-riff-file-reference.md` Appendix G,
+/// `qwBaseOffset` row: *"Base offset (typically the file offset of the
+/// 'movi' list)."*) every `AVISTDINDEX_ENTRY.dwOffset` is added to the
+/// chunk-level `qwBaseOffset` to recover the file-absolute position of
+/// the indexed data — so `qwBaseOffset` is expected to point at (or just
+/// inside) the enclosing `movi` LIST. A `qwBaseOffset` that falls
+/// outside every `movi` segment range means the standard index's
+/// base anchor disagrees with where the file actually stored its data
+/// chunks; a consumer that trusts the `dwOffset`-from-base arithmetic
+/// for seeking will compute positions that miss the real chunk headers.
+///
+/// Returned (possibly empty) by
+/// [`AviDemuxer::std_index_base_offset_violations`]. The validator is
+/// purely informational — it never affects `open()`, and the demuxer's
+/// own OpenDML seek path resolves offsets from the verbatim
+/// `qwBaseOffset` regardless (so a malformed base still round-trips
+/// observably rather than being silently "corrected"). It complements
+/// the per-segment `dwChunkId` / `dwDuration` surfaces with a
+/// position-level sanity check between the index and the `movi` body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StdIndexBaseOffsetViolation {
+    /// Stream number (from the two ASCII digits of the `ix##` chunk's
+    /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
+    pub stream_index: u32,
+    /// Zero-based position of the offending `ix##` chunk within that
+    /// stream's standard indexes, counted in file order across every
+    /// `ix##` chunk that indexes this stream (one `ix##` per `(stream,
+    /// movi segment)` pair for OpenDML files).
+    pub segment_index: usize,
+    /// The chunk's verbatim `qwBaseOffset` that landed outside every
+    /// `movi` LIST region.
+    pub qw_base_offset: u64,
 }
 
 /// 8-tuple returned by [`build_stream`]: the [`StreamInfo`], the
@@ -6836,6 +6910,92 @@ impl AviDemuxer {
             seen = seen.saturating_add(ix.entries.len());
         }
         None
+    }
+
+    /// Per-stream `ix##` standard-index `qwBaseOffset` values
+    /// (round-317).
+    ///
+    /// Per AVISTDINDEX (clean-room source:
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix G,
+    /// `qwBaseOffset` row: *"Base offset (typically the file offset of
+    /// the 'movi' list)."*), each `ix##` standard-index chunk carries a
+    /// 64-bit base offset; every `AVISTDINDEX_ENTRY.dwOffset` is added to
+    /// it to recover the file-absolute position of the indexed data
+    /// chunk. For an OpenDML multi-segment file each stream has one `ix##`
+    /// per `movi` segment, so this returns one entry per segment in file
+    /// order; an AVI-1.0 / no-`ix##` file yields an empty Vec.
+    ///
+    /// The bytes are surfaced verbatim (no normalisation): the demuxer's
+    /// own OpenDML seek path resolves chunk positions from this same raw
+    /// value, so a caller can compare what the index declared against
+    /// where the data physically landed (see
+    /// [`Self::std_index_base_offset_violations`] for the `movi`-region
+    /// cross-check). Distinct from the super-index `_avisuperindex_entry.
+    /// qwOffset` (which is the file-absolute position of each `ix##` chunk
+    /// itself, not the base its entries resolve against).
+    pub fn std_index_base_offsets(&self, stream_index: u32) -> Vec<u64> {
+        let mut out = Vec::new();
+        for ix in &self.std_indexes {
+            match parse_stream_index(&ix.chunk_id) {
+                Some(s) if s == stream_index => out.push(ix.qw_base_offset),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Cross-check each `ix##` standard-index `qwBaseOffset` against the
+    /// file's `movi` LIST regions (round-317).
+    ///
+    /// Per AVISTDINDEX (Appendix G, `qwBaseOffset` row: *"Base offset
+    /// (typically the file offset of the 'movi' list)."*) the base offset
+    /// every `ix##` entry resolves against is expected to point inside
+    /// the enclosing `movi` LIST. This method returns one
+    /// [`StdIndexBaseOffsetViolation`] per `ix##` chunk whose
+    /// `qwBaseOffset` falls outside **every** `movi` segment range the
+    /// demuxer walked (`[start, end)` half-open, where `start` is the
+    /// `movi` LIST body's first chunk-header offset and `end` its body
+    /// end). A base sitting exactly at a segment's `end` is treated as
+    /// outside, matching the half-open `[start, end)` convention used by
+    /// the idx1↔ix## cross-validator.
+    ///
+    /// The check fires for both AVI-1.0-embedded `ix##` (rare) and
+    /// OpenDML multi-segment files; a stream's `ix##` whose base anchors
+    /// inside its segment yields no violation. The validator is purely
+    /// informational — it never affects `open()` and the seek path keeps
+    /// using the verbatim `qwBaseOffset` regardless, so a malformed base
+    /// stays observable rather than being silently rewritten. An empty
+    /// return therefore means "every `ix##` base anchors inside a `movi`
+    /// region", which includes the common case of a file with no
+    /// standard indexes at all.
+    pub fn std_index_base_offset_violations(&self) -> Vec<StdIndexBaseOffsetViolation> {
+        let mut out = Vec::new();
+        // Per-stream running ix## ordinal so `segment_index` counts
+        // across every ix## chunk for that stream in file order
+        // (mirrors `field2_offset_for_packet`'s per-stream walk).
+        let mut seg_per_stream: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        for ix in &self.std_indexes {
+            let stream = match parse_stream_index(&ix.chunk_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let seg = seg_per_stream.entry(stream).or_default();
+            let segment_index = *seg;
+            *seg += 1;
+            let inside_movi = self
+                .movi_segments
+                .iter()
+                .any(|&(start, end)| ix.qw_base_offset >= start && ix.qw_base_offset < end);
+            if !inside_movi {
+                out.push(StdIndexBaseOffsetViolation {
+                    stream_index: stream,
+                    segment_index,
+                    qw_base_offset: ix.qw_base_offset,
+                });
+            }
+        }
+        out
     }
 
     /// OpenDML 2.0 §5.0 `dmlh.dwTotalFrames` (round-9 candidate 3).
