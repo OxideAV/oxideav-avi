@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-avi/compare/v0.0.8...v0.0.9) - 2026-06-15
+
+### Other
+
+- OpenDML super-index dwChunkId indexed-chunk FOURCC accessor (round 312)
+- round-304 OpenDML super-index wLongsPerEntry entry-stride accessor
+- typed avih.dwSuggestedBufferSize accessor (round 298)
+- avih.dwStreams declared stream count + declared-vs-actual cross-check (round 292)
+- idx1 'rec ' LIST entries (AVIIF_LIST) round-trip + offset-base probe hardening (round 285)
+- round-275 avih_movie_rect() typed (dwWidth, dwHeight) accessor
+- typed avih.dwTotalFrames accessor + avi:total_frames metadata key (round 268)
+- typed avih.dwMaxBytesPerSec accessor (round 260)
+- file-global avih.dwMicroSecPerFrame parse + emit (round 256)
+- per-stream strh.fccType parse + emit (round 253)
+- scrub pre-existing tool-naming in demuxer.rs scan_ix_in_movi
+- per-stream (strh.dwScale, strh.dwRate) demux accessor + mux override
+- drop release-plz.toml — use release-plz defaults across the workspace
+- per-stream strh.dwFlags (AVISF_*) demux accessors + mux override
+- OpenDML dmlh.dwTotalFrames override (round 234)
+- per-stream strh.dwLength parse + emit (round 229)
+- per-stream strh.dwSampleSize parse + emit (round 222)
+- per-stream strh.dwSuggestedBufferSize parse + emit (round 217)
+- per-stream strh.fccHandler parse + emit (round 210)
+- per-stream strh.dwStart parse + emit (round 203)
+- OpenDML super-index bIndexSubType surface (round 197)
+
 ### Added
 
 - **OpenDML 2.0 super-index `dwChunkId` indexed-chunk FOURCC accessor
