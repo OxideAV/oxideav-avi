@@ -1456,6 +1456,51 @@ fn open_avi_inner(
         }
     }
 
+    // Round-322: surface an `ix##` standard index whose body `dwChunkId`
+    // declares a *different* stream than the `ix##` chunk's own RIFF
+    // FourCC. Per AVISTDINDEX (`docs/container/riff/avi-riff-file-reference.md`
+    // Appendix G, `dwChunkId` row: *"FOURCC of indexed chunks."*) the
+    // standard-index body's `dwChunkId` names the `movi` data-chunk FourCC
+    // every entry points at, so for a well-formed file its two leading
+    // ASCII digits encode the same stream the `ix##` chunk itself was
+    // emitted for (e.g. an `ix01` chunk indexes `01dc` / `01wb`). When the
+    // two disagree the standard index is cross-wired — its entries resolve
+    // into another stream's chunks — and emitting
+    // `avi:ix.<stream>.<segment>.chunk_id = "<FOURCC>"` lets a downstream
+    // repair tool flag it even though the seek path keeps using the
+    // verbatim `dwChunkId`-derived stream. The canonical own-slot value is
+    // skipped so absence stays observable, mirroring the round-312
+    // super-index `avi:indx.<n>.chunk_id` "default == absent" convention.
+    // The per-segment ordinal counts in file order across every `ix##`
+    // for the stream, matching the `base_outside_movi` key above and the
+    // typed [`AviDemuxer::std_index_chunk_ids`] surface.
+    {
+        let mut seg_per_stream: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        for ix in &std_indexes {
+            let stream = match parse_stream_index(&ix.chunk_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let seg = seg_per_stream.entry(stream).or_default();
+            let segment_index = *seg;
+            *seg += 1;
+            // The `ix##` chunk's own FourCC carries the stream digits at
+            // bytes [2..4] (`ix00` → stream 0); `dwChunkId` carries them
+            // at [0..2] (`00dc` → stream 0). A divergence means the body
+            // declares a different stream than the chunk header.
+            let own_stream = parse_stream_index(&[ix.own_fourcc[2], ix.own_fourcc[3], 0, 0]);
+            if let Some(os) = own_stream {
+                if os != stream {
+                    metadata.push((
+                        format!("avi:ix.{os}.{segment_index}.chunk_id"),
+                        format_fourcc_or_hex(&ix.chunk_id),
+                    ));
+                }
+            }
+        }
+    }
+
     // Round-5 candidate 4: surface a soft-cap warning when a parsed
     // `indx` super-index declared more entries than the conventional
     // 256-slot reserve. Per OpenDML 2.0 §3.0 "Super Index Chunk" the
@@ -3004,7 +3049,7 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
 /// `wLongsPerEntry == 3`. The decoder surfaces the field-2 offset on
 /// [`StdIndexEntry::dw_offset_field2`]; default-subtype entries leave
 /// it at zero.
-fn parse_ix_chunk(body: &[u8]) -> Option<StdIndex> {
+fn parse_ix_chunk(own_fourcc: [u8; 4], body: &[u8]) -> Option<StdIndex> {
     if body.len() < 24 {
         return None;
     }
@@ -3062,6 +3107,7 @@ fn parse_ix_chunk(body: &[u8]) -> Option<StdIndex> {
         });
     }
     Some(StdIndex {
+        own_fourcc,
         chunk_id,
         qw_base_offset,
         b_index_sub_type,
@@ -3097,7 +3143,7 @@ fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
             if hdr.id[0] == b'i' && hdr.id[1] == b'x' {
                 let body = read_body_bounded(r, hdr.size).ok();
                 if let Some(b) = body {
-                    if let Some(idx) = parse_ix_chunk(&b) {
+                    if let Some(idx) = parse_ix_chunk(hdr.id, &b) {
                         out.push(idx);
                     }
                 }
@@ -5759,8 +5805,15 @@ struct StdIndexEntry {
 /// One `ix##` AVISTDINDEX chunk parsed out of a `movi` LIST.
 #[derive(Clone, Debug)]
 struct StdIndex {
-    /// FourCC of indexed chunks (`00dc` etc.). The two ASCII digits at
-    /// `chunk_id[0..2]` give the stream number.
+    /// The `ix##` chunk's own RIFF FourCC (e.g. `ix00` for stream 0).
+    /// Distinct from the body's `dwChunkId`: this is the chunk-header
+    /// FourCC the demuxer found in `movi`, retained so the per-segment
+    /// `dwChunkId` cross-check ([`AviDemuxer::std_index_chunk_ids`]) can
+    /// compare the declared indexed-chunk FourCC against the stream the
+    /// `ix##` chunk itself was emitted for.
+    own_fourcc: [u8; 4],
+    /// FourCC of indexed chunks (`dwChunkId`, e.g. `00dc`). The two ASCII
+    /// digits at `chunk_id[0..2]` give the stream number.
     chunk_id: [u8; 4],
     /// Base offset for `dw_offset` lookups — typically the file offset
     /// of the enclosing `movi` LIST's first chunk header.
@@ -6938,6 +6991,52 @@ impl AviDemuxer {
         for ix in &self.std_indexes {
             match parse_stream_index(&ix.chunk_id) {
                 Some(s) if s == stream_index => out.push(ix.qw_base_offset),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Raw `dwChunkId` FOURCC of every `ix##` standard-index segment for
+    /// a stream, in file order (round-322).
+    ///
+    /// Per AVISTDINDEX (clean-room source:
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix G, the
+    /// `dwChunkId` row: *"FOURCC of indexed chunks."*) and the base
+    /// AVIMETAINDEX in Appendix E (`dwChunkId` row: *"FOURCC of chunks
+    /// indexed (e.g., '00dc')."*), each `ix##` standard-index chunk
+    /// declares which `movi` data-chunk FOURCC its
+    /// `AVISTDINDEX_ENTRY.dwOffset` entries point at. For a well-formed
+    /// AVI 2.0 file it spells the indexed stream's own packet FourCC —
+    /// `00dc` / `00wb` for stream 0, `01dc` / `01wb` for stream 1, and so
+    /// forth — so its two leading ASCII digits encode the same stream
+    /// number the demuxer keyed the `ix##` under (the stream this `Vec`
+    /// is keyed by, matching [`Self::std_index_base_offsets`]). For an
+    /// OpenDML multi-segment file each stream has one `ix##` per `movi`
+    /// segment, so this returns one FOURCC per segment in file order —
+    /// index-aligned with `std_index_base_offsets` for the same stream.
+    ///
+    /// The bytes are surfaced verbatim (no normalisation), so a reader
+    /// can detect a cross-wired / malformed standard index whose declared
+    /// `dwChunkId` points at a *different* stream's chunks than the `ix##`
+    /// FourCC the demuxer keyed it under, *before* trusting the
+    /// `dwOffset`-from-`qwBaseOffset` arithmetic that backs the OpenDML
+    /// seek path. The companion `avi:ix.<n>.<seg>.chunk_id` metadata key
+    /// surfaces the same value as a printable-or-hex string but only when
+    /// it diverges from the canonical own-slot FOURCC; this accessor
+    /// always returns the bytes so a caller can cross-check the canonical
+    /// case too.
+    ///
+    /// Distinct from the super-index `dwChunkId` surfaced via
+    /// [`Self::super_index_chunk_id`] (one per stream, declared once in
+    /// the `strl`) — this is the per-segment standard-index flavour, one
+    /// FOURCC per `ix##` chunk in `movi`. Returns an empty `Vec` for an
+    /// AVI-1.0 / no-`ix##` file or an out-of-range `stream_index`.
+    pub fn std_index_chunk_ids(&self, stream_index: u32) -> Vec<[u8; 4]> {
+        let mut out = Vec::new();
+        for ix in &self.std_indexes {
+            match parse_stream_index(&ix.chunk_id) {
+                Some(s) if s == stream_index => out.push(ix.chunk_id),
                 _ => {}
             }
         }
@@ -8540,7 +8639,8 @@ mod tests {
         body.extend_from_slice(&0x300u32.to_le_bytes());
         body.extend_from_slice(&((512u32) | 0x8000_0000).to_le_bytes());
 
-        let parsed = parse_ix_chunk(&body).unwrap();
+        let parsed = parse_ix_chunk(*b"ix00", &body).unwrap();
+        assert_eq!(&parsed.own_fourcc, b"ix00");
         assert_eq!(&parsed.chunk_id, b"00dc");
         assert_eq!(parsed.qw_base_offset, 0x1000);
         assert_eq!(parsed.b_index_sub_type, 0);
@@ -8572,7 +8672,7 @@ mod tests {
         body.extend_from_slice(&1024u32.to_le_bytes()); // dwSize (whole frame)
         body.extend_from_slice(&0x80u32.to_le_bytes()); // dwOffsetField2
 
-        let parsed = parse_ix_chunk(&body).expect("2-field index must parse");
+        let parsed = parse_ix_chunk(*b"ix00", &body).expect("2-field index must parse");
         assert_eq!(parsed.b_index_sub_type, AVI_INDEX_SUB_2FIELD);
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].dw_offset, 0x40);
