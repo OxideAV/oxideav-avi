@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- per-segment `ix##` AVISTDINDEX `nEntriesInUse` declared entry-count accessor + truncation cross-check validator + divergence metadata key; `parse_ix_chunk` now tolerates a truncated entry table instead of discarding the whole chunk (round 325)
 - per-segment `ix##` AVISTDINDEX `dwChunkId` FOURCC accessor + cross-wiring divergence metadata key (round 322)
 - per-stream `ix##` AVISTDINDEX `qwBaseOffset` accessor + `movi`-region cross-check validator (round 317)
 

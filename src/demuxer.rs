@@ -1501,6 +1501,42 @@ fn open_avi_inner(
         }
     }
 
+    // Round-325: surface an `ix##` standard index whose declared
+    // `nEntriesInUse` exceeds the number of entries the demuxer could
+    // physically parse from its (truncated) body. Per AVISTDINDEX
+    // (`docs/container/riff/avi-riff-file-reference.md` Appendix G / the
+    // base AVIMETAINDEX in Appendix E, `nEntriesInUse` row: *"Number of
+    // valid entries in adwIndex."*) a well-formed chunk holds exactly
+    // `nEntriesInUse` entries; a truncated capture crash-dump can stamp a
+    // larger count. The demuxer keeps the entries it could read and emits
+    // `avi:ix.<stream>.<segment>.declared_entries = "<declared>/<parsed>"`
+    // so a downstream repair tool can flag the loss even though seek limps
+    // along on the entries that survived. The well-formed (declared ==
+    // parsed) case emits no key, so absence stays observable, mirroring the
+    // "default == absent" convention across the other `avi:ix.*` keys.
+    // Mirrors the typed
+    // [`AviDemuxer::std_index_entry_count_violations`] surface.
+    {
+        let mut seg_per_stream: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        for ix in &std_indexes {
+            let stream = match parse_stream_index(&ix.chunk_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let seg = seg_per_stream.entry(stream).or_default();
+            let segment_index = *seg;
+            *seg += 1;
+            let parsed = ix.entries.len() as u32;
+            if ix.declared_n_entries > parsed {
+                metadata.push((
+                    format!("avi:ix.{stream}.{segment_index}.declared_entries"),
+                    format!("{}/{}", ix.declared_n_entries, parsed),
+                ));
+            }
+        }
+    }
+
     // Round-5 candidate 4: surface a soft-cap warning when a parsed
     // `indx` super-index declared more entries than the conventional
     // 256-slot reserve. Per OpenDML 2.0 §3.0 "Super Index Chunk" the
@@ -3065,19 +3101,28 @@ fn parse_ix_chunk(own_fourcc: [u8; 4], body: &[u8]) -> Option<StdIndex> {
         3 if b_index_sub_type == AVI_INDEX_SUB_2FIELD => 12usize,
         _ => return None,
     };
-    let n_entries_in_use = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let declared_n_entries = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    let n_entries_in_use = declared_n_entries as usize;
     let mut chunk_id = [0u8; 4];
     chunk_id.copy_from_slice(&body[8..12]);
     let qw_base_offset = u64::from_le_bytes([
         body[12], body[13], body[14], body[15], body[16], body[17], body[18], body[19],
     ]);
-    let entries_byte_len = n_entries_in_use.saturating_mul(entry_size);
-    let need = 24usize.saturating_add(entries_byte_len);
-    if body.len() < need {
-        return None;
-    }
-    let mut entries = Vec::with_capacity(n_entries_in_use);
-    for i in 0..n_entries_in_use {
+    // Round-325: tolerate a truncated entry table rather than discarding
+    // the whole `ix##` chunk. The 24-byte AVISTDINDEX header (already
+    // validated above) carries the declared `nEntriesInUse` regardless of
+    // how many entries actually fit in the body, so we parse as many
+    // complete entries as the body holds and retain `declared_n_entries`
+    // verbatim. A short-read leaves `entries.len() < declared_n_entries`,
+    // which [`AviDemuxer::std_index_entry_count_violations`] surfaces as a
+    // truncation cross-check — the previous behaviour silently dropped the
+    // chunk and lost the declared count entirely. The seek path only ever
+    // dereferences the entries it actually parsed, so a partial table stays
+    // safe.
+    let available_entries = body.len().saturating_sub(24) / entry_size;
+    let parse_count = n_entries_in_use.min(available_entries);
+    let mut entries = Vec::with_capacity(parse_count);
+    for i in 0..parse_count {
         let base = 24 + i * entry_size;
         let dw_offset =
             u32::from_le_bytes([body[base], body[base + 1], body[base + 2], body[base + 3]]);
@@ -3111,6 +3156,7 @@ fn parse_ix_chunk(own_fourcc: [u8; 4], body: &[u8]) -> Option<StdIndex> {
         chunk_id,
         qw_base_offset,
         b_index_sub_type,
+        declared_n_entries,
         entries,
     })
 }
@@ -3344,6 +3390,38 @@ pub struct StdIndexBaseOffsetViolation {
     /// The chunk's verbatim `qwBaseOffset` that landed outside every
     /// `movi` LIST region.
     pub qw_base_offset: u64,
+}
+
+/// One truncated `ix##` standard-index chunk surfaced by
+/// [`AviDemuxer::std_index_entry_count_violations`] (round-325).
+///
+/// Per AVISTDINDEX (clean-room source:
+/// `docs/container/riff/avi-riff-file-reference.md` Appendix G / the base
+/// AVIMETAINDEX in Appendix E) the `nEntriesInUse` DWORD declares how many
+/// `AVISTDINDEX_ENTRY` records the `ix##` chunk holds. A well-formed chunk
+/// carries exactly that many 8- (or 12-byte 2-field) entries; a truncated
+/// capture crash-dump or hand-edited file can stamp `nEntriesInUse = N`
+/// while the chunk body only physically contains `M < N` entries. The
+/// demuxer parses the `M` entries it can read and reports the
+/// `(declared, parsed)` pair here so a downstream repair tool can detect
+/// the loss. Informational only — never fails `open()`, and the OpenDML
+/// seek path uses just the entries it actually parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StdIndexEntryCountViolation {
+    /// Stream number (from the two ASCII digits of the `ix##` chunk's
+    /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
+    pub stream_index: u32,
+    /// Zero-based position of the offending `ix##` chunk within that
+    /// stream's standard indexes, counted in file order (one `ix##` per
+    /// `(stream, movi segment)` pair for OpenDML files). Matches the
+    /// `segment_index` of [`StdIndexBaseOffsetViolation`].
+    pub segment_index: usize,
+    /// The chunk header's verbatim `nEntriesInUse`.
+    pub declared_entries: u32,
+    /// The number of complete entries the demuxer could physically read
+    /// from the (truncated) body. Always `< declared_entries` for a
+    /// reported violation.
+    pub parsed_entries: u32,
 }
 
 /// 8-tuple returned by [`build_stream`]: the [`StreamInfo`], the
@@ -5822,6 +5900,14 @@ struct StdIndex {
     /// `AVI_INDEX_SUB_2FIELD` (2-field interlaced).
     #[allow(dead_code)]
     b_index_sub_type: u8,
+    /// `nEntriesInUse`: the entry count the `ix##` chunk *declares* in its
+    /// header, retained verbatim even when the body is truncated and fewer
+    /// entries were actually parseable. `entries.len()` is the number the
+    /// demuxer could physically read; the two disagree only for a
+    /// truncated standard index (round-325 — surfaced via
+    /// [`AviDemuxer::std_index_declared_entry_counts`] and
+    /// [`AviDemuxer::std_index_entry_count_violations`]).
+    declared_n_entries: u32,
     entries: Vec<StdIndexEntry>,
 }
 
@@ -7091,6 +7177,83 @@ impl AviDemuxer {
                     stream_index: stream,
                     segment_index,
                     qw_base_offset: ix.qw_base_offset,
+                });
+            }
+        }
+        out
+    }
+
+    /// Raw `nEntriesInUse` declared by every `ix##` standard-index segment
+    /// for a stream, in file order (round-325).
+    ///
+    /// Per AVISTDINDEX (clean-room source:
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix G) and the
+    /// base AVIMETAINDEX in Appendix E (`nEntriesInUse` row: *"Number of
+    /// valid entries in adwIndex."*), this DWORD declares how many
+    /// `AVISTDINDEX_ENTRY` records the standard-index chunk holds. The
+    /// value is surfaced verbatim from the chunk header, so for a truncated
+    /// chunk it can exceed the number of entries the demuxer actually
+    /// parsed (compare against [`Self::std_index_entry_count_violations`]).
+    ///
+    /// For an OpenDML multi-segment file each stream has one `ix##` per
+    /// `movi` segment, so this returns one count per segment in file order —
+    /// index-aligned with [`Self::std_index_base_offsets`] and
+    /// [`Self::std_index_chunk_ids`] for the same stream. Returns an empty
+    /// `Vec` for an AVI-1.0 / no-`ix##` file or an out-of-range
+    /// `stream_index`.
+    pub fn std_index_declared_entry_counts(&self, stream_index: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for ix in &self.std_indexes {
+            match parse_stream_index(&ix.chunk_id) {
+                Some(s) if s == stream_index => out.push(ix.declared_n_entries),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Cross-check each `ix##` standard-index's declared `nEntriesInUse`
+    /// against the number of entries the demuxer could physically parse
+    /// (round-325).
+    ///
+    /// Per AVISTDINDEX (Appendix G / the base AVIMETAINDEX in Appendix E,
+    /// `nEntriesInUse` row: *"Number of valid entries in adwIndex."*) a
+    /// well-formed `ix##` chunk body holds exactly `nEntriesInUse` entries
+    /// (8 bytes each, or 12 for an `AVI_INDEX_SUB_2FIELD` field index). A
+    /// truncated capture crash-dump or hand-edited file can stamp a larger
+    /// `nEntriesInUse` than the body physically contains; the demuxer
+    /// parses the entries it can read (rather than discarding the whole
+    /// chunk) and returns one [`StdIndexEntryCountViolation`] per `ix##`
+    /// whose declared count exceeds the parsed count.
+    ///
+    /// The check is purely informational — it never affects `open()` and
+    /// the seek path resolves chunk positions only from the entries that
+    /// were actually parsed, so a truncated standard index stays usable for
+    /// the data it does cover while the loss stays observable. An empty
+    /// return means every `ix##` carried as many entries as it declared,
+    /// which includes the common case of a file with no standard indexes at
+    /// all. The companion `avi:ix.<stream>.<segment>.declared_entries`
+    /// metadata key surfaces the same divergence as a string, omitting the
+    /// well-formed case so absence stays observable.
+    pub fn std_index_entry_count_violations(&self) -> Vec<StdIndexEntryCountViolation> {
+        let mut out = Vec::new();
+        let mut seg_per_stream: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        for ix in &self.std_indexes {
+            let stream = match parse_stream_index(&ix.chunk_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let seg = seg_per_stream.entry(stream).or_default();
+            let segment_index = *seg;
+            *seg += 1;
+            let parsed = ix.entries.len() as u32;
+            if ix.declared_n_entries > parsed {
+                out.push(StdIndexEntryCountViolation {
+                    stream_index: stream,
+                    segment_index,
+                    declared_entries: ix.declared_n_entries,
+                    parsed_entries: parsed,
                 });
             }
         }
