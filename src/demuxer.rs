@@ -759,10 +759,25 @@ fn open_avi_inner(
             format!("{prefix}.video_format_token"),
             vp.video_format_token.to_string(),
         ));
+        // Named label for the four documented non-`UNKNOWN` format
+        // tokens (OpenDML 2.0 §5.0 `VIDEO_FORMAT`). Emitted only when
+        // the raw DWORD decodes to a recognised PAL/NTSC token —
+        // `FORMAT_UNKNOWN` and any out-of-range vendor / future ordinal
+        // omit the key so absence stays observable, per the
+        // "default == absent" convention.
+        if let Some(label) = VprpVideoFormat::from_raw(vp.video_format_token).label() {
+            metadata.push((format!("{prefix}.video_format_label"), label.to_string()));
+        }
         metadata.push((
             format!("{prefix}.video_standard"),
             vp.video_standard.to_string(),
         ));
+        // Named label for the three documented non-`UNKNOWN` standards
+        // (OpenDML 2.0 §5.0 `VIDEO_STANDARD`). Same "default == absent"
+        // gating as the format label above.
+        if let Some(label) = VprpVideoStandard::from_raw(vp.video_standard).label() {
+            metadata.push((format!("{prefix}.video_standard_label"), label.to_string()));
+        }
         if vp.vertical_refresh_rate > 0 {
             metadata.push((
                 format!("{prefix}.vertical_refresh_rate"),
@@ -5804,6 +5819,149 @@ impl<'a> Iterator for TextChunkTypedIter<'a> {
 
 impl<'a> ExactSizeIterator for TextChunkTypedIter<'a> {}
 
+/// Decoded `vprp.VideoFormatToken` per OpenDML 2.0 §5.0 *"Video Format
+/// Token"* — the `VIDEO_FORMAT` enum.
+///
+/// The spec enumerates `{FORMAT_UNKNOWN, FORMAT_PAL_SQUARE,
+/// FORMAT_PAL_CCIR_601, FORMAT_NTSC_SQUARE, FORMAT_NTSC_CCIR_601, ...}`
+/// as a C enum, so the on-disk DWORD carries the ordinal value
+/// `0..=4` for the five documented tokens. The token *"indicates that
+/// a known standard is defined for the following data fields"* — when
+/// it names one of the four square-pixel / CCIR-601 PAL/NTSC tokens
+/// the refresh-rate / H-total / V-total / aspect fields are expected
+/// to hold that standard's values; `FORMAT_UNKNOWN` means *"the fields
+/// may contain special values"*.
+///
+/// The trailing `...` in the spec's enum leaves room for vendor /
+/// future tokens, so any ordinal outside `0..=4` is surfaced verbatim
+/// via [`Self::Other`] rather than rejected — the raw DWORD stays
+/// observable through [`AviDemuxer::vprp_video_format`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum VprpVideoFormat {
+    /// `FORMAT_UNKNOWN` (0) — the data fields may hold special values.
+    Unknown,
+    /// `FORMAT_PAL_SQUARE` (1) — PAL square-pixel.
+    PalSquare,
+    /// `FORMAT_PAL_CCIR_601` (2) — PAL CCIR 601.
+    PalCcir601,
+    /// `FORMAT_NTSC_SQUARE` (3) — NTSC square-pixel.
+    NtscSquare,
+    /// `FORMAT_NTSC_CCIR_601` (4) — NTSC CCIR 601.
+    NtscCcir601,
+    /// An ordinal outside the five documented tokens (the spec's enum
+    /// ends in `...`). The raw DWORD is preserved verbatim.
+    Other(u32),
+}
+
+impl VprpVideoFormat {
+    /// Decode a raw `VideoFormatToken` DWORD into the named token.
+    pub const fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Unknown,
+            1 => Self::PalSquare,
+            2 => Self::PalCcir601,
+            3 => Self::NtscSquare,
+            4 => Self::NtscCcir601,
+            other => Self::Other(other),
+        }
+    }
+
+    /// The raw `VideoFormatToken` DWORD this token encodes to on disk.
+    pub const fn to_raw(self) -> u32 {
+        match self {
+            Self::Unknown => 0,
+            Self::PalSquare => 1,
+            Self::PalCcir601 => 2,
+            Self::NtscSquare => 3,
+            Self::NtscCcir601 => 4,
+            Self::Other(other) => other,
+        }
+    }
+
+    /// Stable lower-case label for the four documented non-`UNKNOWN`
+    /// tokens (`pal_square` / `pal_ccir_601` / `ntsc_square` /
+    /// `ntsc_ccir_601`), or `None` for `FORMAT_UNKNOWN` and any
+    /// out-of-range [`Self::Other`]. Drives the
+    /// `avi:vprp.<n>.video_format_label` metadata key, which is omitted
+    /// for the `UNKNOWN`/unrecognised cases so absence stays observable.
+    pub const fn label(self) -> Option<&'static str> {
+        match self {
+            Self::PalSquare => Some("pal_square"),
+            Self::PalCcir601 => Some("pal_ccir_601"),
+            Self::NtscSquare => Some("ntsc_square"),
+            Self::NtscCcir601 => Some("ntsc_ccir_601"),
+            Self::Unknown | Self::Other(_) => None,
+        }
+    }
+}
+
+/// Decoded `vprp.VideoStandard` per OpenDML 2.0 §5.0 *"Video Standard"*
+/// — the `VIDEO_STANDARD` enum.
+///
+/// The spec defines `{STANDARD_UNKNOWN, STANDARD_PAL, STANDARD_NTSC,
+/// STANDARD_SECAM}` as a closed C enum (no trailing `...`), so the
+/// on-disk DWORD is the ordinal `0..=3`. The standard *"implicitly
+/// defines vertical refresh rate"* (60 Hz NTSC, 50 Hz PAL) — when
+/// `STANDARD_UNKNOWN` is stamped the `dwVerticalRefreshRate` field
+/// carries the explicit rate instead.
+///
+/// Because the spec's enum is closed, an ordinal outside `0..=3` is a
+/// malformed / vendor value and is surfaced verbatim via
+/// [`Self::Other`] rather than rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum VprpVideoStandard {
+    /// `STANDARD_UNKNOWN` (0) — refresh rate is carried explicitly.
+    Unknown,
+    /// `STANDARD_PAL` (1).
+    Pal,
+    /// `STANDARD_NTSC` (2).
+    Ntsc,
+    /// `STANDARD_SECAM` (3).
+    Secam,
+    /// An ordinal outside the four documented standards.
+    Other(u32),
+}
+
+impl VprpVideoStandard {
+    /// Decode a raw `VideoStandard` DWORD into the named standard.
+    pub const fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Unknown,
+            1 => Self::Pal,
+            2 => Self::Ntsc,
+            3 => Self::Secam,
+            other => Self::Other(other),
+        }
+    }
+
+    /// The raw `VideoStandard` DWORD this standard encodes to on disk.
+    pub const fn to_raw(self) -> u32 {
+        match self {
+            Self::Unknown => 0,
+            Self::Pal => 1,
+            Self::Ntsc => 2,
+            Self::Secam => 3,
+            Self::Other(other) => other,
+        }
+    }
+
+    /// Stable lower-case label for the three documented non-`UNKNOWN`
+    /// standards (`pal` / `ntsc` / `secam`), or `None` for
+    /// `STANDARD_UNKNOWN` and any out-of-range [`Self::Other`]. Drives
+    /// the `avi:vprp.<n>.video_standard_label` metadata key, omitted for
+    /// the `UNKNOWN`/unrecognised cases so absence stays observable.
+    pub const fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Pal => Some("pal"),
+            Self::Ntsc => Some("ntsc"),
+            Self::Secam => Some("secam"),
+            Self::Unknown | Self::Other(_) => None,
+        }
+    }
+}
+
 /// Decoded `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
 ///
 /// The 9 fixed DWORDs at the start of a `vprp` body, plus the
@@ -7712,6 +7870,62 @@ impl AviDemuxer {
         let x = (vp.frame_aspect_ratio >> 16) as u16;
         let y = (vp.frame_aspect_ratio & 0xFFFF) as u16;
         Some((x, y))
+    }
+
+    /// Round-336: per-stream `vprp.VideoFormatToken`, decoded.
+    ///
+    /// Returns the OpenDML 2.0 §5.0 *"Video Format Token"*
+    /// (`VideoFormatToken`) decoded into the named [`VprpVideoFormat`]
+    /// enum — `FORMAT_UNKNOWN` / `FORMAT_PAL_SQUARE` /
+    /// `FORMAT_PAL_CCIR_601` / `FORMAT_NTSC_SQUARE` /
+    /// `FORMAT_NTSC_CCIR_601`, with any out-of-range ordinal preserved
+    /// verbatim as [`VprpVideoFormat::Other`] (the spec's enum ends in
+    /// `...`, leaving room for vendor / future tokens). This is the
+    /// typed companion to the `avi:vprp.<index>.video_format_token`
+    /// (raw decimal) and `avi:vprp.<index>.video_format_label` (named,
+    /// recognised tokens only) metadata keys; callers branching on the
+    /// signal format get the named variant without parsing a string.
+    ///
+    /// Returns `None` only when the stream carries no `vprp` chunk
+    /// (presence gated on `nbFieldPerFrame > 0`, matching the metadata
+    /// surface). A genuinely-present `vprp` whose token is `0` decodes
+    /// to `Some(VprpVideoFormat::Unknown)` — distinct from "no vprp" —
+    /// because `FORMAT_UNKNOWN` is itself a meaningful documented token
+    /// (the data fields then carry explicit values), unlike the
+    /// "default == absent" `0` sentinels on the raw avih/strh accessors.
+    pub fn vprp_video_format(&self, stream_index: u32) -> Option<VprpVideoFormat> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 {
+            return None;
+        }
+        Some(VprpVideoFormat::from_raw(vp.video_format_token))
+    }
+
+    /// Round-336: per-stream `vprp.VideoStandard`, decoded.
+    ///
+    /// Returns the OpenDML 2.0 §5.0 *"Video Standard"* (`VideoStandard`)
+    /// decoded into the named [`VprpVideoStandard`] enum —
+    /// `STANDARD_UNKNOWN` / `STANDARD_PAL` / `STANDARD_NTSC` /
+    /// `STANDARD_SECAM`, with any out-of-range ordinal preserved as
+    /// [`VprpVideoStandard::Other`] (the spec's enum is closed, so a
+    /// stray ordinal is a malformed / vendor value). The standard
+    /// *"implicitly defines vertical refresh rate"* per §5.0 — pair this
+    /// with [`Self::vprp_video_format`] and the
+    /// `avi:vprp.<index>.vertical_refresh_rate` metadata key to recover
+    /// the full signal description. Typed companion to the
+    /// `avi:vprp.<index>.video_standard` (raw) and
+    /// `avi:vprp.<index>.video_standard_label` (named) metadata keys.
+    ///
+    /// Returns `None` only when the stream carries no `vprp` chunk; a
+    /// present `vprp` with standard `0` decodes to
+    /// `Some(VprpVideoStandard::Unknown)`, matching the
+    /// [`Self::vprp_video_format`] presence semantics.
+    pub fn vprp_video_standard(&self, stream_index: u32) -> Option<VprpVideoStandard> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 {
+            return None;
+        }
+        Some(VprpVideoStandard::from_raw(vp.video_standard))
     }
 
     /// Round-19 candidate 1: per-video-stream top-down DIB flag.

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- typed `vprp` `VideoFormatToken` / `VideoStandard` decoders: `vprp_video_format(stream) -> Option<VprpVideoFormat>` (`VIDEO_FORMAT`: Unknown/PalSquare/PalCcir601/NtscSquare/NtscCcir601 + `Other(u32)`) and `vprp_video_standard(stream) -> Option<VprpVideoStandard>` (`VIDEO_STANDARD`: Unknown/Pal/Ntsc/Secam + `Other(u32)`), each with `from_raw`/`to_raw`/`label` const methods, plus named-label metadata keys `avi:vprp.<n>.video_format_label` / `.video_standard_label` (recognised non-UNKNOWN values only) (round 336)
 - file-global `avih.dwReserved[4]` trailing reserved-array accessor (`avih_reserved() -> Option<[u32; 4]>`) + `avi:reserved` hex metadata key; surfaces only a non-conformant non-zero reserved slot, all-zero / short-body ⇒ `None` (round 330)
 - per-segment `ix##` AVISTDINDEX `nEntriesInUse` declared entry-count accessor + truncation cross-check validator + divergence metadata key; `parse_ix_chunk` now tolerates a truncated entry table instead of discarding the whole chunk (round 325)
 - per-segment `ix##` AVISTDINDEX `dwChunkId` FOURCC accessor + cross-wiring divergence metadata key (round 322)
