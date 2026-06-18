@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- file-global `avih.dwReserved[4]` trailing reserved-array accessor (`avih_reserved() -> Option<[u32; 4]>`) + `avi:reserved` hex metadata key; surfaces only a non-conformant non-zero reserved slot, all-zero / short-body ⇒ `None` (round 330)
 - per-segment `ix##` AVISTDINDEX `nEntriesInUse` declared entry-count accessor + truncation cross-check validator + divergence metadata key; `parse_ix_chunk` now tolerates a truncated entry table instead of discarding the whole chunk (round 325)
 - per-segment `ix##` AVISTDINDEX `dwChunkId` FOURCC accessor + cross-wiring divergence metadata key (round 322)
 - per-stream `ix##` AVISTDINDEX `qwBaseOffset` accessor + `movi`-region cross-check validator (round 317)

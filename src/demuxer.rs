@@ -677,6 +677,27 @@ fn open_avi_inner(
         if h.total_frames > 0 {
             metadata.push(("avi:total_frames".into(), h.total_frames.to_string()));
         }
+        // Round-330: surface the file-global `avih.dwReserved[4]` array
+        // (offsets 40..56 of the 56-byte body) whenever any of the four
+        // trailing DWORDs is non-zero. Per AVI 1.0 §"AVIMAINHEADER"
+        // (line 205): *"Reserved. Set this array to zero."* A
+        // spec-conformant writer leaves all four `0`, so the key is
+        // emitted only for a non-conformant header — a hand-edited /
+        // capture-card / vendor-extended file that stamped data into the
+        // reserved slot — keeping the spec-default absence observable,
+        // mirroring the `avi:padding_granularity` / `avi:initial_frames`
+        // / `avi:total_frames` conventions. The value is the four DWORDs
+        // rendered as comma-joined lower-case `0x`-prefixed hex in array
+        // order, e.g. `"0x00000000,0xDEADBEEF,0x00000000,0x00000000"`.
+        if h.reserved.iter().any(|&w| w != 0) {
+            let joined = h
+                .reserved
+                .iter()
+                .map(|w| format!("0x{w:08X}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            metadata.push(("avi:reserved".into(), joined));
+        }
     }
     // Truncated-head signal: capture-card crash dumps, copy-aborted
     // recordings. The demuxer is best-effort for this case (see
@@ -1945,6 +1966,7 @@ fn open_avi_inner(
         avih_streams: avih.as_ref().map(|h| h.streams).unwrap_or(0),
         avih_width: avih.as_ref().map(|h| h.width).unwrap_or(0),
         avih_height: avih.as_ref().map(|h| h.height).unwrap_or(0),
+        avih_reserved: avih.as_ref().map(|h| h.reserved).unwrap_or([0; 4]),
         vprps,
         dmlh_total_frames,
         palette_change_data,
@@ -2266,6 +2288,17 @@ struct AviMainHeader {
     /// sentinel) means "no alignment guarantee" — files predating the
     /// stream-aligned remux path leave this 0.
     padding_granularity: u32,
+    /// `dwReserved[4]` per AVI 1.0 §"AVIMAINHEADER" (offsets 40..56 of
+    /// the 56-byte body). Round-330: the spec pins this trailing array
+    /// as *"Reserved. Set this array to zero."* A spec-conformant
+    /// writer leaves all four DWORDs `0`; this field captures whatever
+    /// the file actually stamped so
+    /// [`AviDemuxer::avih_reserved`] can surface a non-conformant
+    /// writer (a hand-edited / capture-card / vendor-extended header
+    /// that smuggled data into the reserved slot) for forensic / repair
+    /// callers. Defaults to `[0; 4]` for a short (`< 56`-byte) body so
+    /// an absent array reads the same as the conformant all-zero one.
+    reserved: [u32; 4],
 }
 
 /// Parse the AVIMAINHEADER body (should be 56 bytes).
@@ -2285,6 +2318,21 @@ fn parse_avih(buf: &[u8]) -> Result<AviMainHeader> {
         suggested_buffer_size: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
         width: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
         height: u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
+        // dwReserved[4] (offsets 40..56) — round-330. Read only when
+        // the body is the full 56 bytes; a short body (some capture-card
+        // crash dumps stamp a truncated 40-byte avih) leaves the array
+        // all-zero, matching the spec-conformant default so an absent
+        // array is indistinguishable from a zeroed one.
+        reserved: if buf.len() >= 56 {
+            [
+                u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
+                u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]),
+                u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]),
+                u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]),
+            ]
+        } else {
+            [0; 4]
+        },
     })
 }
 
@@ -4741,6 +4789,16 @@ pub struct AviDemuxer {
     /// sentinel mapped to `None`. Already surfaced as `avi:height`
     /// metadata.
     avih_height: u32,
+    /// Raw `dwReserved[4]` from `AVIMAINHEADER` (round-330). The four
+    /// trailing DWORDs at byte offsets 40..56 of the 56-byte
+    /// AVIMAINHEADER body. Per AVI 1.0 §"AVIMAINHEADER"
+    /// (`docs/container/riff/avi-riff-file-reference.md`, Appendix A
+    /// `dwReserved` row, line 205): *"Reserved. Set this array to
+    /// zero."* Captured so [`AviDemuxer::avih_reserved`] can hand back
+    /// the verbatim array, mapping the spec-conformant all-zero default
+    /// to `None`. Also surfaced as the `avi:reserved` metadata key when
+    /// any DWORD is non-zero.
+    avih_reserved: [u32; 4],
     /// Per-stream parsed `vprp` Video Properties Header (round-9
     /// candidate 1). Indexed by stream number; default-initialised
     /// for streams that didn't carry a `vprp` chunk. Retained on the
@@ -6951,6 +7009,42 @@ impl AviDemuxer {
             None
         } else {
             Some((self.avih_width, self.avih_height))
+        }
+    }
+
+    /// `AVIMAINHEADER.dwReserved[4]` trailing reserved array per AVI 1.0
+    /// §"AVIMAINHEADER" (round-330).
+    ///
+    /// Returns the four trailing DWORDs from byte offsets 40..56 of the
+    /// 56-byte AVIMAINHEADER body verbatim, or `None` when the array is
+    /// the spec-conformant all-zero default. Per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix A
+    /// (`dwReserved` row): *"Reserved. Set this array to zero."*
+    ///
+    /// A spec-conformant writer leaves all four DWORDs `0`, so this
+    /// accessor returns `None` for every well-formed file. It returns
+    /// `Some([w0, w1, w2, w3])` only for a non-conformant header — a
+    /// hand-edited / capture-card / vendor-extended AVI that smuggled
+    /// data into the reserved slot — which lets a forensic / repair tool
+    /// detect (and, if it chooses, scrub) the stray bytes before
+    /// trusting the header. The whole array is returned even when only
+    /// one DWORD is non-zero, so the caller sees the exact on-disk
+    /// pattern.
+    ///
+    /// A short (`< 56`-byte) `avih` body — some truncated capture
+    /// crash dumps stamp only the first 40 bytes — yields the all-zero
+    /// default and therefore `None`, so an absent reserved array reads
+    /// the same as a zeroed one. This mirrors the "default == absent"
+    /// convention used across the sibling `avih` accessors
+    /// ([`Self::micro_sec_per_frame`], [`Self::avih_total_frames`],
+    /// [`Self::initial_frames`]). The same data also surfaces under the
+    /// `avi:reserved` metadata key (comma-joined `0x`-hex), emitted only
+    /// when any DWORD is non-zero.
+    pub fn avih_reserved(&self) -> Option<[u32; 4]> {
+        if self.avih_reserved.iter().all(|&w| w == 0) {
+            None
+        } else {
+            Some(self.avih_reserved)
         }
     }
 
