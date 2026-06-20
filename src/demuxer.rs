@@ -1981,6 +1981,51 @@ fn open_avi_inner(
         }
     }
 
+    // Per-stream, per-packet-ordinal keyframe vector for the public
+    // `packet_is_keyframe` accessor. Unifies both index forms, picking
+    // the one with COMPLETE per-stream coverage:
+    //
+    //   * `ix##` standard indexes span every `movi` segment (primary +
+    //     `RIFF AVIX` continuations), so for any stream that declares
+    //     `ix##` entries they are the authoritative full-file sequence.
+    //   * `idx1` only ever covers the PRIMARY segment (its offsets are
+    //     32-bit `movi`-relative), so in a multi-segment OpenDML file
+    //     it would under-count. It IS the right source for legacy AVI
+    //     1.0 files (no `ix##`).
+    //
+    // We therefore build each stream's vector from its `ix##` entries
+    // when present (file order is guaranteed: `std_indexes` is populated
+    // by a forward scan over every segment), and fall back to `idx1`
+    // (also file-ordered) only for streams with no `ix##`. Empty for a
+    // stream with neither — the accessor then returns `None`.
+    let mut ix_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
+    for ix in &std_indexes {
+        if let Some(s) = parse_stream_index(&ix.chunk_id) {
+            let s = s as usize;
+            if s < ix_per_stream.len() {
+                for e in &ix.entries {
+                    ix_per_stream[s].push(e.is_keyframe);
+                }
+            }
+        }
+    }
+    let mut idx1_kf_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
+    for e in &idx_table {
+        let s = e.stream as usize;
+        if s < idx1_kf_per_stream.len() {
+            idx1_kf_per_stream[s].push((e.flags & AVIIF_KEYFRAME) != 0);
+        }
+    }
+    let keyframe_per_stream: Vec<Vec<bool>> = (0..streams.len())
+        .map(|s| {
+            if !ix_per_stream[s].is_empty() {
+                std::mem::take(&mut ix_per_stream[s])
+            } else {
+                std::mem::take(&mut idx1_kf_per_stream[s])
+            }
+        })
+        .collect();
+
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
@@ -2038,6 +2083,7 @@ fn open_avi_inner(
         digitization_date,
         smpte_timecode,
         keyframe_by_offset,
+        keyframe_per_stream,
     })
 }
 
@@ -5215,6 +5261,13 @@ pub struct AviDemuxer {
     /// correct for the all-intra / uncompressed streams that are the
     /// only ones a no-index AVI 1.0 file can describe randomly).
     keyframe_by_offset: std::collections::HashMap<u64, bool>,
+    /// Per-stream keyframe flags in packet order, unifying idx1 and
+    /// `ix##`. Outer index is `stream_index`, inner index is the
+    /// zero-based packet ordinal `next_packet` assigns. Backs the
+    /// public [`AviDemuxer::packet_is_keyframe`] accessor so a caller
+    /// building a seek-point table doesn't have to walk every packet.
+    /// Empty for streams the file carries no per-chunk index for.
+    keyframe_per_stream: Vec<Vec<bool>>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -7324,6 +7377,46 @@ impl AviDemuxer {
     ) -> Option<Idx1Flags> {
         self.idx1_flags_for_packet(stream_index, packet_seq)
             .map(Idx1Flags::from_bits)
+    }
+
+    /// Whether the `packet_seq`-th packet of `stream_index` is a
+    /// keyframe (random-access point), unifying both AVI index forms.
+    ///
+    /// Unlike [`Self::idx1_flags_for_packet`] (which only answers for
+    /// files that carry an `idx1`), this accessor draws the keyframe
+    /// bit from whichever per-chunk index the file has: the `idx1`
+    /// `AVIIF_KEYFRAME` flag when present, else the OpenDML `ix##`
+    /// (`AVISTDINDEX`) `dwSize` delta high bit — the latter being the
+    /// ONLY keyframe source for packets in `RIFF AVIX` continuation
+    /// segments, which `idx1` does not cover. The value is exactly the
+    /// flag [`Demuxer::next_packet`](oxideav_core::Demuxer::next_packet)
+    /// stamps on the matching packet, so a caller can build a
+    /// seek-point table without iterating the whole file.
+    ///
+    /// `packet_seq` is the zero-based packet ordinal in stream-local
+    /// order (the same ordering `next_packet` returns packets for that
+    /// stream). Returns `None` for an out-of-range `stream_index`, a
+    /// `packet_seq` past the indexed packet count, or a stream the file
+    /// carries no per-chunk index for (e.g. an `idx1`-less AVI 1.0 file
+    /// — every emitted packet is then treated as a keyframe by
+    /// `next_packet`, but there is no recorded flag to report here).
+    pub fn packet_is_keyframe(&self, stream_index: u32, packet_seq: usize) -> Option<bool> {
+        self.keyframe_per_stream
+            .get(stream_index as usize)
+            .and_then(|v| v.get(packet_seq))
+            .copied()
+    }
+
+    /// Number of packets of `stream_index` that carry a recorded
+    /// per-chunk keyframe flag (idx1 or `ix##`), i.e. the valid
+    /// `packet_seq` range `0..n` for [`Self::packet_is_keyframe`].
+    ///
+    /// Zero for a stream the file carries no per-chunk index for.
+    pub fn keyframe_indexed_packet_count(&self, stream_index: u32) -> usize {
+        self.keyframe_per_stream
+            .get(stream_index as usize)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// `rec ` LIST entries recorded in idx1, in file order (round-285).

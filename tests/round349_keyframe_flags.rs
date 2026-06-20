@@ -18,8 +18,8 @@
 
 use oxideav_avi::muxer::{open_with_kind, AviKind, RiffSegmentLimit};
 use oxideav_core::{
-    CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, MediaType, Packet, PixelFormat,
-    Rational, StreamInfo, TimeBase,
+    CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Demuxer, MediaType, Packet,
+    PixelFormat, Rational, StreamInfo, TimeBase,
 };
 use oxideav_core::{ReadSeek, WriteSeek};
 
@@ -265,5 +265,108 @@ fn opendml_multi_segment_continuation_keyframe_flags() {
     assert!(
         got.iter().skip(6).any(|&k| !k),
         "expected at least one ix##-sourced delta frame in a continuation"
+    );
+}
+
+/// The public `packet_is_keyframe` / `keyframe_indexed_packet_count`
+/// accessors must agree with what `next_packet` streams, for an idx1
+/// file.
+#[test]
+fn packet_is_keyframe_accessor_idx1() {
+    let stream = video_stream(b"XVID", "mpeg4");
+    let pattern = keyframe_pattern(13);
+
+    let mut reg = CodecRegistry::new();
+    register_fake_video(&mut reg, "mpeg4", b"XVID");
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-r349-accessor-idx1.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+        mux.write_header().unwrap();
+        for (i, &is_key) in pattern.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, frame_bytes(i as u8, 50));
+            pkt.pts = Some(i as i64);
+            pkt.flags.keyframe = is_key;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let dmx = oxideav_avi::demuxer::open_avi(rs, &reg).unwrap();
+
+    assert_eq!(dmx.keyframe_indexed_packet_count(0), pattern.len());
+    for (i, &expected) in pattern.iter().enumerate() {
+        assert_eq!(
+            dmx.packet_is_keyframe(0, i),
+            Some(expected),
+            "packet_is_keyframe(0, {i}) must match staged pattern"
+        );
+    }
+    // Out-of-range queries return None.
+    assert_eq!(dmx.packet_is_keyframe(0, pattern.len()), None);
+    assert_eq!(dmx.packet_is_keyframe(9, 0), None);
+    assert_eq!(dmx.keyframe_indexed_packet_count(9), 0);
+}
+
+/// Same accessor, but for a multi-segment OpenDML file where the
+/// continuation packets' flags come from ix## only. The accessor must
+/// report the full unified per-stream sequence, and it must match the
+/// streamed flags packet-for-packet.
+#[test]
+fn packet_is_keyframe_accessor_opendml_multi_segment() {
+    let stream = video_stream(b"XVID", "mpeg4");
+    let pattern = keyframe_pattern(24);
+
+    let mut reg = CodecRegistry::new();
+    register_fake_video(&mut reg, "mpeg4", b"XVID");
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-r349-accessor-odml.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_kind(
+            ws,
+            std::slice::from_ref(&stream),
+            AviKind::OpenDml(RiffSegmentLimit::Bytes(4096)),
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        for (i, &is_key) in pattern.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, frame_bytes(i as u8, 1000));
+            pkt.pts = Some(i as i64);
+            pkt.flags.keyframe = is_key;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = oxideav_avi::demuxer::open_avi(rs, &reg).unwrap();
+
+    // Accessor reports the whole unified sequence (idx1 primary + ix##
+    // continuations).
+    assert_eq!(dmx.keyframe_indexed_packet_count(0), pattern.len());
+    for (i, &expected) in pattern.iter().enumerate() {
+        assert_eq!(dmx.packet_is_keyframe(0, i), Some(expected));
+    }
+
+    // And it agrees with what next_packet actually streams.
+    let mut streamed: Vec<bool> = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => streamed.push(p.flags.keyframe),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    let from_accessor: Vec<bool> = (0..streamed.len())
+        .map(|i| dmx.packet_is_keyframe(0, i).unwrap())
+        .collect();
+    assert_eq!(
+        streamed, from_accessor,
+        "accessor and next_packet must agree across segment boundaries"
     );
 }
