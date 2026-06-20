@@ -1950,6 +1950,37 @@ fn open_avi_inner(
         }
     }
 
+    // Build the per-chunk keyframe map (offset → keyframe flag) for the
+    // `next_packet` read path. AVI payload chunk headers carry no
+    // keyframe bit themselves; the only per-chunk random-access metadata
+    // lives in the `idx1` (`AVIIF_KEYFRAME`) or OpenDML `ix##`
+    // (`AVISTDINDEX` dwSize high bit) indexes. We prefer `idx1` when
+    // present (it covers the primary segment exactly), then layer in any
+    // `ix##` entries not already keyed (OpenDML continuation segments,
+    // or idx1-less files). Offsets in both forms name the chunk's 8-byte
+    // header — exactly where `next_packet` sits when reading a payload.
+    let mut keyframe_by_offset: std::collections::HashMap<u64, bool> =
+        std::collections::HashMap::new();
+    for e in &idx_table {
+        keyframe_by_offset.insert(e.offset, (e.flags & AVIIF_KEYFRAME) != 0);
+    }
+    for ix in &std_indexes {
+        for e in &ix.entries {
+            let data_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
+            // dwOffset points at chunk DATA; back off 8 to the header,
+            // matching `seek_via_std_indexes`'s resolution. A degenerate
+            // dwOffset < 8 (offset inside the qwBaseOffset header) is
+            // skipped rather than wrapping the subtraction.
+            if data_off < 8 {
+                continue;
+            }
+            let header_off = data_off - 8;
+            keyframe_by_offset
+                .entry(header_off)
+                .or_insert(e.is_keyframe);
+        }
+    }
+
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
@@ -2006,6 +2037,7 @@ fn open_avi_inner(
         stream_fcc_types,
         digitization_date,
         smpte_timecode,
+        keyframe_by_offset,
     })
 }
 
@@ -5156,6 +5188,33 @@ pub struct AviDemuxer {
     /// normalised. Surfaced via the typed [`AviDemuxer::smpte_timecode`]
     /// accessor in addition to the `avi:ismp` metadata key.
     smpte_timecode: Option<String>,
+    /// File-absolute chunk-header offset → keyframe flag, built once at
+    /// `open()` from whichever per-chunk index the file carries.
+    ///
+    /// AVI's only per-chunk random-access metadata is the keyframe bit:
+    /// the `idx1` chunk's `AVIIF_KEYFRAME` (`0x10`) per
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix C —
+    /// *"The chunk is a key frame."* — and, for OpenDML 2.0 files, the
+    /// `ix##` (`AVISTDINDEX`) per-entry `dwSize` high bit which the same
+    /// reference documents as a delta-frame marker (*"high bit set =>
+    /// non-keyframe (delta)"*). The `movi` payload chunk headers
+    /// themselves carry NO keyframe flag, so without consulting an index
+    /// the demuxer cannot know which frames are random-access points.
+    ///
+    /// Both index forms resolve to the file-absolute offset of the
+    /// payload chunk's 8-byte header (idx1 directly via
+    /// [`build_idx_table`]'s offset-base probe; ix## via
+    /// `qw_base_offset + dwOffset - 8`), which is exactly the position
+    /// `next_packet` is at when it reads each payload chunk. Keying on
+    /// that offset lets `next_packet` stamp the true keyframe flag in
+    /// O(1) without re-deriving per-stream packet ordinals.
+    ///
+    /// Empty when the file carries neither an `idx1` nor any parseable
+    /// `ix##` index; in that case `next_packet` falls back to flagging
+    /// every payload chunk as a keyframe (the historical behaviour —
+    /// correct for the all-intra / uncompressed streams that are the
+    /// only ones a no-index AVI 1.0 file can describe randomly).
+    keyframe_by_offset: std::collections::HashMap<u64, bool>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -6210,6 +6269,11 @@ impl Demuxer for AviDemuxer {
                 }
                 return Err(Error::Eof);
             }
+            // File-absolute offset of this chunk's 8-byte header. The
+            // per-chunk keyframe map (`keyframe_by_offset`) is keyed on
+            // exactly this position, so capture it before consuming the
+            // header.
+            let chunk_header_off = self.input.stream_position()?;
             // Lenient header read: a short read at the segment tail
             // (truncated-head AVI; segment_end = file_len) means "stop"
             // rather than "I/O error".
@@ -6340,7 +6404,21 @@ impl Demuxer for AviDemuxer {
                         let mut pkt = Packet::new(idx, stream.time_base, data);
                         pkt.pts = Some(pts);
                         pkt.dts = Some(pts);
-                        pkt.flags.keyframe = true;
+                        // Stamp the TRUE keyframe flag from the per-chunk
+                        // index (idx1 `AVIIF_KEYFRAME` or OpenDML `ix##`
+                        // delta bit), keyed on this chunk's header offset.
+                        // No index entry for this offset ⇒ the file carries
+                        // no per-chunk random-access metadata for it, in
+                        // which case every payload chunk is treated as a
+                        // keyframe (the only thing a no-index AVI can
+                        // describe randomly is all-intra / uncompressed
+                        // data). For compressed delta-frame streams the
+                        // index is present and the flag is exact.
+                        pkt.flags.keyframe = self
+                            .keyframe_by_offset
+                            .get(&chunk_header_off)
+                            .copied()
+                            .unwrap_or(true);
                         // Bump counter.
                         let bump = packet_time_delta(stream, pkt.data.len());
                         self.per_stream_counter[idx as usize] = counter + bump;
