@@ -117,6 +117,105 @@ pub fn parse_bitfields_masks(extradata: &[u8]) -> Option<(u32, u32, u32)> {
     Some((r, g, b))
 }
 
+/// One entry of a DIB color table — `RGBQUAD` per the RIFF MCI
+/// reference (`docs/container/riff/metadata/microsoft-riffmci.pdf`
+/// §"Color Table Structure"):
+///
+/// ```text
+/// typedef struct tagRGBQUAD {
+///   BYTE rgbBlue;
+///   BYTE rgbGreen;
+///   BYTE rgbRed;
+///   BYTE rgbReserved;   // "Not used. Must be set to 0."
+/// } RGBQUAD;
+/// ```
+///
+/// The on-disk byte order is blue / green / red / reserved (note the
+/// inverted channel order versus the per-entry `PALETTEENTRY` of an
+/// `xxpc` palette-change chunk, which is red / green / blue / flags).
+/// The four bytes are surfaced verbatim — `reserved` is preserved
+/// even though the spec pins it to `0`, so a non-conformant writer's
+/// stray byte stays observable and the table round-trips exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RgbQuad {
+    /// `rgbBlue` — blue intensity.
+    pub blue: u8,
+    /// `rgbGreen` — green intensity.
+    pub green: u8,
+    /// `rgbRed` — red intensity.
+    pub red: u8,
+    /// `rgbReserved` — "Not used. Must be set to 0." per the spec;
+    /// surfaced verbatim for round-trip parity.
+    pub reserved: u8,
+}
+
+/// Parse the DIB color table (`RGBQUAD bmiColors[]`) that follows the
+/// 40-byte BITMAPINFOHEADER inside a `strf` payload, for an
+/// indexed-colour video stream.
+///
+/// Per the RIFF MCI reference
+/// (`docs/container/riff/metadata/microsoft-riffmci.pdf`
+/// §"Bitmap Color Table" / §"Interpreting the Color Table"): the color
+/// table "isn't present for bitmaps with 24 color bits"; for a
+/// `biBitCount` of 1 / 4 / 8 the bitmap is indexed and the table holds
+/// up to `2 ^ biBitCount` `RGBQUAD` entries. The number of entries
+/// "actually used" is `biClrUsed`, and "if the biClrUsed field is set
+/// to 0, the bitmap uses the maximum number of colors corresponding to
+/// the value of the [biBitCount] field" — i.e. `1 << biBitCount`.
+///
+/// `bit_count` is the BMIH `biBitCount`; `clr_used` is `biClrUsed`;
+/// `extradata` is the strf bytes following the 40-byte fixed header
+/// (the same slice surfaced as [`BitmapInfoHeader::extradata`]).
+///
+/// Returns `None` for:
+/// - `bit_count == 0` or `bit_count > 8` (no palette: 16/24/32-bpp
+///   truecolour DIBs and the "unspecified depth" `0` carry no table;
+///   the spec's §"Interpreting the Color Table" only enumerates the
+///   indexed depths 1 / 4 / 8 as palettised),
+/// - a resolved entry count of `0`,
+/// - extradata too short to hold even one `RGBQUAD`.
+///
+/// When the extradata is shorter than the resolved `count * 4` bytes
+/// (a truncated / hand-edited table) only the complete `RGBQUAD`s the
+/// buffer physically contains are returned, so a short table stays
+/// usable for the colours it does carry rather than being dropped
+/// wholesale.
+pub fn parse_color_table(bit_count: u16, clr_used: u32, extradata: &[u8]) -> Option<Vec<RgbQuad>> {
+    // The color table exists only for indexed DIBs (1/4/8-bpp). A
+    // `biBitCount` of 0 is the "depth unspecified / carried elsewhere"
+    // sentinel; 16/24/32-bpp are truecolour. The spec's §"Interpreting
+    // the Color Table" only enumerates 1 / 4 / 8 as palettised, so any
+    // depth above 8 carries no table.
+    if bit_count == 0 || bit_count > 8 {
+        return None;
+    }
+    // Resolved entry count: `biClrUsed`, or the depth maximum when 0.
+    // `1 << bit_count` is safe for the 1/4/8 range this arm reaches
+    // (max 256). A pathological `biClrUsed` larger than the depth
+    // maximum is honoured verbatim — some writers over-declare — and
+    // capped only by what the extradata physically holds below.
+    let max_entries = 1u32 << bit_count;
+    let declared = if clr_used == 0 { max_entries } else { clr_used };
+    if declared == 0 {
+        return None;
+    }
+    let available = (extradata.len() / 4) as u32;
+    let count = declared.min(available);
+    if count == 0 {
+        return None;
+    }
+    let mut table = Vec::with_capacity(count as usize);
+    for quad in extradata.chunks_exact(4).take(count as usize) {
+        table.push(RgbQuad {
+            blue: quad[0],
+            green: quad[1],
+            red: quad[2],
+            reserved: quad[3],
+        });
+    }
+    Some(table)
+}
+
 /// Emit a 40-byte BITMAPINFOHEADER followed by optional extradata.
 ///
 /// `biHeight` is written positive (bottom-up DIB). Call
@@ -1023,6 +1122,85 @@ mod tests {
     fn bitfields_masks_too_short_returns_none() {
         assert!(parse_bitfields_masks(&[1u8, 2, 3]).is_none());
         assert!(parse_bitfields_masks(&[]).is_none());
+    }
+
+    #[test]
+    fn color_table_8bpp_clr_used() {
+        // 8-bpp DIB declaring 3 used colours. RGBQUAD on-disk order is
+        // blue / green / red / reserved per RIFF MCI §"Color Table
+        // Structure".
+        let ext = [
+            0x10, 0x20, 0x30, 0x00, // blue=0x10 green=0x20 red=0x30
+            0x40, 0x50, 0x60, 0x00, // blue=0x40 green=0x50 red=0x60
+            0x70, 0x80, 0x90, 0xFF, // blue=0x70 green=0x80 red=0x90 reserved=0xFF
+        ];
+        let table = parse_color_table(8, 3, &ext).unwrap();
+        assert_eq!(table.len(), 3);
+        assert_eq!(
+            table[0],
+            RgbQuad {
+                blue: 0x10,
+                green: 0x20,
+                red: 0x30,
+                reserved: 0x00
+            }
+        );
+        assert_eq!(
+            table[2],
+            RgbQuad {
+                blue: 0x70,
+                green: 0x80,
+                red: 0x90,
+                reserved: 0xFF
+            }
+        );
+    }
+
+    #[test]
+    fn color_table_clr_used_zero_means_depth_max() {
+        // biClrUsed == 0 ⇒ "the bitmap uses the maximum number of
+        // colors corresponding to the value of the [biBitCount] field"
+        // (RIFF MCI §"Note on Windows DIBs"): 1 << 4 == 16 for a 4-bpp
+        // DIB.
+        let ext = vec![0u8; 16 * 4];
+        let table = parse_color_table(4, 0, &ext).unwrap();
+        assert_eq!(table.len(), 16);
+    }
+
+    #[test]
+    fn color_table_monochrome_two_entries() {
+        // 1-bpp ⇒ "monochrome, and the color table contains two
+        // entries" per RIFF MCI §"Interpreting the Color Table".
+        let ext = vec![0u8; 2 * 4];
+        let table = parse_color_table(1, 0, &ext).unwrap();
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn color_table_truncated_returns_what_fits() {
+        // Declared 8 colours but only 2 RGBQUADs present: parse the 2
+        // complete entries the buffer holds rather than dropping the
+        // whole table.
+        let ext = [1, 2, 3, 0, 4, 5, 6, 0];
+        let table = parse_color_table(8, 8, &ext).unwrap();
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn color_table_truecolour_has_no_table() {
+        // 16 / 24 / 32-bpp truecolour DIBs carry no palette; bit_count
+        // 0 (depth unspecified) likewise.
+        let ext = vec![0u8; 256 * 4];
+        assert!(parse_color_table(16, 0, &ext).is_none());
+        assert!(parse_color_table(24, 0, &ext).is_none());
+        assert!(parse_color_table(32, 0, &ext).is_none());
+        assert!(parse_color_table(0, 0, &ext).is_none());
+    }
+
+    #[test]
+    fn color_table_empty_extradata_returns_none() {
+        assert!(parse_color_table(8, 0, &[]).is_none());
+        assert!(parse_color_table(8, 4, &[1, 2, 3]).is_none());
     }
 
     #[test]
