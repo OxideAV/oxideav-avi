@@ -913,6 +913,19 @@ fn open_avi_inner(
                 format!("r=0x{r:08X},g=0x{g:08X},b=0x{b:08X}"),
             ));
         }
+        // Round-355: baseline DIB color-table entry count for an
+        // indexed-colour video stream (`RGBQUAD bmiColors[]` per the
+        // RIFF MCI reference §"Bitmap Color Table"). Emitted only when a
+        // palette is present (1/4/8-bpp indexed DIB with a parseable
+        // table) so absence stays observable, mirroring the
+        // `top_down` / `bitfields` "default == absent" convention. The
+        // full table is reachable via [`AviDemuxer::stream_palette`].
+        if let Some(pal) = &vs.palette {
+            metadata.push((
+                format!("avi:vids.{i}.palette_entries"),
+                pal.len().to_string(),
+            ));
+        }
     }
 
     // Round-75: WAVEFORMATEXTENSIBLE side-info per audio stream.
@@ -1337,6 +1350,10 @@ fn open_avi_inner(
     // first walking every regular packet via `next_packet`.
     let mut palette_change_data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); streams.len()];
     let mut text_chunk_data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); streams.len()];
+    // Round-355: per-stream preceding-data-packet count of each `xxpc`
+    // (index-aligned with `palette_change_data`); only computable from
+    // the static idx1 listing, so populated alongside the eager walk.
+    let mut palette_change_positions: Vec<Vec<u64>> = vec![Vec::new(); streams.len()];
     let mut sideband_data_loaded = false;
     // Round-285: `rec ` LIST entries recorded in idx1 (AVI 1.0 §"AVI
     // Index Entries": idx1 carries "entries for each data chunk,
@@ -1362,6 +1379,7 @@ fn open_avi_inner(
             *b"tx",
             &mut text_chunk_data,
         );
+        palette_change_positions = compute_palette_change_positions(&raw, &streams);
         sideband_data_loaded = true;
         let (table, recs) = build_idx_table(&mut *input, &raw, movi_start, &streams)?;
         idx1_rec_entries = recs;
@@ -2061,6 +2079,7 @@ fn open_avi_inner(
         vprps,
         dmlh_total_frames,
         palette_change_data,
+        palette_change_positions,
         text_chunk_data,
         sideband_data_loaded,
         video_strf: video_strfs,
@@ -4013,9 +4032,22 @@ fn build_stream(
                 } else {
                     None
                 };
+                // Baseline DIB color table for indexed-colour video
+                // (`biBitCount` 1/4/8) per RIFF MCI §"Bitmap Color
+                // Table". `parse_color_table` returns `None` for
+                // truecolour depths and the `BI_BITFIELDS` 16/32-bpp
+                // case (whose trailing bytes are colour masks, already
+                // consumed above) so this never double-claims the
+                // extradata.
+                let palette = if b.compression == crate::stream_format::BI_BITFIELDS {
+                    None
+                } else {
+                    crate::stream_format::parse_color_table(b.bit_count, b.clr_used, &b.extradata)
+                };
                 video_strf_info = Some(VideoStrfInfo {
                     top_down: b.top_down,
                     bitfields_masks,
+                    palette,
                 });
             }
             // Frame rate from scale/rate (rate/scale = fps).
@@ -4480,6 +4512,55 @@ fn read_sideband_data_from_idx1<R: ReadSeek + ?Sized>(
     }
 }
 
+/// Round-355: walk `idx1` in file order and, for each `xxpc`
+/// palette-change entry, record how many of the *same stream's* own
+/// data chunks preceded it. The result is index-aligned with the
+/// per-stream `xxpc` body buffer that [`read_sideband_data_from_idx1`]
+/// fills, so `out[s][k]` is the preceding-data-packet count of the
+/// `k`-th `xxpc` for stream `s`.
+///
+/// A "data chunk" is any per-stream chunk whose 2-byte suffix is **not**
+/// a side-band family (`pc` palette-change, `tx` text/subtitle) — i.e.
+/// the `dc`/`db`/`wb`/... packets the demuxer surfaces through
+/// `next_packet`. This mirrors the per-stream `next_packet` sequence
+/// numbering so a delta with preceding-count `p` is in effect for every
+/// data packet of sequence `>= p`.
+///
+/// idx1 entries are the canonical static list of every chunk in `movi`,
+/// in file order, so a single linear pass over the raw entries is
+/// enough — no seeking, no body reads.
+fn compute_palette_change_positions(raw: &[u8], streams: &[StreamInfo]) -> Vec<Vec<u64>> {
+    let mut out: Vec<Vec<u64>> = vec![Vec::new(); streams.len()];
+    if raw.len() < 16 {
+        return out;
+    }
+    let n = raw.len() / 16;
+    let mut data_counts: Vec<u64> = vec![0u64; streams.len()];
+    for i in 0..n {
+        let base = i * 16;
+        let ckid = [raw[base], raw[base + 1], raw[base + 2], raw[base + 3]];
+        let stream = match parse_stream_index(&ckid) {
+            Some(s) => s as usize,
+            None => continue, // `rec ` LIST entries etc. carry no stream.
+        };
+        if stream >= streams.len() {
+            continue;
+        }
+        let suffix = [ckid[2], ckid[3]];
+        if suffix == *b"pc" {
+            // Record the running data-packet count for this stream as
+            // this delta's position, then leave the count unchanged —
+            // a palette change is side-band, not a data packet.
+            out[stream].push(data_counts[stream]);
+        } else if suffix == *b"tx" {
+            // Text/subtitle is also side-band: not a data packet.
+        } else {
+            data_counts[stream] = data_counts[stream].saturating_add(1);
+        }
+    }
+    out
+}
+
 fn build_idx_table<R: ReadSeek + ?Sized>(
     r: &mut R,
     raw: &[u8],
@@ -4654,6 +4735,17 @@ pub struct VideoStrfInfo {
     /// masks). `None` when the stream isn't `BI_BITFIELDS` or the
     /// extradata was too short to carry the three DWORDs.
     pub bitfields_masks: Option<(u32, u32, u32)>,
+    /// Baseline DIB color table (`RGBQUAD bmiColors[]`) parsed from the
+    /// `strf` BITMAPINFO for an indexed-colour video stream
+    /// (`biBitCount` of 1 / 4 / 8) per the RIFF MCI reference
+    /// §"Bitmap Color Table". `None` for truecolour DIBs (16/24/32-bpp,
+    /// which carry no palette), `BI_BITFIELDS` streams (whose trailing
+    /// bytes are colour masks, not a table), compressed FourCC streams
+    /// that omit the table, or when the extradata was too short to hold
+    /// even one `RGBQUAD`. This is the **baseline** palette that any
+    /// `xxpc` palette-change deltas are applied on top of — see
+    /// [`AviDemuxer::effective_palette_at`].
+    pub palette: Option<Vec<crate::stream_format::RgbQuad>>,
 }
 
 /// Concrete AVI demuxer. Returned by [`open_avi`] for callers that
@@ -4917,6 +5009,20 @@ pub struct AviDemuxer {
     /// progressively. Empty when no `xxpc` chunks were seen for that
     /// stream.
     palette_change_data: Vec<Vec<Vec<u8>>>,
+    /// Per-stream count of this stream's own data packets that precede
+    /// each buffered `xxpc` palette-change chunk in file order
+    /// (round-355). Index-aligned with the inner Vec of
+    /// [`Self::palette_change_data`]: `palette_change_positions[s][k]`
+    /// is how many `00dc`/`00db`/... data chunks for stream `s` were
+    /// seen before the `k`-th `xxpc`. This is the bridge from the
+    /// count-based [`AviDemuxer::effective_palette_after_changes`] to
+    /// the packet-sequence-based [`AviDemuxer::effective_palette_at`]:
+    /// a delta with preceding-count `p` is in effect for every data
+    /// packet of sequence `>= p`. Populated only when the eager `idx1`
+    /// walk supplied the data (`sideband_data_loaded == true`); empty
+    /// for `idx1`-less files, where the packet-sequence accessor can't
+    /// place the deltas and returns `None`.
+    palette_change_positions: Vec<Vec<u64>>,
     /// Per-stream buffered `xxtx` text/subtitle chunk bodies in file
     /// order (round-12 candidate 1). Mirror of
     /// [`Self::palette_change_data`] for the text-stream FourCC family.
@@ -6838,6 +6944,117 @@ impl AviDemuxer {
         PaletteChangeTypedIter { bodies, next: 0 }
     }
 
+    /// Round-355: the **effective palette** of an indexed-colour video
+    /// stream after applying its first `num_changes` `xxpc`
+    /// palette-change deltas, in file order, on top of the baseline
+    /// color table.
+    ///
+    /// Composes [`Self::stream_palette`] (the `strf` baseline `RGBQUAD
+    /// bmiColors[]`) with the first `num_changes` `AVIPALCHANGE` deltas
+    /// surfaced by [`Self::palette_change_typed`]. Each delta rewrites a
+    /// run of `bNumEntries` palette indices starting at `bFirstEntry`
+    /// per the AVI 1.0 reference §"AVIPALCHANGE"; the `PALETTEENTRY`
+    /// red / green / blue channels map onto the corresponding
+    /// [`crate::stream_format::RgbQuad`] fields (the entry's `peFlags`
+    /// is dropped — it has no `RGBQUAD` slot, whose `rgbReserved` the
+    /// spec pins to `0`).
+    ///
+    /// `num_changes` is clamped to the number of deltas actually buffered
+    /// for the stream, so passing `u32::MAX` yields the palette after
+    /// every change. Returns `None` for a stream that has no baseline
+    /// color table (non-video, truecolour, `BI_BITFIELDS`, or a `strf`
+    /// too short) — there is nothing to animate. A delta that writes
+    /// past the end of the baseline table extends it with the new
+    /// entries so a palette grown by `xxpc` (legal: the table can start
+    /// smaller than `1 << biBitCount`) stays observable; a delta whose
+    /// `first_entry` lands beyond the current table grows it with
+    /// default-black padding to keep index alignment.
+    pub fn effective_palette_after_changes(
+        &self,
+        stream_index: u32,
+        num_changes: u32,
+    ) -> Option<Vec<crate::stream_format::RgbQuad>> {
+        let mut table = self.stream_palette(stream_index)?.to_vec();
+        let deltas = self.palette_change_typed(stream_index);
+        let take = (num_changes as usize).min(deltas.len());
+        for delta in deltas.iter().take(take) {
+            let first = delta.first_entry as usize;
+            for (idx, entry) in (first..).zip(delta.entries.iter()) {
+                if idx >= table.len() {
+                    table.resize(idx + 1, crate::stream_format::RgbQuad::default());
+                }
+                table[idx] = crate::stream_format::RgbQuad {
+                    blue: entry.blue,
+                    green: entry.green,
+                    red: entry.red,
+                    reserved: 0,
+                };
+            }
+        }
+        Some(table)
+    }
+
+    /// Round-355: per-stream preceding-data-packet count of each
+    /// buffered `xxpc` palette-change delta, in file order.
+    ///
+    /// `palette_change_packet_positions(s)[k]` is how many of stream
+    /// `s`'s own data packets (the `00dc`/`00db`/`00wb`/... chunks the
+    /// demuxer surfaces through `next_packet`) precede the `k`-th
+    /// `xxpc`, index-aligned with [`Self::palette_change_data`] /
+    /// [`Self::palette_change_typed`]. A delta with position `p` is in
+    /// effect for every data packet of sequence `>= p`.
+    ///
+    /// Computed from the static `idx1` listing, so it's available only
+    /// for files that carry an `idx1` (`sideband_data_loaded`). Returns
+    /// an empty slice for `idx1`-less (OpenDML-only) files — where the
+    /// packet-sequence accessor [`Self::effective_palette_at`] can't
+    /// place the deltas — and for unknown `stream_index`.
+    pub fn palette_change_packet_positions(&self, stream_index: u32) -> &[u64] {
+        self.palette_change_positions
+            .get(stream_index as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Round-355: the **effective palette** in force for the data packet
+    /// at `packet_seq` (the per-stream `next_packet` sequence number) of
+    /// an indexed-colour video stream.
+    ///
+    /// Resolves the baseline color table plus every `xxpc`
+    /// palette-change delta that appears, in file order, at or before
+    /// the data packet of sequence `packet_seq` — i.e. every delta whose
+    /// [`Self::palette_change_packet_positions`] value is `<=
+    /// packet_seq`. This is the palette a player would have active while
+    /// presenting that frame, per the AVI 1.0 reference §"AVIPALCHANGE"
+    /// (palette changes "update the palette during an AVI sequence").
+    ///
+    /// Returns `None` when:
+    /// - the stream has no baseline color table (see
+    ///   [`Self::effective_palette_after_changes`]), or
+    /// - the file carries no `idx1`, so the deltas can't be positioned
+    ///   against the packet sequence (the count-based
+    ///   [`Self::effective_palette_after_changes`] still works there).
+    pub fn effective_palette_at(
+        &self,
+        stream_index: u32,
+        packet_seq: u64,
+    ) -> Option<Vec<crate::stream_format::RgbQuad>> {
+        // No baseline ⇒ nothing to animate.
+        self.stream_palette(stream_index)?;
+        let positions = self.palette_change_positions.get(stream_index as usize)?;
+        // `idx1`-less files have an empty positions Vec even when deltas
+        // exist; distinguish "no deltas at all" (fine — return baseline)
+        // from "deltas present but unpositioned" (can't resolve).
+        let have_deltas = !self.palette_change_data(stream_index).is_empty();
+        if positions.is_empty() && have_deltas {
+            return None;
+        }
+        // Deltas are in file order, so positions are non-decreasing;
+        // count how many are at or before this packet sequence.
+        let applied = positions.iter().filter(|&&p| p <= packet_seq).count();
+        self.effective_palette_after_changes(stream_index, applied as u32)
+    }
+
     /// `avih.dwSuggestedBufferSize` accessor (round-13 candidate 2).
     ///
     /// Per AVI 1.0 §3.1, the avih's `dwSuggestedBufferSize` is the
@@ -8142,6 +8359,38 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .and_then(|v| v.as_ref())
             .and_then(|vs| vs.bitfields_masks)
+    }
+
+    /// Baseline DIB color table (`RGBQUAD bmiColors[]`) of an
+    /// indexed-colour video stream.
+    ///
+    /// Per the RIFF MCI reference
+    /// (`docs/container/riff/metadata/microsoft-riffmci.pdf`
+    /// §"Bitmap Color Table" / §"Interpreting the Color Table"): a DIB
+    /// with `biBitCount` of 1 / 4 / 8 is palettised and embeds its
+    /// color table immediately after the 40-byte BITMAPINFOHEADER in
+    /// the `strf` chunk, with `biClrUsed` entries (or `1 << biBitCount`
+    /// when `biClrUsed == 0`). Each entry is a 4-byte `RGBQUAD`
+    /// (blue / green / red / reserved).
+    ///
+    /// Returns `Some(table)` with one [`crate::stream_format::RgbQuad`]
+    /// per parsed entry. Returns `None` for:
+    /// - non-video / out-of-range streams,
+    /// - truecolour DIBs (16 / 24 / 32-bpp carry no palette),
+    /// - `BI_BITFIELDS` streams (the trailing bytes are colour masks,
+    ///   surfaced via [`Self::stream_bitfields_masks`] instead),
+    /// - compressed FourCC streams that ship no color table,
+    /// - a `strf` too short to hold even one `RGBQUAD`.
+    ///
+    /// This is the **baseline** palette. For the palette in effect at a
+    /// given point in the stream — after the cumulative `xxpc`
+    /// palette-change deltas up to that packet — use
+    /// [`Self::effective_palette_at`].
+    pub fn stream_palette(&self, stream_index: u32) -> Option<&[crate::stream_format::RgbQuad]> {
+        self.video_strf
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+            .and_then(|vs| vs.palette.as_deref())
     }
 
     /// Round-75: per-audio-stream WAVEFORMATEX(TENSIBLE) typed side-info.
