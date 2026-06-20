@@ -16,6 +16,7 @@
 //! honestly) and assert the demuxer now reflects the true per-chunk
 //! flag.
 
+use oxideav_avi::muxer::{open_with_kind, AviKind, RiffSegmentLimit};
 use oxideav_core::{
     CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, MediaType, Packet, PixelFormat,
     Rational, StreamInfo, TimeBase,
@@ -152,4 +153,117 @@ fn all_keyframe_stream_stays_all_keyframe() {
         }
     }
     assert_eq!(count, n);
+}
+
+/// Single-segment OpenDML 2.0 file: carries BOTH an `idx1` (the
+/// primary RIFF always writes one) and per-segment `ix##` standard
+/// indexes. The demuxer must surface the true per-packet keyframe
+/// flags either way; idx1 is consulted first but the two encode the
+/// same key/delta pattern, so the result must match.
+#[test]
+fn opendml_single_segment_keyframe_flags() {
+    let stream = video_stream(b"XVID", "mpeg4");
+    let pattern = keyframe_pattern(11);
+
+    let mut reg = CodecRegistry::new();
+    register_fake_video(&mut reg, "mpeg4", b"XVID");
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-r349-odml-single.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        // Large limit ⇒ everything stays in one primary RIFF.
+        let mut mux = open_with_kind(
+            ws,
+            std::slice::from_ref(&stream),
+            AviKind::OpenDml(RiffSegmentLimit::OneGiB),
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        for (i, &is_key) in pattern.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, frame_bytes(i as u8, 64));
+            pkt.pts = Some(i as i64);
+            pkt.flags.keyframe = is_key;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
+    let mut got: Vec<bool> = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.push(p.flags.keyframe),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(got, pattern, "OpenDML single-segment keyframe flags");
+}
+
+/// Multi-segment OpenDML 2.0 file: a tiny `RiffSegmentLimit` forces
+/// the muxer to roll `RIFF AVIX` continuation segments. The legacy
+/// `idx1` only covers the PRIMARY segment (its offsets are
+/// 32-bit `movi`-relative), so the keyframe flags for every packet
+/// that lands in a continuation segment can ONLY come from that
+/// segment's `ix##` standard index. This is the path that exercises
+/// the `keyframe_by_offset` map's `ix##` branch end-to-end.
+#[test]
+fn opendml_multi_segment_continuation_keyframe_flags() {
+    let stream = video_stream(b"XVID", "mpeg4");
+    // Enough packets, each large enough, that a 4 KiB segment ceiling
+    // forces several AVIX continuations.
+    let pattern = keyframe_pattern(24);
+
+    let mut reg = CodecRegistry::new();
+    register_fake_video(&mut reg, "mpeg4", b"XVID");
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-r349-odml-multi.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_kind(
+            ws,
+            std::slice::from_ref(&stream),
+            AviKind::OpenDml(RiffSegmentLimit::Bytes(4096)),
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        for (i, &is_key) in pattern.iter().enumerate() {
+            // ~1 KiB each so a handful fill a 4 KiB segment.
+            let mut pkt = Packet::new(0, stream.time_base, frame_bytes(i as u8, 1000));
+            pkt.pts = Some(i as i64);
+            pkt.flags.keyframe = is_key;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = oxideav_avi::demuxer::open(rs, &reg).unwrap();
+    // Confirm the fixture actually segmented (more than one movi region)
+    // by checking the total frame count comes back whole AND the flags
+    // line up across the segment boundaries.
+    let mut got: Vec<bool> = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.push(p.flags.keyframe),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(got.len(), pattern.len(), "all packets across all segments");
+    assert_eq!(
+        got, pattern,
+        "continuation-segment keyframe flags must come from ix## (idx1 \
+         covers only the primary segment)"
+    );
+    // The tail of the pattern (indices >= ~5) necessarily lands in a
+    // continuation segment given the 4 KiB ceiling, so at least one
+    // delta flag was sourced purely from ix##.
+    assert!(
+        got.iter().skip(6).any(|&k| !k),
+        "expected at least one ix##-sourced delta frame in a continuation"
+    );
 }
