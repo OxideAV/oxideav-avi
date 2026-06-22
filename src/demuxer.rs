@@ -1742,6 +1742,31 @@ fn open_avi_inner(
         }
     }
 
+    // Round-361: surface a non-conformant non-zero `dwReserved[3]` on a
+    // stream's `indx` super-index. Per the AVISUPERINDEX layout the 3
+    // DWORDs after `dwChunkId` are reserved (*"0 if unused"*); a
+    // conforming AVI 2.0 super-index of indexes leaves them all-zero, so
+    // we surface the slot only when at least one DWORD is non-zero —
+    // mirroring the file-global `avi:reserved` (round-330) "surface only
+    // the non-conformant case" shape. Rendered as comma-joined lower-case
+    // `0x`-hex in array order, matching `avi:reserved`. Gate on `present`
+    // so a mislabelled entry-less super-index's reserved bytes still
+    // surface, and the all-zero `default()` pad slot never emits.
+    for (i, sx) in super_indexes.iter().enumerate() {
+        if !sx.present {
+            continue;
+        }
+        if sx.dw_reserved.iter().any(|&w| w != 0) {
+            let joined = sx
+                .dw_reserved
+                .iter()
+                .map(|w| format!("0x{w:08X}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            metadata.push((format!("avi:indx.{i}.reserved"), joined));
+        }
+    }
+
     // Round-5 candidate 2: when an idx1 table is present alongside
     // an `AVI_INDEX_2FIELD` ix## for the same stream, surface a
     // per-stream "interlaced via idx1" hint at the idx1 layer. The
@@ -3189,6 +3214,17 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
     let n_entries_in_use = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
     let mut chunk_id = [0u8; 4];
     chunk_id.copy_from_slice(&body[8..12]);
+    // `dwReserved[3]` — 3 DWORDs at body offsets 12/16/20. Per the
+    // AVISUPERINDEX layout the array is *"meaning differs for each index
+    // type/subtype. 0 if unused"*; for an AVI 2.0 super-index of indexes
+    // it is reserved and written 0. Captured verbatim so the round-361
+    // `super_index_reserved` diagnostic can surface a non-conformant
+    // non-zero slot (body.len() >= 24 is already guaranteed above).
+    let dw_reserved = [
+        u32::from_le_bytes([body[12], body[13], body[14], body[15]]),
+        u32::from_le_bytes([body[16], body[17], body[18], body[19]]),
+        u32::from_le_bytes([body[20], body[21], body[22], body[23]]),
+    ];
     let entries_byte_len = n_entries_in_use.saturating_mul(16);
     let need = 24usize.saturating_add(entries_byte_len);
     if body.len() < need {
@@ -3206,6 +3242,7 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
         return Ok(SuperIndex {
             b_index_type,
             present: true,
+            dw_reserved,
             ..SuperIndex::default()
         });
     }
@@ -3260,6 +3297,7 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
         b_index_sub_type,
         b_index_type,
         present: true,
+        dw_reserved,
         chunk_id,
         entries,
     })
@@ -3314,6 +3352,11 @@ fn parse_ix_chunk(own_fourcc: [u8; 4], body: &[u8]) -> Option<StdIndex> {
     let qw_base_offset = u64::from_le_bytes([
         body[12], body[13], body[14], body[15], body[16], body[17], body[18], body[19],
     ]);
+    // `dwReserved3` — the DWORD at body offset 20 (*"must be 0"* per the
+    // AVISTDINDEX layout). Captured verbatim so the round-361
+    // `std_index_reserved` diagnostic can surface a non-conformant
+    // non-zero value (body.len() >= 24 already validated above).
+    let dw_reserved3 = u32::from_le_bytes([body[20], body[21], body[22], body[23]]);
     // Round-325: tolerate a truncated entry table rather than discarding
     // the whole `ix##` chunk. The 24-byte AVISTDINDEX header (already
     // validated above) carries the declared `nEntriesInUse` regardless of
@@ -3363,6 +3406,7 @@ fn parse_ix_chunk(own_fourcc: [u8; 4], body: &[u8]) -> Option<StdIndex> {
         qw_base_offset,
         b_index_sub_type,
         b_index_type,
+        dw_reserved3,
         declared_n_entries,
         entries,
     })
@@ -6423,6 +6467,12 @@ struct SuperIndex {
     /// Lets the `bIndexType` accessor distinguish "no super-index" from a
     /// genuinely-present but entry-less / mislabelled one.
     present: bool,
+    /// `dwReserved[3]` — the 3 reserved DWORDs after `dwChunkId` in the
+    /// AVISUPERINDEX header. *"0 if unused"* for an AVI 2.0 super-index of
+    /// indexes; captured verbatim so [`AviDemuxer::super_index_reserved`]
+    /// can surface a non-conformant non-zero slot. All-zero for a
+    /// `default()` pad slot.
+    dw_reserved: [u32; 3],
     /// FourCC of indexed chunks (`00dc` etc.). Tags every `ix##` slot.
     chunk_id: [u8; 4],
     entries: Vec<SuperIndexEntry>,
@@ -6475,6 +6525,10 @@ struct StdIndex {
     /// captured for the round-361 [`AviDemuxer::std_index_index_types`]
     /// accessor so the per-segment surface mirrors the super-index one.
     b_index_type: u8,
+    /// `dwReserved3` DWORD (*"must be 0"* per the AVISTDINDEX layout).
+    /// Captured verbatim so [`AviDemuxer::std_index_reserved`] can surface
+    /// a non-conformant non-zero value.
+    dw_reserved3: u32,
     /// `nEntriesInUse`: the entry count the `ix##` chunk *declares* in its
     /// header, retained verbatim even when the body is truncated and fewer
     /// entries were actually parseable. `entries.len()` is the number the
@@ -8412,6 +8466,73 @@ impl AviDemuxer {
             match parse_stream_index(&ix.chunk_id) {
                 Some(s) if s == stream_index => {
                     out.push(AviIndexType::from_raw(ix.b_index_type));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `dwReserved[3]` of a stream's `indx` super-index, surfaced only
+    /// when non-conformant (round-361).
+    ///
+    /// Per the AVISUPERINDEX layout (clean-room source:
+    /// `docs/container/riff/opendml-avi-2.0.pdf` §"Index Structures") the
+    /// 3 DWORDs after `dwChunkId` are `dwReserved[3]` — *"meaning differs
+    /// for each index type/subtype. 0 if unused"*; for the AVI 2.0
+    /// super-index-of-indexes that this crate reads and writes, the array
+    /// is reserved and a conforming writer leaves it all-zero.
+    ///
+    /// Returns `Some([u32; 3])` only when the parsed super-index carries a
+    /// **non-zero** reserved slot — a non-conformant / writer-private use
+    /// of the reserved space a downstream tool may want to detect or
+    /// preserve — mirroring the round-330 `avih_reserved` "surface only
+    /// the non-conformant case" shape. An all-zero reserved array reads as
+    /// `None` (the conforming default), and so does a stream with no
+    /// `indx` super-index at all (`stream_index` out of range or no slot).
+    /// Surfaces the reserved value for a present-but-mislabelled
+    /// (entry-less) super-index too — it gates on the internal `present`
+    /// flag like [`Self::super_index_index_type`], so the reserved bytes
+    /// of a malformed `indx` stay observable.
+    pub fn super_index_reserved(&self, stream_index: u32) -> Option<[u32; 3]> {
+        let sx = self.super_indexes.get(stream_index as usize)?;
+        if !sx.present {
+            return None;
+        }
+        if sx.dw_reserved == [0, 0, 0] {
+            return None;
+        }
+        Some(sx.dw_reserved)
+    }
+
+    /// `dwReserved3` of every `ix##` standard-index segment for a stream,
+    /// surfaced only when non-conformant (round-361).
+    ///
+    /// Per the AVISTDINDEX layout (clean-room source:
+    /// `docs/container/riff/opendml-avi-2.0.pdf` §"Index Structures") the
+    /// DWORD after `qwBaseOffset` is `dwReserved3` — *"must be 0"*. This
+    /// method returns one `(segment_index, dwReserved3)` pair per `ix##`
+    /// chunk for the stream whose reserved DWORD is **non-zero**, in file
+    /// order (`segment_index` counting the stream's `ix##` chunks like
+    /// [`Self::std_index_base_offset_violations`]). A conforming file
+    /// yields an empty `Vec`; the pairs surface a non-conformant /
+    /// writer-private reserved value so a downstream tool can detect or
+    /// preserve it, mirroring the round-330 `avih_reserved` "surface only
+    /// the non-conformant case" shape.
+    ///
+    /// Returns an empty `Vec` for an AVI-1.0 / no-`ix##` file, an
+    /// out-of-range `stream_index`, or a stream whose every `ix##`
+    /// carries the conforming `0` reserved DWORD.
+    pub fn std_index_reserved(&self, stream_index: u32) -> Vec<(usize, u32)> {
+        let mut out = Vec::new();
+        let mut seg = 0usize;
+        for ix in &self.std_indexes {
+            match parse_stream_index(&ix.chunk_id) {
+                Some(s) if s == stream_index => {
+                    if ix.dw_reserved3 != 0 {
+                        out.push((seg, ix.dw_reserved3));
+                    }
+                    seg += 1;
                 }
                 _ => {}
             }
