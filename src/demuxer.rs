@@ -72,6 +72,12 @@ use crate::stream_format::{
 const AVI_INDEX_OF_INDEXES: u8 = 0x00;
 /// `bIndexType` of an `AVIMETAINDEX` chunk index (`ix##`).
 const AVI_INDEX_OF_CHUNKS: u8 = 0x01;
+/// `bIndexType` for an `AVIMETAINDEX` whose `aIndex[]` entries *are* the
+/// data themselves (OpenDML 2.0 §"Index Structures": `AVI_INDEX_IS_DATA`).
+/// Not produced by this crate's muxer and unused by the seek path, but
+/// surfaced verbatim so a reader can recognise an inline-data index before
+/// trusting an entry walk that assumes the chunk-offset layout.
+const AVI_INDEX_IS_DATA: u8 = 0x80;
 /// `bIndexSubType` flag for a 2-field interlaced std-index (per OpenDML 2.0
 /// §3.0 "AVI Field Index Chunk"). When set, each `aIndex` entry carries an
 /// extra `dwOffsetField2` DWORD (so `wLongsPerEntry == 3` and entries are
@@ -1705,6 +1711,37 @@ fn open_avi_inner(
         }
     }
 
+    // Round-361: surface the `indx` super-index's own `bIndexType` byte
+    // when it diverges from the canonical `AVI_INDEX_OF_INDEXES`. Per the
+    // OpenDML 2.0 *"Index Structures"* `// bIndexType codes` block
+    // (clean-room source: `docs/container/riff/opendml-avi-2.0.pdf`
+    // §"Index Structures"), a `strl`-level `indx` is an index *of
+    // indexes*, so its `bIndexType` must be `AVI_INDEX_OF_INDEXES`
+    // (`0x00`). The canonical value is fully implied by the chunk being a
+    // super-index at all, so we skip it (the typed
+    // `super_index_index_type` accessor returns the decoded type verbatim
+    // either way), mirroring the round-312/304/197 "default == absent"
+    // convention. A divergent byte (`AVI_INDEX_OF_CHUNKS` /
+    // `AVI_INDEX_IS_DATA` / any other code) is a mislabelled / malformed
+    // `indx` — `parse_indx` already folds it to an entry-less slot so it
+    // never participates in seek, and surfacing the decoded label lets a
+    // repair tool see the cause. Unlike the round-312/304/197 loops, we
+    // gate on the internal `present` flag rather than `entries.is_empty()`
+    // precisely so the entry-less mislabelled case is still reported (an
+    // unrecognised `Other(_)` byte has no label, so its key is suppressed
+    // — the accessor still returns the typed value for those).
+    for (i, sx) in super_indexes.iter().enumerate() {
+        if !sx.present {
+            continue;
+        }
+        let ty = AviIndexType::from_raw(sx.b_index_type);
+        if ty != AviIndexType::OfIndexes {
+            if let Some(label) = ty.label() {
+                metadata.push((format!("avi:indx.{i}.index_type"), label.into()));
+            }
+        }
+    }
+
     // Round-5 candidate 2: when an idx1 table is present alongside
     // an `AVI_INDEX_2FIELD` ix## for the same stream, surface a
     // per-stream "interlaced via idx1" hint at the idx1 layer. The
@@ -3162,8 +3199,15 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
     if b_index_type != AVI_INDEX_OF_INDEXES {
         // Per spec/06 §6.1 the `indx` chunk in the strl always carries
         // bIndexType = AVI_INDEX_OF_INDEXES. Some encoders are sloppy
-        // here, so we tolerate it but won't have working seek.
-        return Ok(SuperIndex::default());
+        // here, so we tolerate it but won't have working seek. Retain the
+        // declared `b_index_type` + `present` flag so the round-361
+        // `super_index_index_type` accessor can report the mislabelling
+        // (entries stay empty ⇒ the seek path treats it as absent).
+        return Ok(SuperIndex {
+            b_index_type,
+            present: true,
+            ..SuperIndex::default()
+        });
     }
     let mut entries = Vec::with_capacity(n_entries_in_use);
     for i in 0..n_entries_in_use {
@@ -3214,6 +3258,8 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
     Ok(SuperIndex {
         w_longs_per_entry,
         b_index_sub_type,
+        b_index_type,
+        present: true,
         chunk_id,
         entries,
     })
@@ -3316,6 +3362,7 @@ fn parse_ix_chunk(own_fourcc: [u8; 4], body: &[u8]) -> Option<StdIndex> {
         chunk_id,
         qw_base_offset,
         b_index_sub_type,
+        b_index_type,
         declared_n_entries,
         entries,
     })
@@ -6180,6 +6227,80 @@ impl VprpVideoStandard {
     }
 }
 
+/// Decoded `bIndexType` of an OpenDML 2.0 `AVIMETAINDEX` (`indx` /
+/// `ix##`) per the spec's *"Index Structures"* `// bIndexType codes`
+/// block.
+///
+/// The base `AVIMETAINDEX` header carries a one-byte `bIndexType`
+/// selecting how its `aIndex[]` table is interpreted:
+///
+/// * `AVI_INDEX_OF_INDEXES` (`0x00`) — each entry points at a
+///   *sub-index* chunk (the `strl`-level `indx` super-index of
+///   indexes).
+/// * `AVI_INDEX_OF_CHUNKS` (`0x01`) — each entry points at a *data
+///   chunk* in `movi` (the per-segment `ix##` standard / field index).
+/// * `AVI_INDEX_IS_DATA` (`0x80`) — each entry *is* the data itself
+///   (an inline-data index; not emitted by this crate's muxer).
+///
+/// The spec block defines exactly these three codes; the demuxer
+/// surfaces any other byte verbatim via [`Self::Other`] so a malformed
+/// / future-extended `bIndexType` stays observable rather than being
+/// silently coerced. Note `0x01` is the value of *both* the
+/// `AVI_INDEX_OF_CHUNKS` `bIndexType` and the `AVI_INDEX_2FIELD`
+/// `bIndexSubType` — they live in different header bytes, so the typed
+/// sub-type decoders ([`AviDemuxer::super_index_sub_type`] /
+/// [`AviDemuxer::std_index_sub_types`]) stay distinct from this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AviIndexType {
+    /// `AVI_INDEX_OF_INDEXES` (`0x00`) — entries point at sub-indexes.
+    OfIndexes,
+    /// `AVI_INDEX_OF_CHUNKS` (`0x01`) — entries point at data chunks.
+    OfChunks,
+    /// `AVI_INDEX_IS_DATA` (`0x80`) — entries are the data themselves.
+    IsData,
+    /// A `bIndexType` byte outside the three documented codes,
+    /// preserved verbatim.
+    Other(u8),
+}
+
+impl AviIndexType {
+    /// Decode a raw `bIndexType` byte into the named code.
+    pub const fn from_raw(raw: u8) -> Self {
+        match raw {
+            AVI_INDEX_OF_INDEXES => Self::OfIndexes,
+            AVI_INDEX_OF_CHUNKS => Self::OfChunks,
+            AVI_INDEX_IS_DATA => Self::IsData,
+            other => Self::Other(other),
+        }
+    }
+
+    /// The raw `bIndexType` byte this code encodes to on disk.
+    pub const fn to_raw(self) -> u8 {
+        match self {
+            Self::OfIndexes => AVI_INDEX_OF_INDEXES,
+            Self::OfChunks => AVI_INDEX_OF_CHUNKS,
+            Self::IsData => AVI_INDEX_IS_DATA,
+            Self::Other(other) => other,
+        }
+    }
+
+    /// Stable lower-case label for the three documented codes
+    /// (`of_indexes` / `of_chunks` / `is_data`), or `None` for an
+    /// out-of-range [`Self::Other`]. Drives the divergence-only
+    /// `avi:indx.<n>.index_type` / `avi:ix.<n>.index_type` metadata
+    /// keys, which surface the unexpected code so a reader can spot a
+    /// mislabelled index.
+    pub const fn label(self) -> Option<&'static str> {
+        match self {
+            Self::OfIndexes => Some("of_indexes"),
+            Self::OfChunks => Some("of_chunks"),
+            Self::IsData => Some("is_data"),
+            Self::Other(_) => None,
+        }
+    }
+}
+
 /// Decoded `vprp` (Video Properties Header) per OpenDML 2.0 §5.0.
 ///
 /// The 9 fixed DWORDs at the start of a `vprp` body, plus the
@@ -6287,6 +6408,21 @@ struct SuperIndex {
     w_longs_per_entry: u16,
     /// 0 (default) or `AVI_INDEX_SUB_2FIELD`.
     b_index_sub_type: u8,
+    /// `bIndexType` byte verbatim — `AVI_INDEX_OF_INDEXES` (`0x00`) for a
+    /// well-formed `strl` super-index. Captured even when it diverges (a
+    /// non-`OF_INDEXES` `indx` is folded to an empty slot below, but the
+    /// declared type is retained so [`AviDemuxer::super_index_index_type`]
+    /// can report the mislabelling). `0` for a `default()` pad slot — the
+    /// canonical value, so a pad and a genuine `OF_INDEXES` super-index
+    /// agree, and the accessor gates on `entries`/`present` to tell them
+    /// apart.
+    b_index_type: u8,
+    /// True iff this slot was populated from a real `indx` chunk (even one
+    /// whose `bIndexType` diverged and produced no usable entries), as
+    /// opposed to a `default()` pad slot for a stream that carried none.
+    /// Lets the `bIndexType` accessor distinguish "no super-index" from a
+    /// genuinely-present but entry-less / mislabelled one.
+    present: bool,
     /// FourCC of indexed chunks (`00dc` etc.). Tags every `ix##` slot.
     chunk_id: [u8; 4],
     entries: Vec<SuperIndexEntry>,
@@ -6334,6 +6470,11 @@ struct StdIndex {
     /// `AVI_INDEX_SUB_2FIELD` (2-field interlaced).
     #[allow(dead_code)]
     b_index_sub_type: u8,
+    /// `bIndexType` byte verbatim. Always `AVI_INDEX_OF_CHUNKS` (`0x01`)
+    /// for a retained `ix##` — `parse_ix_chunk` rejects any other type —
+    /// captured for the round-361 [`AviDemuxer::std_index_index_types`]
+    /// accessor so the per-segment surface mirrors the super-index one.
+    b_index_type: u8,
     /// `nEntriesInUse`: the entry count the `ix##` chunk *declares* in its
     /// header, retained verbatim even when the body is truncated and fewer
     /// entries were actually parseable. `entries.len()` is the number the
@@ -8205,6 +8346,77 @@ impl AviDemuxer {
             return None;
         }
         Some(sx.chunk_id)
+    }
+
+    /// Decoded `bIndexType` of a stream's `indx` super-index (round-361).
+    ///
+    /// Per the OpenDML 2.0 *"Index Structures"* `// bIndexType codes`
+    /// block (clean-room source: `docs/container/riff/opendml-avi-2.0.pdf`
+    /// §"Index Structures"), the `strl`-level `indx` chunk is an
+    /// *index of indexes*, so its `bIndexType` byte must be
+    /// `AVI_INDEX_OF_INDEXES` (`0x00`). This accessor decodes whatever the
+    /// file declared into the typed [`AviIndexType`] — the canonical
+    /// [`AviIndexType::OfIndexes`] for a conforming file, or
+    /// [`AviIndexType::OfChunks`] / [`AviIndexType::IsData`] /
+    /// [`AviIndexType::Other`] for a mislabelled / future-extended one.
+    ///
+    /// Unlike [`Self::super_index_sub_type`] and the other super-index
+    /// accessors (which gate on `entries.is_empty()`), this method
+    /// surfaces the type even for a *present-but-entry-less* super-index:
+    /// `parse_indx` folds a non-`OF_INDEXES` `indx` to an empty slot so it
+    /// never participates in seek, but the declared (wrong) `bIndexType`
+    /// is retained so a reader can detect the mislabelling that *caused*
+    /// the fold. It gates instead on the internal `present` flag, so it
+    /// still returns `None` for `stream_index` out of range or a stream
+    /// that declared no `indx` at all (the AVI-1.0 case and OpenDML
+    /// streams whose `strl` reserved no super-index slot).
+    ///
+    /// The companion `avi:indx.<n>.index_type` metadata key surfaces the
+    /// same value as a label string but only when it diverges from the
+    /// canonical `OF_INDEXES`; this accessor always returns the decoded
+    /// type so a caller can branch on the canonical case too.
+    pub fn super_index_index_type(&self, stream_index: u32) -> Option<AviIndexType> {
+        let sx = self.super_indexes.get(stream_index as usize)?;
+        if !sx.present {
+            // Pad slot (no indx declared at all) — distinct from a
+            // present super-index whose `bIndexType` happens to be 0.
+            return None;
+        }
+        Some(AviIndexType::from_raw(sx.b_index_type))
+    }
+
+    /// Decoded `bIndexType` of every `ix##` standard-index segment for a
+    /// stream, in file order (round-361).
+    ///
+    /// Per the OpenDML 2.0 *"Index Structures"* `// bIndexType codes`
+    /// block (clean-room source: `docs/container/riff/opendml-avi-2.0.pdf`
+    /// §"Index Structures"), an `ix##` in `movi` is an *index of chunks*,
+    /// so its `bIndexType` byte is `AVI_INDEX_OF_CHUNKS` (`0x01`). Because
+    /// `parse_ix_chunk` only retains a chunk whose `bIndexType` actually
+    /// equals `OF_CHUNKS` (any other byte makes the whole `ix##` drop, so
+    /// it never reaches seek with a wrong type), every entry of the
+    /// returned `Vec` is the canonical [`AviIndexType::OfChunks`] for a
+    /// conforming file — but the value is surfaced verbatim so the
+    /// per-segment surface mirrors [`Self::super_index_index_type`] and a
+    /// future relaxation of the parse filter would flow through unchanged.
+    ///
+    /// The `Vec` is keyed by `stream_index` and ordered the same as
+    /// [`Self::std_index_base_offsets`] / [`Self::std_index_chunk_ids`] —
+    /// one entry per `ix##` chunk the demuxer keyed under that stream, in
+    /// file order (for OpenDML multi-segment files, one per `movi`
+    /// segment). Returns an empty `Vec` for an AVI-1.0 / no-`ix##` file or
+    /// an out-of-range `stream_index`.
+    pub fn std_index_index_types(&self, stream_index: u32) -> Vec<AviIndexType> {
+        let mut out = Vec::new();
+        for ix in &self.std_indexes {
+            match parse_stream_index(&ix.chunk_id) {
+                Some(s) if s == stream_index => {
+                    out.push(AviIndexType::from_raw(ix.b_index_type));
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Per-stream `vprp` `VIDEO_FIELD_DESC` records (round-9
