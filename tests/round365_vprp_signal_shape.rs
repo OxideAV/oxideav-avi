@@ -109,9 +109,9 @@ fn meta(dmx: &oxideav_avi::demuxer::AviDemuxer, key: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-/// NTSC preset on a 720x480 stream: refresh 60 (from the preset),
-/// h_total / frame_width = 720, v_total / frame_height = 480 (derived
-/// from the coded dimensions).
+/// NTSC preset: refresh 60, broadcast totals 858 x 525, active frame
+/// 720 x 480 (round-365 fills the §5.0 known-tokens-table values rather
+/// than the stream's coded dimensions).
 #[test]
 fn ntsc_preset_signal_shape_round_trips() {
     let stream = magicyuv_stream(720, 480);
@@ -119,8 +119,8 @@ fn ntsc_preset_signal_shape_round_trips() {
     let dmx = open(write_opendml(&stream, opts));
 
     assert_eq!(dmx.vprp_vertical_refresh_rate(0), Some(60));
-    assert_eq!(dmx.vprp_h_total_in_t(0), Some(720));
-    assert_eq!(dmx.vprp_v_total_in_lines(0), Some(480));
+    assert_eq!(dmx.vprp_h_total_in_t(0), Some(858));
+    assert_eq!(dmx.vprp_v_total_in_lines(0), Some(525));
     assert_eq!(dmx.vprp_frame_width_in_pixels(0), Some(720));
     assert_eq!(dmx.vprp_frame_height_in_lines(0), Some(480));
 
@@ -128,15 +128,16 @@ fn ntsc_preset_signal_shape_round_trips() {
         dmx.vprp_signal_shape(0),
         Some(VprpSignalShape {
             vertical_refresh_rate: 60,
-            h_total_in_t: 720,
-            v_total_in_lines: 480,
+            h_total_in_t: 858,
+            v_total_in_lines: 525,
             frame_width_in_pixels: 720,
             frame_height_in_lines: 480,
         })
     );
 }
 
-/// PAL preset on a 720x576 stream: refresh 50, dimensions 720x576.
+/// PAL preset: refresh 50, broadcast totals 864 x 625, active frame
+/// 720 x 576.
 #[test]
 fn pal_preset_signal_shape_round_trips() {
     let stream = magicyuv_stream(720, 576);
@@ -144,10 +145,50 @@ fn pal_preset_signal_shape_round_trips() {
     let dmx = open(write_opendml(&stream, opts));
 
     assert_eq!(dmx.vprp_vertical_refresh_rate(0), Some(50));
-    assert_eq!(dmx.vprp_h_total_in_t(0), Some(720));
-    assert_eq!(dmx.vprp_v_total_in_lines(0), Some(576));
+    assert_eq!(dmx.vprp_h_total_in_t(0), Some(864));
+    assert_eq!(dmx.vprp_v_total_in_lines(0), Some(625));
     assert_eq!(dmx.vprp_frame_width_in_pixels(0), Some(720));
     assert_eq!(dmx.vprp_frame_height_in_lines(0), Some(576));
+}
+
+/// Custom builders: `with_signal_totals` + `with_active_frame` +
+/// `with_vertical_refresh_rate` round-trip independently of the coded
+/// stream dimensions, and a `0` falls back to the coded dimension.
+#[test]
+fn custom_signal_shape_builders_round_trip() {
+    let stream = magicyuv_stream(640, 480);
+    let cfg = VprpConfig::default()
+        .with_nb_field_per_frame(1)
+        .with_vertical_refresh_rate(59)
+        .with_signal_totals(800, 521)
+        .with_active_frame(704, 0); // height 0 -> falls back to coded 480
+    let opts = AviMuxOptions::new().with_vprp(0, cfg);
+    let dmx = open(write_opendml(&stream, opts));
+
+    assert_eq!(dmx.vprp_vertical_refresh_rate(0), Some(59));
+    assert_eq!(dmx.vprp_h_total_in_t(0), Some(800));
+    assert_eq!(dmx.vprp_v_total_in_lines(0), Some(521));
+    assert_eq!(dmx.vprp_frame_width_in_pixels(0), Some(704));
+    // height 0 -> coded fallback.
+    assert_eq!(dmx.vprp_frame_height_in_lines(0), Some(480));
+}
+
+/// Default `VprpConfig` (no signal-shape override) falls back to the
+/// coded stream dimensions on every total/active field, preserving the
+/// pre-round-365 muxer behaviour. The refresh rate falls back to the
+/// stream fps (25).
+#[test]
+fn default_config_falls_back_to_coded_dimensions() {
+    let stream = magicyuv_stream(352, 288);
+    let cfg = VprpConfig::default().with_nb_field_per_frame(1);
+    let opts = AviMuxOptions::new().with_vprp(0, cfg);
+    let dmx = open(write_opendml(&stream, opts));
+
+    assert_eq!(dmx.vprp_vertical_refresh_rate(0), Some(25));
+    assert_eq!(dmx.vprp_h_total_in_t(0), Some(352));
+    assert_eq!(dmx.vprp_v_total_in_lines(0), Some(288));
+    assert_eq!(dmx.vprp_frame_width_in_pixels(0), Some(352));
+    assert_eq!(dmx.vprp_frame_height_in_lines(0), Some(288));
 }
 
 /// Typed accessors agree with the raw `avi:vprp.0.*` metadata keys.

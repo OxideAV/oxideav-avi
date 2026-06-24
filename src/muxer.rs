@@ -955,6 +955,25 @@ pub struct VprpConfig {
     pub vertical_refresh_rate: u32,
     /// `dwFrameAspectRatio` packed `(X << 16) | Y`. 0 = 4:3 default.
     pub frame_aspect_ratio: u32,
+    /// `dwHTotalInT` — total horizontal samples per line incl. blanking
+    /// (round-365). `0` = fall back to the stream's coded width (the
+    /// pre-round-365 muxer default). Set this to the true broadcast
+    /// H-total (858 NTSC CCIR-601, 864 PAL CCIR-601) when round-tripping
+    /// a parsed signal shape — it is larger than the active
+    /// `frame_width_in_pixels`.
+    pub h_total_in_t: u32,
+    /// `dwVTotalInLines` — total vertical lines per frame incl. the
+    /// vertical blanking interval (round-365). `0` = fall back to the
+    /// stream's coded height. 525 NTSC, 625 PAL.
+    pub v_total_in_lines: u32,
+    /// `dwFrameWidthInPixels` — *active* frame width (round-365). `0` =
+    /// fall back to the stream's coded width. Distinct from
+    /// `h_total_in_t`, which counts the whole line including blanking.
+    pub frame_width_in_pixels: u32,
+    /// `dwFrameHeightInLines` — *active* frame height (round-365). `0` =
+    /// fall back to the stream's coded height. Distinct from
+    /// `v_total_in_lines`.
+    pub frame_height_in_lines: u32,
     /// `nbFieldPerFrame` — 1 progressive, 2 interlaced. 0 = 1.
     pub nb_field_per_frame: u32,
     /// Optional caller-supplied `VIDEO_FIELD_DESC[]` records (round-10
@@ -1024,35 +1043,54 @@ pub const VIDEO_STANDARD_NTSC: u32 = 2;
 pub const VIDEO_STANDARD_SECAM: u32 = 3;
 
 impl VprpConfig {
-    /// NTSC CCIR-601 preset: 60 Hz, interlaced, 4:3.
+    /// NTSC CCIR-601 preset: 60 Hz, interlaced, 4:3. Round-365 fills the
+    /// broadcast H-/V-totals (858 x 525) + active frame (720 x 480) from
+    /// the §5.0 known-tokens table so a re-mux carries the real signal
+    /// shape rather than the stream's coded dimensions.
     pub fn ntsc() -> Self {
         Self {
             video_format_token: VIDEO_FORMAT_NTSC_CCIR_601,
             video_standard: VIDEO_STANDARD_NTSC,
             vertical_refresh_rate: 60,
             frame_aspect_ratio: (4u32 << 16) | 3,
+            h_total_in_t: 858,
+            v_total_in_lines: 525,
+            frame_width_in_pixels: 720,
+            frame_height_in_lines: 480,
             nb_field_per_frame: 2,
             field_descs: Vec::new(),
         }
     }
-    /// PAL CCIR-601 preset: 50 Hz, interlaced, 4:3.
+    /// PAL CCIR-601 preset: 50 Hz, interlaced, 4:3. Round-365 fills the
+    /// broadcast H-/V-totals (864 x 625) + active frame (720 x 576) from
+    /// the §5.0 known-tokens table.
     pub fn pal() -> Self {
         Self {
             video_format_token: VIDEO_FORMAT_PAL_CCIR_601,
             video_standard: VIDEO_STANDARD_PAL,
             vertical_refresh_rate: 50,
             frame_aspect_ratio: (4u32 << 16) | 3,
+            h_total_in_t: 864,
+            v_total_in_lines: 625,
+            frame_width_in_pixels: 720,
+            frame_height_in_lines: 576,
             nb_field_per_frame: 2,
             field_descs: Vec::new(),
         }
     }
     /// SECAM preset: 50 Hz, interlaced, 4:3 (no SECAM token in §5.0).
+    /// Round-365 fills the PAL-shaped 864 x 625 totals + 720 x 576 active
+    /// frame (SECAM shares PAL's 625-line / 50 Hz signal geometry).
     pub fn secam() -> Self {
         Self {
             video_format_token: VIDEO_FORMAT_UNKNOWN,
             video_standard: VIDEO_STANDARD_SECAM,
             vertical_refresh_rate: 50,
             frame_aspect_ratio: (4u32 << 16) | 3,
+            h_total_in_t: 864,
+            v_total_in_lines: 625,
+            frame_width_in_pixels: 720,
+            frame_height_in_lines: 576,
             nb_field_per_frame: 2,
             field_descs: Vec::new(),
         }
@@ -1070,6 +1108,40 @@ impl VprpConfig {
     /// Builder: pin `dwFrameAspectRatio` from `(X, Y)`.
     pub fn with_aspect(mut self, x: u32, y: u32) -> Self {
         self.frame_aspect_ratio = ((x & 0xFFFF) << 16) | (y & 0xFFFF);
+        self
+    }
+    /// Builder: pin the §5.0 signal-shape totals `dwHTotalInT` /
+    /// `dwVTotalInLines` (round-365). These count the whole horizontal
+    /// line / frame *including* blanking, so they are larger than the
+    /// active `(frame_width, frame_height)` set via
+    /// [`Self::with_active_frame`] — e.g. NTSC CCIR-601 is 858 x 525 with
+    /// a 720 x 480 active frame. A `0` in either argument falls back to
+    /// the stream's coded dimension (the pre-round-365 muxer default).
+    pub fn with_signal_totals(mut self, h_total_in_t: u32, v_total_in_lines: u32) -> Self {
+        self.h_total_in_t = h_total_in_t;
+        self.v_total_in_lines = v_total_in_lines;
+        self
+    }
+    /// Builder: pin the §5.0 active frame `dwFrameWidthInPixels` /
+    /// `dwFrameHeightInLines` (round-365). This is the *active* picture
+    /// region, distinct from the coded `BITMAPINFOHEADER` size and from
+    /// the [`Self::with_signal_totals`] line/frame totals. A `0` in
+    /// either argument falls back to the stream's coded dimension.
+    pub fn with_active_frame(
+        mut self,
+        frame_width_in_pixels: u32,
+        frame_height_in_lines: u32,
+    ) -> Self {
+        self.frame_width_in_pixels = frame_width_in_pixels;
+        self.frame_height_in_lines = frame_height_in_lines;
+        self
+    }
+    /// Builder: pin `dwVerticalRefreshRate` in Hz (round-365). `0` falls
+    /// back to the stream's derived fps (the pre-round-365 default). Use
+    /// this to stamp the broadcast refresh (60 NTSC / 50 PAL) on a stream
+    /// whose packaging fps differs from the signal rate.
+    pub fn with_vertical_refresh_rate(mut self, hz: u32) -> Self {
+        self.vertical_refresh_rate = hz;
         self
     }
     /// Builder: pin the trailing `VIDEO_FIELD_DESC[]` array verbatim
@@ -4648,16 +4720,43 @@ fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> 
     } else {
         1
     };
+    // Round-365: the four signal-shape DWORDs now honour the
+    // VprpConfig override, each falling back to the stream's coded
+    // dimension when left `0` (the pre-round-365 muxer default). The
+    // `h_total_in_t` / `v_total_in_lines` totals count the whole line /
+    // frame including blanking (858 x 525 NTSC, 864 x 625 PAL); the
+    // `frame_width_in_pixels` / `frame_height_in_lines` describe the
+    // active picture region.
+    let h_total_in_t = if cfg.h_total_in_t > 0 {
+        cfg.h_total_in_t
+    } else {
+        width
+    };
+    let v_total_in_lines = if cfg.v_total_in_lines > 0 {
+        cfg.v_total_in_lines
+    } else {
+        height
+    };
+    let frame_width_in_pixels = if cfg.frame_width_in_pixels > 0 {
+        cfg.frame_width_in_pixels
+    } else {
+        width
+    };
+    let frame_height_in_lines = if cfg.frame_height_in_lines > 0 {
+        cfg.frame_height_in_lines
+    } else {
+        height
+    };
     // Body capacity = 9 fixed DWORDs (36 B) + per-field 32 B records.
     let mut body = Vec::with_capacity(36 + 32 * nb_field_per_frame as usize);
     body.extend_from_slice(&video_format_token.to_le_bytes());
     body.extend_from_slice(&video_standard.to_le_bytes());
     body.extend_from_slice(&refresh_rate.to_le_bytes()); // dwVerticalRefreshRate
-    body.extend_from_slice(&width.to_le_bytes()); // dwHTotalInT (unknown — fall back to width)
-    body.extend_from_slice(&height.to_le_bytes()); // dwVTotalInLines
+    body.extend_from_slice(&h_total_in_t.to_le_bytes()); // dwHTotalInT
+    body.extend_from_slice(&v_total_in_lines.to_le_bytes()); // dwVTotalInLines
     body.extend_from_slice(&frame_aspect_ratio.to_le_bytes()); // dwFrameAspectRatio
-    body.extend_from_slice(&width.to_le_bytes()); // dwFrameWidthInPixels
-    body.extend_from_slice(&height.to_le_bytes()); // dwFrameHeightInLines
+    body.extend_from_slice(&frame_width_in_pixels.to_le_bytes()); // dwFrameWidthInPixels
+    body.extend_from_slice(&frame_height_in_lines.to_le_bytes()); // dwFrameHeightInLines
     body.extend_from_slice(&nb_field_per_frame.to_le_bytes());
 
     // VIDEO_FIELD_DESC[0..nbFieldPerFrame]: spec-mandated per-field
