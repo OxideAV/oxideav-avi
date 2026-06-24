@@ -6422,6 +6422,47 @@ pub struct VprpFieldDesc {
     pub video_y_valid_start_line: u32,
 }
 
+/// Round-365: the five fixed signal-shape DWORDs of an OpenDML 2.0
+/// §5.0 *"Video Properties Header"* (`vprp`), bundled.
+///
+/// Surfaced by [`AviDemuxer::vprp_signal_shape`] so a caller that wants
+/// the whole signal description in one read — rather than five separate
+/// `Option<u32>` accessor calls — can pattern-match a single struct.
+/// Every member is the verbatim DWORD from the `vprp` body; the demuxer
+/// does no clamping, range-checking, or cross-field validation (the
+/// spec phrases the standard `(refresh, HTotal, VTotal)` triples as
+/// conventions a writer *may* follow, not invariants the file MUST
+/// satisfy — see the §5.0 *"Known tokens"* table). The companion
+/// per-field `VIDEO_FIELD_DESC` array stays on
+/// [`AviDemuxer::vprp_field_descs`]; the packed
+/// `dwFrameAspectRatio` stays on
+/// [`AviDemuxer::vprp_frame_aspect_ratio`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VprpSignalShape {
+    /// `dwVerticalRefreshRate` — *"Used when an unknown standard is
+    /// specified. Normally, 60 for NTSC, and 50 for PAL."* (§5.0).
+    pub vertical_refresh_rate: u32,
+    /// `dwHTotalInT` — *"Defines the horizontal total, in T (one
+    /// luminance sample: pixel)."* (§5.0). 858 for NTSC CCIR-601, 864
+    /// for PAL CCIR-601 per the §5.0 known-tokens table.
+    pub h_total_in_t: u32,
+    /// `dwVTotalInLines` — *"Defines the vertical total, in lines."*
+    /// (§5.0). 525 for NTSC, 625 for PAL.
+    pub v_total_in_lines: u32,
+    /// `dwFrameWidthInPixels` — *"Defines the active frame width in
+    /// pixels. The bitmap might digitize a region that is smaller or
+    /// bigger than the active video width."* (§5.0). Logically distinct
+    /// from the coded `BITMAPINFOHEADER.biWidth` and from `dwHTotalInT`
+    /// (which counts the whole horizontal line including blanking).
+    pub frame_width_in_pixels: u32,
+    /// `dwFrameHeightInLines` — *"Defines the frame height in lines. The
+    /// bitmap might digitize a region that is smaller or bigger than the
+    /// active video height."* (§5.0). Distinct from `dwVTotalInLines`
+    /// (which counts the whole frame including the vertical blanking
+    /// interval).
+    pub frame_height_in_lines: u32,
+}
+
 /// One `AVISUPERINDEX_ENTRY` parsed from an `indx` chunk.
 ///
 /// We don't dereference `qw_offset` directly — the `ix##` chunks it
@@ -8647,6 +8688,157 @@ impl AviDemuxer {
             return None;
         }
         Some(VprpVideoStandard::from_raw(vp.video_standard))
+    }
+
+    /// Round-365: per-stream `vprp.dwVerticalRefreshRate`, typed.
+    ///
+    /// Returns the OpenDML 2.0 §5.0 *"Vertical Refresh Rate"*
+    /// (`dwVerticalRefreshRate`) — *"Used when an unknown standard is
+    /// specified. Normally, 60 for NTSC, and 50 for PAL."* — as a raw
+    /// `u32` in Hz. Typed companion to the
+    /// `avi:vprp.<index>.vertical_refresh_rate` metadata key.
+    ///
+    /// Returns `None` when the stream carries no `vprp` chunk (presence
+    /// gated on `nbFieldPerFrame > 0`, matching the metadata surface)
+    /// **or** when the field is `0` — the writer-skipped / "derive from
+    /// the `VideoStandard` token" sentinel, mirroring the metadata
+    /// surface (which omits the key for `0`) and the "default == absent"
+    /// convention this crate carries across its scalar accessors. A
+    /// present `vprp` that genuinely declares a refresh rate has it
+    /// non-zero, so the recognised-standard case (where the rate is
+    /// implied by [`Self::vprp_video_standard`]) and the explicit case
+    /// stay distinguishable.
+    pub fn vprp_vertical_refresh_rate(&self, stream_index: u32) -> Option<u32> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 || vp.vertical_refresh_rate == 0 {
+            return None;
+        }
+        Some(vp.vertical_refresh_rate)
+    }
+
+    /// Round-365: per-stream `vprp.dwHTotalInT`, typed.
+    ///
+    /// Returns the OpenDML 2.0 §5.0 *"H-Total in T"* (`dwHTotalInT`) —
+    /// *"Defines the horizontal total, in T (one luminance sample:
+    /// pixel)."* — as a raw `u32`. This counts the whole horizontal
+    /// line including the blanking interval (858 for NTSC CCIR-601, 864
+    /// for PAL CCIR-601 per the §5.0 known-tokens table), so it is
+    /// larger than the active [`Self::vprp_frame_width_in_pixels`].
+    /// Typed companion to the `avi:vprp.<index>.h_total_in_t` metadata
+    /// key.
+    ///
+    /// `None` for a stream with no `vprp` or a `0` field (writer-skipped
+    /// sentinel — the metadata key is omitted there too), per the
+    /// "default == absent" convention.
+    pub fn vprp_h_total_in_t(&self, stream_index: u32) -> Option<u32> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 || vp.h_total_in_t == 0 {
+            return None;
+        }
+        Some(vp.h_total_in_t)
+    }
+
+    /// Round-365: per-stream `vprp.dwVTotalInLines`, typed.
+    ///
+    /// Returns the OpenDML 2.0 §5.0 *"V-Total in Lines"*
+    /// (`dwVTotalInLines`) — *"Defines the vertical total, in lines."* —
+    /// as a raw `u32`. This counts the whole frame including the
+    /// vertical blanking interval (525 for NTSC, 625 for PAL per the
+    /// §5.0 known-tokens table), so it is larger than the active
+    /// [`Self::vprp_frame_height_in_lines`]. Typed companion to the
+    /// `avi:vprp.<index>.v_total_in_lines` metadata key.
+    ///
+    /// `None` for a stream with no `vprp` or a `0` field (writer-skipped
+    /// sentinel — the metadata key is omitted there too), per the
+    /// "default == absent" convention.
+    pub fn vprp_v_total_in_lines(&self, stream_index: u32) -> Option<u32> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 || vp.v_total_in_lines == 0 {
+            return None;
+        }
+        Some(vp.v_total_in_lines)
+    }
+
+    /// Round-365: per-stream `vprp.dwFrameWidthInPixels`, typed.
+    ///
+    /// Returns the OpenDML 2.0 §5.0 *"Active Frame Width in Pixels"*
+    /// (`dwFrameWidthInPixels`) — *"Defines the active frame width in
+    /// pixels. The bitmap might digitize a region that is smaller or
+    /// bigger than the active video width."* — as a raw `u32`.
+    /// Logically distinct from the coded `BITMAPINFOHEADER.biWidth`
+    /// (surfaced via [`oxideav_core::CodecParameters::width`]) and from
+    /// [`Self::vprp_h_total_in_t`]; paired with
+    /// [`Self::vprp_frame_height_in_lines`] and
+    /// [`Self::vprp_frame_aspect_ratio`] a caller can compute the pixel
+    /// aspect ratio per the §5.0 *"This value can be used with the frame
+    /// width and height to calculate the pixel aspect ratio."* note.
+    /// Typed companion to the `avi:vprp.<index>.frame_width_in_pixels`
+    /// metadata key.
+    ///
+    /// `None` for a stream with no `vprp` or a `0` field (writer-skipped
+    /// sentinel — the metadata key is omitted there too), per the
+    /// "default == absent" convention.
+    pub fn vprp_frame_width_in_pixels(&self, stream_index: u32) -> Option<u32> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 || vp.frame_width_in_pixels == 0 {
+            return None;
+        }
+        Some(vp.frame_width_in_pixels)
+    }
+
+    /// Round-365: per-stream `vprp.dwFrameHeightInLines`, typed.
+    ///
+    /// Returns the OpenDML 2.0 §5.0 *"Active Frame Height in Lines"*
+    /// (`dwFrameHeightInLines`) — *"Defines the frame height in lines.
+    /// The bitmap might digitize a region that is smaller or bigger than
+    /// the active video height."* — as a raw `u32`. Logically distinct
+    /// from the coded `BITMAPINFOHEADER.biHeight` and from
+    /// [`Self::vprp_v_total_in_lines`]. Typed companion to the
+    /// `avi:vprp.<index>.frame_height_in_lines` metadata key.
+    ///
+    /// `None` for a stream with no `vprp` or a `0` field (writer-skipped
+    /// sentinel — the metadata key is omitted there too), per the
+    /// "default == absent" convention.
+    pub fn vprp_frame_height_in_lines(&self, stream_index: u32) -> Option<u32> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 || vp.frame_height_in_lines == 0 {
+            return None;
+        }
+        Some(vp.frame_height_in_lines)
+    }
+
+    /// Round-365: per-stream `vprp` signal-shape bundle, typed.
+    ///
+    /// Returns the five fixed signal-shape DWORDs of the OpenDML 2.0
+    /// §5.0 *"Video Properties Header"* — `dwVerticalRefreshRate`,
+    /// `dwHTotalInT`, `dwVTotalInLines`, `dwFrameWidthInPixels`,
+    /// `dwFrameHeightInLines` — bundled into a single [`VprpSignalShape`]
+    /// so a caller can read the whole signal description in one call
+    /// instead of five separate `Option<u32>` accessors.
+    ///
+    /// Unlike the individual `vprp_*` accessors (each of which maps its
+    /// own `0` field to `None`), this bundle surfaces **every** member
+    /// verbatim — including a `0` in any individual DWORD — because at
+    /// the struct level a partially-specified header (e.g. a recognised
+    /// standard token that leaves `dwVerticalRefreshRate` at `0` so the
+    /// standard implies it) is itself meaningful and the caller may want
+    /// to see exactly which fields the writer filled. Presence is gated
+    /// only on the chunk existing at all (`nbFieldPerFrame > 0`), the
+    /// same presence rule as [`Self::vprp_video_format`] /
+    /// [`Self::vprp_video_standard`]; a stream with no `vprp` returns
+    /// `None`.
+    pub fn vprp_signal_shape(&self, stream_index: u32) -> Option<VprpSignalShape> {
+        let vp = self.vprps.get(stream_index as usize)?;
+        if vp.nb_field_per_frame == 0 {
+            return None;
+        }
+        Some(VprpSignalShape {
+            vertical_refresh_rate: vp.vertical_refresh_rate,
+            h_total_in_t: vp.h_total_in_t,
+            v_total_in_lines: vp.v_total_in_lines,
+            frame_width_in_pixels: vp.frame_width_in_pixels,
+            frame_height_in_lines: vp.frame_height_in_lines,
+        })
     }
 
     /// Round-19 candidate 1: per-video-stream top-down DIB flag.
