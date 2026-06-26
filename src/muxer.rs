@@ -947,6 +947,23 @@ pub struct AviMuxOptions {
     /// index offsets. Default empty (no top-level JUNK emitted).
     /// Use [`Self::with_top_level_junk`].
     pub top_level_junk_sizes: Vec<u32>,
+    /// Explicit top-level `DISP` chunks to emit as siblings of
+    /// `LIST hdrl`, just before the `movi` LIST (round-373). Each entry
+    /// is the raw `DISP` chunk body bytes; the muxer writes one `DISP`
+    /// chunk per entry with that body (RIFF word-pad applied for odd
+    /// lengths).
+    ///
+    /// `DISP` is a RIFF-level display / sound-scheme-title chunk
+    /// (`docs/container/riff/metadata/exiftool-riff-tags.html` →
+    /// `SoundSchemeTitle`). The muxer writes the supplied bytes
+    /// verbatim and does NOT compose or interpret the leading
+    /// clipboard-format code — the caller owns the full body layout.
+    /// Write-side complement of the round-373 demuxer
+    /// [`crate::demuxer::AviDemuxer::disp_chunks`] surface: a fixture
+    /// authored with `with_disp_chunk` round-trips through `disp_chunks`
+    /// (raw body byte-equal) and the `avi:disp.count` metadata key.
+    /// Default empty (no `DISP` emitted). Use [`Self::with_disp_chunk`].
+    pub disp_chunks: Vec<Vec<u8>>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1304,6 +1321,24 @@ impl AviMuxOptions {
     /// index offsets.
     pub fn with_top_level_junk(mut self, body_size: u32) -> Self {
         self.top_level_junk_sizes.push(body_size);
+        self
+    }
+
+    /// Builder helper: append a top-level `DISP` chunk carrying `body`,
+    /// emitted as a sibling of `LIST hdrl` just before the `movi` LIST
+    /// (round-373). Repeatable — each call adds one more `DISP` chunk in
+    /// call order.
+    ///
+    /// `DISP` is a RIFF-level display / sound-scheme-title chunk
+    /// (RIFF tag registry → `SoundSchemeTitle`). The `body` bytes are
+    /// written verbatim (a RIFF word-pad byte is appended for an odd
+    /// length); the muxer does NOT compose or interpret the leading
+    /// clipboard-format code — the caller owns the full body. Write-side
+    /// complement of [`crate::demuxer::AviDemuxer::disp_chunks`]: a
+    /// fixture authored this way round-trips with the raw body
+    /// byte-equal.
+    pub fn with_disp_chunk(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.disp_chunks.push(body.into());
         self
     }
 
@@ -2976,6 +3011,16 @@ impl Muxer for AviMuxer {
         for &size in &self.options.top_level_junk_sizes {
             let body = vec![0u8; size as usize];
             write_chunk(self.output.as_mut(), b"JUNK", &body)?;
+        }
+
+        // Round-373: emit explicit top-level `DISP` chunks as siblings
+        // of `LIST hdrl`, just before the `movi` LIST (RIFF tag registry
+        // → `SoundSchemeTitle`). Each body is written verbatim;
+        // `write_chunk` applies the RIFF word-pad for odd lengths. The
+        // round-373 demuxer reads these back via `walk_riff_body`'s
+        // `DISP` arm and surfaces them through `AviDemuxer::disp_chunks`.
+        for body in &self.options.disp_chunks {
+            write_chunk(self.output.as_mut(), b"DISP", body)?;
         }
 
         // movi LIST — size patched in write_trailer (or when this segment

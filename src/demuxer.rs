@@ -455,6 +455,9 @@ fn open_avi_inner(
     // primary `RIFF AVI ` (OpenDML 2.0 §"RIFF Chunk Format"). `0` for a
     // single-RIFF AVI 1.0 / OpenDML file that fits in one RIFF.
     let mut avix_riff_count: u32 = 0;
+    // Round-373: top-level `DISP` chunks (RIFF tag registry →
+    // `SoundSchemeTitle`), primary RIFF only, in file order.
+    let mut top_level_disp: Vec<DispChunk> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -490,6 +493,7 @@ fn open_avi_inner(
         &mut digitization_date,
         &mut smpte_timecode,
         &mut top_level_junk,
+        &mut top_level_disp,
         codecs,
         /* is_primary */ true,
     )?;
@@ -538,6 +542,7 @@ fn open_avi_inner(
                     &mut digitization_date,
                     &mut smpte_timecode,
                     &mut top_level_junk,
+                    &mut top_level_disp,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -583,6 +588,17 @@ fn open_avi_inner(
         metadata.push((
             "avi:movi.segments".to_string(),
             movi_segments.len().to_string(),
+        ));
+    }
+
+    // Round-373: surface top-level `DISP` chunk presence (RIFF tag
+    // registry → `SoundSchemeTitle`). The key is omitted when no `DISP`
+    // is present so absence stays observable. The raw bodies are reached
+    // via the typed `disp_chunks()` accessor.
+    if !top_level_disp.is_empty() {
+        metadata.push((
+            "avi:disp.count".to_string(),
+            top_level_disp.len().to_string(),
         ));
     }
 
@@ -2213,6 +2229,7 @@ fn open_avi_inner(
         smpte_timecode,
         top_level_junk,
         avix_riff_count,
+        top_level_disp,
         keyframe_by_offset,
         keyframe_per_stream,
     })
@@ -2258,6 +2275,7 @@ fn walk_riff_body(
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
     top_level_junk: &mut Vec<JunkChunk>,
+    top_level_disp: &mut Vec<DispChunk>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -2379,6 +2397,31 @@ fn walk_riff_body(
                 offset: header_offset,
                 size: hdr.size,
             });
+            skip_chunk(input, &hdr)?;
+        } else if &hdr.id == b"DISP" && is_primary {
+            // Round-373: record each top-level `DISP` chunk's position +
+            // raw body. `DISP` is a RIFF-level display / sound-scheme
+            // chunk (RIFF tag registry → `SoundSchemeTitle`); its body
+            // is meaningful so we retain the raw bytes verbatim. The
+            // leading 4-byte clipboard-format code is NOT split out (its
+            // structure isn't in the in-tree docs). Primary RIFF only —
+            // per OpenDML 2.0 all non-`movi` info lives in the first
+            // RIFF. The 8-byte header was already consumed.
+            let header_offset = input.stream_position()?.saturating_sub(8);
+            let pos = input.stream_position()?;
+            let avail = file_len.saturating_sub(pos);
+            let take = (hdr.size as u64).min(avail) as usize;
+            let mut buf = vec![0u8; take];
+            let read = read_up_to(input, &mut buf)?;
+            buf.truncate(read);
+            top_level_disp.push(DispChunk {
+                offset: header_offset,
+                size: hdr.size,
+                body: buf,
+            });
+            // Re-seek to the chunk header start so skip_chunk advances
+            // past the full declared body + word-pad consistently.
+            input.seek(SeekFrom::Start(header_offset + 8))?;
             skip_chunk(input, &hdr)?;
         } else {
             skip_chunk(input, &hdr)?;
@@ -5555,6 +5598,13 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::movi_segments`] / [`AviDemuxer::movi_segment_count`]
     /// `LIST movi` boundary surface.
     avix_riff_count: u32,
+    /// Top-level `DISP` chunks recorded during the primary RIFF body
+    /// walk (round-373). `DISP` is a RIFF-level display / sound-scheme
+    /// chunk (RIFF tag registry → `SoundSchemeTitle`); the body is
+    /// retained verbatim. Surfaced via [`AviDemuxer::disp_chunks`] /
+    /// [`AviDemuxer::disp_chunk_count`] + the `avi:disp.count` metadata
+    /// key. Empty when the file carried no `DISP`.
+    top_level_disp: Vec<DispChunk>,
     /// File-absolute chunk-header offset → keyframe flag, built once at
     /// `open()` from whichever per-chunk index the file carries.
     ///
@@ -5987,6 +6037,38 @@ pub struct JunkChunk {
     /// Surfaced verbatim from the chunk header with no clamping
     /// against the physical file length.
     pub size: u32,
+}
+
+/// One top-level `DISP` chunk recorded during the RIFF body walk
+/// (round-373).
+///
+/// `DISP` is a RIFF-level display / sound-scheme-title chunk listed in
+/// the RIFF tag registry (`docs/container/riff/metadata/exiftool-riff-tags.html`
+/// maps `'DISP'` → `SoundSchemeTitle`). It is a regular RIFF chunk
+/// (`'DISP' <le32 cb> <cb bytes>`) carried at the top level alongside
+/// `LIST hdrl` / `LIST INFO`. Unlike `JUNK` its body is meaningful, so
+/// the demuxer retains the **raw body bytes** verbatim in addition to
+/// the file-absolute header offset.
+///
+/// The body's internal structure — a leading 4-byte clipboard-format
+/// code (`CF_*`) followed by the format-specific payload — is **not**
+/// interpreted here: that layout is not specified in the in-tree docs
+/// (see the round-373 docs-gap note), so the demuxer surfaces the raw
+/// bytes and leaves any clipboard-format split to the caller. Surfaced
+/// via [`AviDemuxer::disp_chunks`] / [`AviDemuxer::disp_chunk_count`]
+/// plus the `avi:disp.count` metadata key (omitted when no `DISP` is
+/// present so absence stays observable).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DispChunk {
+    /// File-absolute offset of the `DISP` chunk's 8-byte RIFF header
+    /// (the position of the `DISP` FourCC itself, not its body).
+    pub offset: u64,
+    /// Declared `cb` body size in bytes (header + word-pad excluded).
+    pub size: u32,
+    /// Raw chunk body bytes, verbatim, exactly `size` bytes (or fewer
+    /// on a truncated tail). The leading 4-byte clipboard-format code
+    /// is NOT split out — see the struct-level note.
+    pub body: Vec<u8>,
 }
 
 /// One palette entry inside a [`PaletteChange`] body — `PALETTEENTRY`
@@ -9920,6 +10002,37 @@ impl AviDemuxer {
     /// (omitted when `0` so absence stays observable).
     pub fn avix_segment_count(&self) -> u32 {
         self.avix_riff_count
+    }
+
+    /// Top-level `DISP` chunks recorded during the primary RIFF body
+    /// walk, in file order (round-373).
+    ///
+    /// `DISP` is a RIFF-level display / sound-scheme-title chunk listed
+    /// in the RIFF tag registry
+    /// (`docs/container/riff/metadata/exiftool-riff-tags.html` maps
+    /// `'DISP'` → `SoundSchemeTitle`). It is carried at the top level
+    /// alongside `LIST hdrl` / `LIST INFO`. Each [`DispChunk`] holds the
+    /// file-absolute header offset, the declared `cb` body size, and the
+    /// **raw body bytes** verbatim.
+    ///
+    /// The body's internal layout — a leading 4-byte clipboard-format
+    /// code (`CF_*`) plus the format-specific payload — is **not**
+    /// interpreted: that structure is not specified in the in-tree docs,
+    /// so the caller receives the raw bytes and decides how (or whether)
+    /// to split off the clipboard-format code. Companion to the
+    /// `avi:disp.count` metadata key (omitted when no `DISP` is present
+    /// so absence stays observable). Empty when the file carried no
+    /// `DISP`. Write-side complement:
+    /// [`crate::muxer::AviMuxOptions::with_disp_chunk`].
+    pub fn disp_chunks(&self) -> &[DispChunk] {
+        &self.top_level_disp
+    }
+
+    /// Number of top-level `DISP` chunks (round-373) — the length of
+    /// [`Self::disp_chunks`]. `0` for a file with no `DISP`. Mirrors the
+    /// `avi:disp.count` metadata key.
+    pub fn disp_chunk_count(&self) -> usize {
+        self.top_level_disp.len()
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).
