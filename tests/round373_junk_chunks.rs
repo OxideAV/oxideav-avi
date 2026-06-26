@@ -24,7 +24,9 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi;
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{
+    open_with_kind, open_with_options, AviKind, AviMuxOptions, RiffSegmentLimit,
+};
 
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
@@ -206,6 +208,124 @@ fn many_junk_chunks_preserve_order_and_sizes() {
     let expected_total: u64 = sizes.iter().map(|&s| s as u64).sum();
     assert_eq!(dmx.junk_total_bytes(), expected_total);
 
+    let got = demux_all(&mut dmx);
+    assert_eq!(got, frames);
+}
+
+#[test]
+fn single_riff_file_has_one_movi_segment_zero_avix() {
+    let stream = magicyuv_stream(64, 64);
+    let frames: Vec<Vec<u8>> = (0..4).map(|i| synthesize_payload(i + 3760, 96)).collect();
+    let reg = registry_with_magicyuv();
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-r373-single-riff.avi");
+    mux_frames(&tmp, &stream, &frames, AviMuxOptions::new());
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = open_avi(rs, &reg).unwrap();
+
+    assert_eq!(dmx.movi_segment_count(), 1);
+    assert_eq!(dmx.movi_segments().len(), 1);
+    assert_eq!(dmx.avix_segment_count(), 0);
+
+    // Both OpenDML-specific layout keys omitted for a single-RIFF file.
+    let meta = dmx.metadata().to_vec();
+    assert!(!meta.iter().any(|(k, _)| k == "avi:riff.avix_count"));
+    assert!(!meta.iter().any(|(k, _)| k == "avi:movi.segments"));
+
+    let got = demux_all(&mut dmx);
+    assert_eq!(got, frames);
+}
+
+#[test]
+fn multi_riff_opendml_surfaces_avix_and_movi_segment_counts() {
+    // 8 frames of ~512 bytes each; limit 2 KiB forces multiple RIFFs.
+    let stream = magicyuv_stream(64, 64);
+    let frames: Vec<Vec<u8>> = (0..8).map(|i| synthesize_payload(i + 3770, 512)).collect();
+    let reg = registry_with_magicyuv();
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-r373-multi-riff.avi");
+    {
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_kind(
+            ws,
+            std::slice::from_ref(&stream),
+            AviKind::OpenDml(RiffSegmentLimit::Bytes(2 * 1024)),
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        for (i, payload) in frames.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, payload.clone());
+            pkt.pts = Some(i as i64);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    let bytes = std::fs::read(&tmp).unwrap();
+    let on_disk_avix = bytes.windows(4).filter(|w| *w == b"AVIX").count();
+    assert!(on_disk_avix >= 1, "expected >= 1 AVIX form on disk");
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let mut dmx = open_avi(rs, &reg).unwrap();
+
+    // One movi segment per RIFF: the primary + each AVIX. The demuxer's
+    // AVIX count equals the on-disk AVIX form count, and the movi
+    // segment count is exactly avix_count + 1 (one movi in the primary
+    // RIFF plus one per AVIX).
+    let avix = dmx.avix_segment_count();
+    assert_eq!(
+        avix as usize, on_disk_avix,
+        "demuxer AVIX count vs on-disk AVIX forms"
+    );
+    assert!(avix >= 1, "expected >= 1 AVIX segment");
+    assert_eq!(
+        dmx.movi_segment_count(),
+        avix as usize + 1,
+        "movi segments = primary + one per AVIX"
+    );
+
+    // Segments are non-overlapping, in file order, with start < end.
+    let segs = dmx.movi_segments().to_vec();
+    assert_eq!(segs.len(), dmx.movi_segment_count());
+    for seg in &segs {
+        assert!(seg.0 < seg.1, "movi segment start < end");
+        // The `start` points just past the 4-byte `movi` form-type
+        // FourCC, so the FourCC itself sits at `start - 4`.
+        let s = seg.0 as usize;
+        assert!(
+            s >= 4,
+            "movi segment start has room for the preceding FourCC"
+        );
+        assert_eq!(
+            &bytes[s - 4..s],
+            b"movi",
+            "movi FourCC sits 4 bytes before segment start"
+        );
+    }
+    for w in segs.windows(2) {
+        assert!(w[1].0 >= w[0].1, "movi segments must not overlap");
+    }
+
+    // Metadata keys mirror the typed surface.
+    let meta = dmx.metadata().to_vec();
+    let avix_meta = meta
+        .iter()
+        .find(|(k, _)| k == "avi:riff.avix_count")
+        .map(|(_, v)| v.clone());
+    let movi_meta = meta
+        .iter()
+        .find(|(k, _)| k == "avi:movi.segments")
+        .map(|(_, v)| v.clone());
+    assert_eq!(avix_meta.as_deref(), Some(avix.to_string().as_str()));
+    assert_eq!(
+        movi_meta.as_deref(),
+        Some(dmx.movi_segment_count().to_string().as_str())
+    );
+
+    // All frames recovered in order across every RIFF segment.
     let got = demux_all(&mut dmx);
     assert_eq!(got, frames);
 }

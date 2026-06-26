@@ -451,6 +451,10 @@ fn open_avi_inner(
     // Chunks"), recorded across both the primary RIFF and every
     // `RIFF AVIX` continuation, in file order.
     let mut top_level_junk: Vec<JunkChunk> = Vec::new();
+    // Round-373: count of `RIFF AVIX` extension chunks following the
+    // primary `RIFF AVI ` (OpenDML 2.0 §"RIFF Chunk Format"). `0` for a
+    // single-RIFF AVI 1.0 / OpenDML file that fits in one RIFF.
+    let mut avix_riff_count: u32 = 0;
 
     walk_riff_body(
         &mut *input,
@@ -499,6 +503,7 @@ fn open_avi_inner(
             let ext_end =
                 (input.stream_position()? + hdr.size.saturating_sub(4) as u64).min(file_len);
             if &form == b"AVIX" {
+                avix_riff_count = avix_riff_count.saturating_add(1);
                 walk_riff_body(
                     &mut *input,
                     ext_end,
@@ -558,6 +563,27 @@ fn open_avi_inner(
         ));
         let total: u64 = top_level_junk.iter().map(|j| j.size as u64).sum();
         metadata.push(("avi:junk.total_bytes".to_string(), total.to_string()));
+    }
+
+    // Round-373: surface the multi-RIFF segment layout (OpenDML 2.0
+    // §"RIFF Chunk Format"). `avi:riff.avix_count` is the number of
+    // `RIFF AVIX` extension chunks beyond the primary `RIFF AVI `;
+    // `avi:movi.segments` is the total count of `LIST movi` segments
+    // across all RIFFs. Both keys are omitted for a single-RIFF,
+    // single-movi file (avix_count == 0 / movi.segments <= 1) so the
+    // simple AVI 1.0 case stays free of OpenDML-specific keys and
+    // absence stays observable.
+    if avix_riff_count > 0 {
+        metadata.push((
+            "avi:riff.avix_count".to_string(),
+            avix_riff_count.to_string(),
+        ));
+    }
+    if movi_segments.len() > 1 {
+        metadata.push((
+            "avi:movi.segments".to_string(),
+            movi_segments.len().to_string(),
+        ));
     }
 
     // Round-14 candidate 2: audio `(format_tag, sample_size)` invariant.
@@ -2186,6 +2212,7 @@ fn open_avi_inner(
         digitization_date,
         smpte_timecode,
         top_level_junk,
+        avix_riff_count,
         keyframe_by_offset,
         keyframe_per_stream,
     })
@@ -5479,6 +5506,16 @@ pub struct AviDemuxer {
     /// for forensic / round-trip / layout inspection. Empty when the
     /// file carried no JUNK.
     top_level_junk: Vec<JunkChunk>,
+    /// Number of `RIFF AVIX` extension chunks beyond the primary
+    /// `RIFF AVI ` (round-373). Per OpenDML 2.0 §"RIFF Chunk Format":
+    /// *"An AVI file can be extended beyond 1 GB by placing more than
+    /// one RIFF chunk in the same file ... Subsequent RIFF chunks will
+    /// be identified by the AVIX (for AVI extended) chunk id."* `0` for
+    /// a single-RIFF AVI 1.0 / OpenDML file. Surfaced via
+    /// [`AviDemuxer::avix_segment_count`]; companion to the
+    /// [`AviDemuxer::movi_segments`] / [`AviDemuxer::movi_segment_count`]
+    /// `LIST movi` boundary surface.
+    avix_riff_count: u32,
     /// File-absolute chunk-header offset → keyframe flag, built once at
     /// `open()` from whichever per-chunk index the file carries.
     ///
@@ -9746,6 +9783,54 @@ impl AviDemuxer {
     /// JUNK. Mirrors the `avi:junk.total_bytes` metadata key.
     pub fn junk_total_bytes(&self) -> u64 {
         self.top_level_junk.iter().map(|j| j.size as u64).sum()
+    }
+
+    /// File-absolute `[start, end)` byte ranges of every `LIST movi`
+    /// segment, in file order (round-373).
+    ///
+    /// Per OpenDML 2.0 §"RIFF Chunk Format"
+    /// (`docs/container/riff/opendml-avi-2.0.pdf`): a single-RIFF AVI
+    /// 1.0 / OpenDML file has exactly one `LIST movi`; an OpenDML file
+    /// extended past the ~1 GB RIFF ceiling spreads its data across the
+    /// primary `RIFF AVI ` plus one or more `RIFF AVIX` extension
+    /// chunks, *"It is expected that the AVIX chunks only contain
+    /// LIST 'movi' data"* — so each RIFF contributes one `movi`
+    /// segment. The `start` of each range is the byte offset of the
+    /// first chunk header inside the `movi` LIST body — i.e. just past
+    /// the 4-byte `movi` form-type FourCC, so the FourCC itself sits at
+    /// `start - 4`; `end` is the clamped exclusive end of that
+    /// segment's body. These are the same segment boundaries
+    /// `next_packet` walks across, so a caller can map a packet's file
+    /// position back to the RIFF segment it lives in. There is always
+    /// at least one segment for a well-formed file.
+    pub fn movi_segments(&self) -> &[(u64, u64)] {
+        &self.movi_segments
+    }
+
+    /// Number of `LIST movi` segments across all RIFFs (round-373) — the
+    /// length of [`Self::movi_segments`]. `1` for a single-RIFF AVI 1.0
+    /// / OpenDML file; `1 + N` for an OpenDML file with `N` `RIFF AVIX`
+    /// extension RIFFs that each carry one `movi`. Mirrors the
+    /// `avi:movi.segments` metadata key (which is omitted when this is
+    /// `<= 1` so the simple case stays observable).
+    pub fn movi_segment_count(&self) -> usize {
+        self.movi_segments.len()
+    }
+
+    /// Number of `RIFF AVIX` extension chunks beyond the primary
+    /// `RIFF AVI ` (round-373).
+    ///
+    /// Per OpenDML 2.0 §"RIFF Chunk Format": *"Standard AVI
+    /// applications will see the first RIFF chunk (RIFF 'AVI') as a
+    /// standard AVI file ... Subsequent RIFF chunks will be identified
+    /// by the AVIX (for AVI extended) chunk id."* `0` for a single-RIFF
+    /// file (the only RIFF is the primary `AVI `). Distinct from
+    /// [`Self::movi_segment_count`]: the AVIX count excludes the
+    /// primary RIFF, while the movi-segment count includes the primary
+    /// RIFF's `movi`. Mirrors the `avi:riff.avix_count` metadata key
+    /// (omitted when `0` so absence stays observable).
+    pub fn avix_segment_count(&self) -> u32 {
+        self.avix_riff_count
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).
