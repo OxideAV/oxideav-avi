@@ -1451,6 +1451,13 @@ fn open_avi_inner(
     // including 'rec ' chunks"). Collected by `build_idx_table` while
     // it walks the raw entries; empty when no idx1 or no rec entries.
     let mut idx1_rec_entries: Vec<Idx1RecEntry> = Vec::new();
+    // Round-373: whether an `idx1` chunk was physically present in the
+    // primary RIFF, captured before `idx1_raw` is consumed into
+    // `idx_table`. Distinct from `idx_table.is_empty()` (a present
+    // idx1 holding only `rec ` LIST entries, or an empty idx1, yields an
+    // empty seek table while the chunk WAS present). Drives the
+    // `avih.dwFlags` `AVIF_HASINDEX` cross-check.
+    let has_idx1 = idx1_raw.is_some();
     let idx_table = if let Some(raw) = idx1_raw {
         scan_idx1_for_suffix(&raw, &streams, *b"pc", &mut palette_change_counts);
         scan_idx1_for_suffix(&raw, &streams, *b"tx", &mut text_chunk_counts);
@@ -2215,6 +2222,7 @@ fn open_avi_inner(
         palette_change_counts,
         text_chunk_counts,
         avih_flags: avih.as_ref().map(|h| h.flags).unwrap_or(0),
+        has_idx1,
         avih_suggested_buffer_size: avih.as_ref().map(|h| h.suggested_buffer_size).unwrap_or(0),
         avih_padding_granularity: avih.as_ref().map(|h| h.padding_granularity).unwrap_or(0),
         avih_initial_frames: avih.as_ref().map(|h| h.initial_frames).unwrap_or(0),
@@ -5124,6 +5132,13 @@ pub struct AviDemuxer {
     /// seen — typed-flag accessors then return their `false` /
     /// "no flag set" defaults.
     avih_flags: u32,
+    /// Whether an `idx1` chunk was physically present in the primary
+    /// RIFF (round-373). Distinct from `idx_table.is_empty()` — a
+    /// present idx1 holding only `rec ` LIST entries (or an empty idx1)
+    /// yields an empty seek table while the chunk WAS present. Drives
+    /// [`AviDemuxer::has_index_flag_violation`] — the `avih.dwFlags`
+    /// `AVIF_HASINDEX` cross-check.
+    has_idx1: bool,
     /// Raw `dwSuggestedBufferSize` from `AVIMAINHEADER` (round-13
     /// candidate 2). Mirror of [`Self::avih_flags`] for the
     /// per-AVI 1.0 §3.1 read-ahead allocation hint. Populated from
@@ -8602,6 +8617,41 @@ impl AviDemuxer {
             }
         }
         out
+    }
+
+    /// Cross-check of `avih.dwFlags` `AVIF_HASINDEX` against whether an
+    /// `idx1` chunk was physically present in the primary RIFF
+    /// (round-373).
+    ///
+    /// Per AVI 1.0 §"AVI Index Entries": *"If the file contains an
+    /// index, set the AVIF_HASINDEX flag in the dwFlags member of the
+    /// AVIMAINHEADER structure."* So for a conforming file the flag is
+    /// set iff an `idx1` chunk is present. Returns `Some((flag_set,
+    /// idx1_present))` when the two disagree, `None` when they agree (or
+    /// no `avih` was seen — the all-zero flag word then carries no claim
+    /// to validate, and `None` `avih` reads `AVIF_HASINDEX` clear).
+    ///
+    /// Informational only — never fails `open()` — in the same family
+    /// as [`Self::declared_vs_actual_stream_count_mismatch`] /
+    /// [`Self::palette_change_flag_violations`]. A flag-set-but-no-idx1
+    /// case is a hallmark of a truncated capture crash dump (the header
+    /// was stamped up-front but the file was cut off before the trailing
+    /// `idx1` was written) or a stripped index; an idx1-present-but-flag-
+    /// clear case is a writer that emitted the index but forgot the
+    /// hint (a player that trusts the flag for random-access capability
+    /// would needlessly fall back to a linear scan). The demuxer always
+    /// uses the index it physically found regardless of the flag.
+    ///
+    /// `idx1` presence is the **chunk** being present, distinct from the
+    /// per-stream seek table being non-empty — a present `idx1` holding
+    /// only `rec ` LIST entries still counts as present here.
+    pub fn has_index_flag_violation(&self) -> Option<(bool, bool)> {
+        let flag_set = self.avih_flags & AVIF_HASINDEX != 0;
+        if flag_set != self.has_idx1 {
+            Some((flag_set, self.has_idx1))
+        } else {
+            None
+        }
     }
 
     /// Per-segment `_avisuperindex_entry.dwDuration` values from a
