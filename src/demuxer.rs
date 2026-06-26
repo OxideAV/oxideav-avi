@@ -3635,6 +3635,45 @@ pub struct BlockAlignViolation {
     pub block_align: u16,
 }
 
+/// One video stream whose `AVISF_VIDEO_PALCHANGES` strh flag disagrees
+/// with whether the stream actually carries `xxpc` palette-change
+/// chunks (round-373).
+///
+/// Per AVI 1.0 §"Stream Data ('movi' List)": *"Video data chunks can
+/// also define new palette entries to update the palette during an AVI
+/// sequence. Each palette-change chunk ('xxpc') contains an
+/// AVIPALCHANGE structure. If a stream contains palette changes, set
+/// the AVISF_VIDEO_PALCHANGES flag in the dwFlags member of the
+/// AVISTREAMHEADER structure for that stream."* The flag is the
+/// playback hint that warns a player it must animate the palette; a
+/// conforming writer sets it iff the stream emits `xxpc` chunks.
+///
+/// Returned (possibly empty) by
+/// [`AviDemuxer::palette_change_flag_violations`]. Like the other
+/// cross-checks in this family
+/// ([`AviDemuxer::declared_vs_actual_stream_count_mismatch`] /
+/// [`AviDemuxer::cbr_audio_block_alignment_violations`]) it is purely
+/// informational — it never fails `open()`. A violation flags either a
+/// writer that emitted `xxpc` chunks but forgot to set the flag (a
+/// player that trusts the flag would skip the palette animation), or a
+/// writer that set the flag but emitted no `xxpc` (a spurious hint).
+/// Scoped to video streams, since the flag + chunk family are
+/// video-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaletteChangeFlagViolation {
+    /// Stream number whose `AVISF_VIDEO_PALCHANGES` flag was checked.
+    pub stream_index: u32,
+    /// Whether the `AVISF_VIDEO_PALCHANGES` (`0x0001_0000`) bit is set
+    /// in the stream's `AVISTREAMHEADER.dwFlags`.
+    pub flag_set: bool,
+    /// Number of `xxpc` palette-change chunks the demuxer actually saw
+    /// for the stream (the value behind
+    /// [`AviDemuxer::palette_change_count`]). A violation is reported
+    /// when this is `> 0` but `flag_set` is `false`, or when this is
+    /// `0` but `flag_set` is `true`.
+    pub palette_change_chunks: u32,
+}
+
 /// One super-index whose per-segment `dwDuration` total disagrees with
 /// the file's `dmlh.dwTotalFrames` (round-101).
 ///
@@ -8334,6 +8373,56 @@ impl AviDemuxer {
             }
             if let Some(slot) = seen_per_stream.get_mut(stream as usize) {
                 *slot = base.saturating_add(ix.entries.len());
+            }
+        }
+        out
+    }
+
+    /// Cross-check of each video stream's `AVISF_VIDEO_PALCHANGES` strh
+    /// flag against whether the stream actually carries `xxpc`
+    /// palette-change chunks (round-373).
+    ///
+    /// Per AVI 1.0 §"Stream Data ('movi' List)": *"If a stream contains
+    /// palette changes, set the AVISF_VIDEO_PALCHANGES flag in the
+    /// dwFlags member of the AVISTREAMHEADER structure for that
+    /// stream."* So for a conforming file the flag is set iff the
+    /// stream emits at least one `xxpc` chunk. This returns one
+    /// [`PaletteChangeFlagViolation`] per **video** stream where the two
+    /// disagree:
+    ///
+    /// - flag set but no `xxpc` seen — a spurious palette-animation hint
+    ///   (a player may needlessly prepare for palette updates);
+    /// - `xxpc` seen but flag clear — a missing hint (a player that
+    ///   trusts the flag would skip the palette animation and render
+    ///   wrong colours after the first change).
+    ///
+    /// Informational only, in the same family as
+    /// [`Self::declared_vs_actual_stream_count_mismatch`] /
+    /// [`Self::cbr_audio_block_alignment_violations`]: it never fails
+    /// `open()`, and the demuxer always reports the `xxpc` chunks it
+    /// physically saw regardless of the flag. Non-video streams are
+    /// skipped (the flag + chunk family are video-only). Returns an
+    /// empty Vec for a conforming file.
+    pub fn palette_change_flag_violations(&self) -> Vec<PaletteChangeFlagViolation> {
+        let mut out = Vec::new();
+        for (i, stream) in self.streams.iter().enumerate() {
+            if !matches!(stream.params.media_type, MediaType::Video) {
+                continue;
+            }
+            let flag_set = self
+                .stream_flags
+                .get(i)
+                .copied()
+                .flatten()
+                .map(|f| f & AVISF_VIDEO_PALCHANGES != 0)
+                .unwrap_or(false);
+            let chunks = self.palette_change_counts.get(i).copied().unwrap_or(0);
+            if flag_set != (chunks > 0) {
+                out.push(PaletteChangeFlagViolation {
+                    stream_index: i as u32,
+                    flag_set,
+                    palette_change_chunks: chunks,
+                });
             }
         }
         out
