@@ -647,6 +647,27 @@ fn open_avi_inner(
         })
         .collect();
 
+    // Round-373: the raw per-stream `WAVEFORMATEX.nBlockAlign`, parallel
+    // to `streams`, for ALL audio streams regardless of CBR/VBR (the
+    // round-96 `audio_cbr_block_aligns` above is scoped to CBR streams
+    // with `nBlockAlign > 1`). `None` for non-audio streams, audio
+    // streams with no parsable WAVEFORMATEX, or a stamped `0`
+    // ("unspecified"); the typed accessor maps `0` to `None` so a
+    // VBR stream that left `nBlockAlign` at the writer default reads the
+    // same as one with no value. Surfaced via
+    // [`AviDemuxer::stream_block_align`].
+    let audio_block_aligns: Vec<Option<u16>> = audio_infos
+        .iter()
+        .map(|ai| ai.and_then(|info| (info.block_align != 0).then_some(info.block_align)))
+        .collect();
+    // Round-373: per-stream VBR/CBR classification from the audio
+    // format tag (`Some(true)` ⇒ VBR, `Some(false)` ⇒ CBR,
+    // `None` ⇒ non-audio / unconstrained tag), parallel to `streams`.
+    let audio_vbr_flags: Vec<Option<bool>> = audio_infos
+        .iter()
+        .map(|ai| ai.and_then(|info| classify_audio_sample_size(info.format_tag)))
+        .collect();
+
     if movi_segments.is_empty() {
         return Err(Error::invalid("AVI: missing movi list"));
     }
@@ -2188,6 +2209,8 @@ fn open_avi_inner(
         super_indexes,
         std_indexes,
         audio_cbr_block_aligns,
+        audio_block_aligns,
+        audio_vbr_flags,
         idx1_flags_per_stream,
         palette_change_counts,
         text_chunk_counts,
@@ -5046,6 +5069,23 @@ pub struct AviDemuxer {
     /// validate against). Drives
     /// [`AviDemuxer::cbr_audio_block_alignment_violations`].
     audio_cbr_block_aligns: Vec<Option<u16>>,
+    /// Raw per-stream `WAVEFORMATEX.nBlockAlign` for ALL audio streams
+    /// regardless of CBR/VBR (round-373), parallel to `streams`.
+    /// `Some(block_align)` for an audio stream whose WAVEFORMATEX
+    /// carried a nonzero `nBlockAlign`; `None` for video / data
+    /// streams, audio with no parsable WAVEFORMATEX, or a `0` stamp.
+    /// Distinct from [`Self::audio_cbr_block_aligns`] which is scoped to
+    /// CBR streams with `nBlockAlign > 1`. Surfaced via
+    /// [`AviDemuxer::stream_block_align`].
+    audio_block_aligns: Vec<Option<u16>>,
+    /// Per-stream VBR/CBR classification (round-373), parallel to
+    /// `streams`. `Some(true)` ⇒ the audio format tag is a documented
+    /// VBR codec (MPEG / MP3 / AAC / AC-3 / DTS / WMA / Opus),
+    /// `Some(false)` ⇒ a documented CBR codec (PCM / A-law / µ-law /
+    /// IMA-ADPCM), `None` ⇒ non-audio stream or a format tag the AVI
+    /// 1.0 sample-size invariant doesn't constrain. Surfaced via
+    /// [`AviDemuxer::audio_is_vbr`].
+    audio_vbr_flags: Vec<Option<bool>>,
     /// Per-stream idx1-flags lookup table (round-8 candidate 1).
     ///
     /// Built once at `open()` from `idx_table`: outer index is
@@ -8458,6 +8498,60 @@ impl AviDemuxer {
             }
         }
         out
+    }
+
+    /// Raw `WAVEFORMATEX.nBlockAlign` for an audio stream (round-373).
+    ///
+    /// Returns the byte size of one sample block as declared in the
+    /// stream's `strf` WAVEFORMATEX — `nChannels * wBitsPerSample / 8`
+    /// for PCM, the codec-defined frame size for compressed audio. Per
+    /// AVI 1.0 §"AVISTREAMHEADER" `dwScale`/`dwRate`: the per-stream
+    /// time base for audio *"corresponds to the time needed to play
+    /// nBlockAlign bytes of audio"*, so `nBlockAlign` is the unit the
+    /// audio time base is expressed against.
+    ///
+    /// `None` for non-audio streams, audio with no parsable
+    /// WAVEFORMATEX, or a stamped `0` ("unspecified"). The `0`-to-`None`
+    /// mapping mirrors the "default == absent" convention used across
+    /// the other raw-field accessors — a VBR stream that left
+    /// `nBlockAlign` at the writer default reads the same as one with no
+    /// value. Unlike [`Self::cbr_audio_block_alignment_violations`]
+    /// (which only consults CBR streams with `nBlockAlign > 1`), this
+    /// surfaces the value for **every** audio stream, including VBR
+    /// streams whose `nBlockAlign` is typically `1`.
+    pub fn stream_block_align(&self, stream_index: u32) -> Option<u16> {
+        self.audio_block_aligns
+            .get(stream_index as usize)
+            .copied()
+            .flatten()
+    }
+
+    /// VBR/CBR classification of an audio stream from its `wFormatTag`
+    /// (round-373).
+    ///
+    /// Returns `Some(true)` when the stream's audio format tag is a
+    /// documented variable-bit-rate codec (MPEG / MP3 / AAC / AC-3 /
+    /// DTS / WMA / Opus — one packet per audio frame, `strh.dwSampleSize
+    /// == 0`), `Some(false)` for a documented constant-bit-rate codec
+    /// (PCM / A-law / µ-law / IMA-ADPCM — a fixed `nBlockAlign` bytes
+    /// per sample block, `strh.dwSampleSize == nBlockAlign`), and `None`
+    /// for a non-audio stream or a format tag the AVI 1.0 sample-size
+    /// invariant doesn't pin one way or the other (e.g. a custom /
+    /// future registration).
+    ///
+    /// This is the classification behind the `open()`-time VBR/CBR
+    /// sample-size invariant (C2) and the `nBlockAlign` edge handling:
+    /// for a VBR stream `nBlockAlign` is advisory (usually `1`) and the
+    /// frame boundary is the chunk boundary, whereas for a CBR stream
+    /// `nBlockAlign` is the hard sample-block size every chunk must be a
+    /// multiple of. Pairs with [`Self::stream_block_align`] so a caller
+    /// can decide whether to treat `nBlockAlign` as a framing constraint
+    /// (CBR) or a hint (VBR).
+    pub fn audio_is_vbr(&self, stream_index: u32) -> Option<bool> {
+        self.audio_vbr_flags
+            .get(stream_index as usize)
+            .copied()
+            .flatten()
     }
 
     /// Cross-check of each video stream's `AVISF_VIDEO_PALCHANGES` strh
