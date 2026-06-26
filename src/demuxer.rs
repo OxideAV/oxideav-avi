@@ -447,6 +447,10 @@ fn open_avi_inner(
     // `None` until/unless the primary RIFF's `hdrl` carries an `ISMP`
     // chunk with a non-empty (after NUL/whitespace trim) body.
     let mut smpte_timecode: Option<String> = None;
+    // Round-373: top-level `JUNK` padding chunks (AVI 1.0 §"Other Data
+    // Chunks"), recorded across both the primary RIFF and every
+    // `RIFF AVIX` continuation, in file order.
+    let mut top_level_junk: Vec<JunkChunk> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -481,6 +485,7 @@ fn open_avi_inner(
         &mut stream_fcc_types,
         &mut digitization_date,
         &mut smpte_timecode,
+        &mut top_level_junk,
         codecs,
         /* is_primary */ true,
     )?;
@@ -527,6 +532,7 @@ fn open_avi_inner(
                     &mut stream_fcc_types,
                     &mut digitization_date,
                     &mut smpte_timecode,
+                    &mut top_level_junk,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -536,6 +542,22 @@ fn open_avi_inner(
         } else {
             skip_chunk(&mut *input, &hdr)?;
         }
+    }
+
+    // Round-373: surface top-level `JUNK` padding-chunk layout via
+    // metadata keys (AVI 1.0 §"Other Data Chunks"). Both keys are
+    // omitted when the file carries no JUNK so absence stays observable,
+    // mirroring the "default == absent" convention used across the other
+    // demuxer surfaces. `count` is the number of JUNK chunks across the
+    // primary RIFF + every `RIFF AVIX` continuation; `total_bytes` sums
+    // their declared `cb` body sizes (header + word-pad excluded).
+    if !top_level_junk.is_empty() {
+        metadata.push((
+            "avi:junk.count".to_string(),
+            top_level_junk.len().to_string(),
+        ));
+        let total: u64 = top_level_junk.iter().map(|j| j.size as u64).sum();
+        metadata.push(("avi:junk.total_bytes".to_string(), total.to_string()));
     }
 
     // Round-14 candidate 2: audio `(format_tag, sample_size)` invariant.
@@ -2163,6 +2185,7 @@ fn open_avi_inner(
         stream_fcc_types,
         digitization_date,
         smpte_timecode,
+        top_level_junk,
         keyframe_by_offset,
         keyframe_per_stream,
     })
@@ -2207,6 +2230,7 @@ fn walk_riff_body(
     stream_fcc_types: &mut Vec<Option<[u8; 4]>>,
     digitization_date: &mut Option<String>,
     smpte_timecode: &mut Option<String>,
+    top_level_junk: &mut Vec<JunkChunk>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -2315,6 +2339,20 @@ fn walk_riff_body(
             }
             skip_pad(input, hdr.size)?;
             *idx1_raw = Some(buf);
+        } else if &hdr.id == b"JUNK" || &hdr.id == b"junk" {
+            // Round-373: record each top-level `JUNK` padding chunk's
+            // position + declared size (per AVI 1.0 §"Other Data
+            // Chunks"). Its *contents* stay ignored — JUNK never enters
+            // the packet stream — but the layout is surfaced for
+            // forensic / round-trip inspection. The 8-byte header was
+            // already consumed, so the chunk header started 8 bytes
+            // before the current position.
+            let header_offset = input.stream_position()?.saturating_sub(8);
+            top_level_junk.push(JunkChunk {
+                offset: header_offset,
+                size: hdr.size,
+            });
+            skip_chunk(input, &hdr)?;
         } else {
             skip_chunk(input, &hdr)?;
         }
@@ -5431,6 +5469,16 @@ pub struct AviDemuxer {
     /// normalised. Surfaced via the typed [`AviDemuxer::smpte_timecode`]
     /// accessor in addition to the `avi:ismp` metadata key.
     smpte_timecode: Option<String>,
+    /// Top-level `JUNK` padding chunks recorded during the RIFF body
+    /// walk, in file order across the primary RIFF + every `RIFF AVIX`
+    /// continuation (round-373). Per AVI 1.0 §"Other Data Chunks" the
+    /// *contents* are ignored — JUNK never enters the packet stream —
+    /// but each chunk's file-absolute header offset + declared body
+    /// size are surfaced via [`AviDemuxer::junk_chunks`] /
+    /// [`AviDemuxer::junk_chunk_count`] / [`AviDemuxer::junk_total_bytes`]
+    /// for forensic / round-trip / layout inspection. Empty when the
+    /// file carried no JUNK.
+    top_level_junk: Vec<JunkChunk>,
     /// File-absolute chunk-header offset → keyframe flag, built once at
     /// `open()` from whichever per-chunk index the file carries.
     ///
@@ -5832,6 +5880,36 @@ pub struct Idx1RecEntry {
     /// value (the 4-byte `rec ` form-type FourCC plus the grouped
     /// chunk bytes), surfaced verbatim with no cross-validation
     /// against the on-disk LIST header.
+    pub size: u32,
+}
+
+/// One top-level `JUNK` padding chunk recorded during the RIFF body
+/// walk (round-373).
+///
+/// Per AVI 1.0 §"Other Data Chunks": *"Data can be aligned in an AVI
+/// file by inserting 'JUNK' chunks as needed. Applications should
+/// ignore the contents of a 'JUNK' chunk."* The demuxer continues to
+/// ignore the *contents* — the bytes never enter the packet stream —
+/// but records each JUNK chunk's file-absolute position and declared
+/// size so a caller doing forensic / round-trip / layout analysis can
+/// observe where the writer inserted padding (e.g. the conventional
+/// pre-`movi` alignment JUNK most VfW writers emit, or the
+/// `dwPaddingGranularity`-driven per-packet JUNK this crate's own
+/// muxer can write via `with_padding_granularity`). Surfaced via
+/// [`AviDemuxer::junk_chunks`] / [`AviDemuxer::junk_chunk_count`] /
+/// [`AviDemuxer::junk_total_bytes`] plus the `avi:junk.count` /
+/// `avi:junk.total_bytes` metadata keys. Both the canonical `JUNK`
+/// FourCC and the lowercase `junk` variant some legacy writers emit
+/// are recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JunkChunk {
+    /// File-absolute offset of the JUNK chunk's 8-byte RIFF header
+    /// (the position of the `JUNK` FourCC itself, not its body).
+    pub offset: u64,
+    /// Declared `cb` body size in bytes (not including the 8-byte
+    /// header and not including any trailing RIFF word-pad byte).
+    /// Surfaced verbatim from the chunk header with no clamping
+    /// against the physical file length.
     pub size: u32,
 }
 
@@ -9629,6 +9707,45 @@ impl AviDemuxer {
     /// [`crate::muxer::AviMuxOptions::with_smpte_timecode`].
     pub fn smpte_timecode(&self) -> Option<&str> {
         self.smpte_timecode.as_deref()
+    }
+
+    /// Top-level `JUNK` padding chunks recorded during the RIFF body
+    /// walk, in file order (round-373).
+    ///
+    /// Per AVI 1.0 §"Other Data Chunks": *"Data can be aligned in an
+    /// AVI file by inserting 'JUNK' chunks as needed. Applications
+    /// should ignore the contents of a 'JUNK' chunk."* The demuxer
+    /// ignores the contents — JUNK never enters the packet stream — but
+    /// records each chunk's file-absolute header offset and declared
+    /// `cb` body size so a forensic / round-trip / layout caller can
+    /// observe where the writer inserted padding (the conventional
+    /// pre-`movi` alignment JUNK most VfW writers emit, the
+    /// `dwPaddingGranularity`-driven per-packet JUNK this crate's own
+    /// muxer writes via
+    /// [`crate::muxer::AviMuxOptions::with_padding_granularity`], or an
+    /// explicit top-level JUNK via
+    /// [`crate::muxer::AviMuxOptions::with_top_level_junk`]). The list
+    /// spans the primary RIFF and every `RIFF AVIX` continuation.
+    /// Companion to the `avi:junk.count` / `avi:junk.total_bytes`
+    /// metadata keys (both omitted when the slice is empty so absence
+    /// stays observable). Empty when the file carried no JUNK.
+    pub fn junk_chunks(&self) -> &[JunkChunk] {
+        &self.top_level_junk
+    }
+
+    /// Number of top-level `JUNK` padding chunks (round-373) — the
+    /// length of [`Self::junk_chunks`], summed across the primary RIFF
+    /// and every `RIFF AVIX` continuation. `0` for a file with no JUNK.
+    pub fn junk_chunk_count(&self) -> usize {
+        self.top_level_junk.len()
+    }
+
+    /// Sum of the declared `cb` body sizes of every top-level `JUNK`
+    /// padding chunk (round-373), excluding the per-chunk 8-byte header
+    /// and any trailing RIFF word-pad byte. `0` for a file with no
+    /// JUNK. Mirrors the `avi:junk.total_bytes` metadata key.
+    pub fn junk_total_bytes(&self) -> u64 {
+        self.top_level_junk.iter().map(|j| j.size as u64).sum()
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).

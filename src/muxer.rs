@@ -925,6 +925,28 @@ pub struct AviMuxOptions {
     /// purpose and will surface through
     /// `super_index_duration_violations()` on re-demux.
     pub dmlh_total_frames: Option<u32>,
+    /// Explicit top-level `JUNK` padding chunks to emit as siblings of
+    /// `LIST hdrl`, just before the `movi` LIST (round-373). Each entry
+    /// is a JUNK body size in bytes; the muxer writes one `JUNK` chunk
+    /// per entry with that many zero bytes of body (RIFF word-pad
+    /// applied for odd sizes).
+    ///
+    /// Per AVI 1.0 §"Other Data Chunks"
+    /// (`docs/container/riff/avi-riff-file-reference.md`): *"Data can
+    /// be aligned in an AVI file by inserting 'JUNK' chunks as needed.
+    /// Applications should ignore the contents of a 'JUNK' chunk."*
+    /// This is the write-side complement of the round-373 demuxer
+    /// [`crate::demuxer::AviDemuxer::junk_chunks`] surface: a fixture
+    /// authored with `with_top_level_junk` round-trips through
+    /// `junk_chunks` / `junk_chunk_count` / `junk_total_bytes` and the
+    /// `avi:junk.count` / `avi:junk.total_bytes` metadata keys.
+    /// Distinct from the per-packet alignment JUNK driven by
+    /// [`Self::padding_granularity`] (which inserts JUNK *inside* the
+    /// `movi` LIST ahead of each misaligned packet); these chunks sit
+    /// at the top level outside `movi`, so they never affect packet /
+    /// index offsets. Default empty (no top-level JUNK emitted).
+    /// Use [`Self::with_top_level_junk`].
+    pub top_level_junk_sizes: Vec<u32>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1261,6 +1283,27 @@ impl AviMuxOptions {
     /// payload. No-op when [`Self::with_info`] was never called.
     pub fn with_top_level_info(mut self, on: bool) -> Self {
         self.info_top_level = on;
+        self
+    }
+
+    /// Builder helper: append a top-level `JUNK` padding chunk of
+    /// `body_size` bytes, emitted as a sibling of `LIST hdrl` just
+    /// before the `movi` LIST (round-373). Repeatable — each call adds
+    /// one more JUNK chunk in call order.
+    ///
+    /// Per AVI 1.0 §"Other Data Chunks": *"Data can be aligned in an
+    /// AVI file by inserting 'JUNK' chunks as needed."* The body is
+    /// `body_size` zero bytes (readers ignore JUNK contents); a RIFF
+    /// word-pad byte is appended for odd sizes. This is the write-side
+    /// complement of [`crate::demuxer::AviDemuxer::junk_chunks`] — a
+    /// fixture authored this way round-trips through `junk_chunks` /
+    /// `junk_chunk_count` / `junk_total_bytes`. Distinct from the
+    /// per-packet alignment JUNK driven by
+    /// [`Self::with_padding_granularity`] (which inserts JUNK inside
+    /// `movi`); these sit outside `movi` so they never shift packet /
+    /// index offsets.
+    pub fn with_top_level_junk(mut self, body_size: u32) -> Self {
+        self.top_level_junk_sizes.push(body_size);
         self
     }
 
@@ -2920,6 +2963,19 @@ impl Muxer for AviMuxer {
         // byte-equally regardless of which the muxer chose.
         if want_info && self.options.info_top_level {
             write_info_list(self.output.as_mut(), &self.options.info_entries)?;
+        }
+
+        // Round-373: emit explicit top-level `JUNK` padding chunks as
+        // siblings of `LIST hdrl`, just before the `movi` LIST opens
+        // (AVI 1.0 §"Other Data Chunks"). Each is a `JUNK` chunk with
+        // `size` zero bytes of body; `write_chunk` applies the RIFF
+        // word-pad for odd sizes. These sit outside `movi`, so they do
+        // not affect packet / `idx1` / `ix##` offsets. The round-373
+        // demuxer reads them back via `walk_riff_body`'s `JUNK` arm and
+        // surfaces them through `AviDemuxer::junk_chunks`.
+        for &size in &self.options.top_level_junk_sizes {
+            let body = vec![0u8; size as usize];
+            write_chunk(self.output.as_mut(), b"JUNK", &body)?;
         }
 
         // movi LIST — size patched in write_trailer (or when this segment
