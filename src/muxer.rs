@@ -964,6 +964,24 @@ pub struct AviMuxOptions {
     /// (raw body byte-equal) and the `avi:disp.count` metadata key.
     /// Default empty (no `DISP` emitted). Use [`Self::with_disp_chunk`].
     pub disp_chunks: Vec<Vec<u8>>,
+    /// Explicit top-level `CSET` (character-set) chunks to emit as
+    /// siblings of `LIST hdrl`, just before the `movi` LIST (round-377).
+    /// Each entry is a [`crate::demuxer::CsetChunk`] whose four 16-bit
+    /// fields (`code_page`, `country_code`, `language_code`, `dialect`)
+    /// are serialised into the canonical 8-byte little-endian `CSET`
+    /// body via [`crate::demuxer::CsetChunk::to_bytes`]; the entry's
+    /// `offset` field is ignored on write (it is read-side layout
+    /// metadata).
+    ///
+    /// `CSET` is a generic RIFF chunk that overrides the character set /
+    /// language / country / dialect of the form's text chunks
+    /// (`docs/container/riff/metadata/exiftool-riff-tags.html` "RIFF
+    /// CSET Tags"). Write-side complement of the round-377 demuxer
+    /// [`crate::demuxer::AviDemuxer::cset_chunks`] surface: a fixture
+    /// authored with `with_cset` round-trips through `cset_chunks`
+    /// (typed-field-equal) and the `avi:cset.count` metadata key.
+    /// Default empty (no `CSET` emitted). Use [`Self::with_cset`].
+    pub cset_chunks: Vec<crate::demuxer::CsetChunk>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1340,6 +1358,47 @@ impl AviMuxOptions {
     pub fn with_disp_chunk(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.disp_chunks.push(body.into());
         self
+    }
+
+    /// Builder helper: append a top-level `CSET` (character-set) chunk,
+    /// emitted as a sibling of `LIST hdrl` just before the `movi` LIST
+    /// (round-377). Repeatable — each call adds one more `CSET` chunk in
+    /// call order.
+    ///
+    /// `CSET` is a generic RIFF chunk that overrides the character set /
+    /// language / country / dialect of the form's text chunks. The four
+    /// 16-bit fields of `cset` are serialised into the canonical 8-byte
+    /// little-endian body via [`crate::demuxer::CsetChunk::to_bytes`]
+    /// (the entry's `offset` is read-side layout metadata and is ignored
+    /// on write). The 8-byte body is even, so no RIFF word-pad byte is
+    /// needed. Write-side complement of the round-377
+    /// [`crate::demuxer::AviDemuxer::cset_chunks`] surface: a fixture
+    /// authored this way round-trips with the four typed fields equal.
+    pub fn with_cset(mut self, cset: crate::demuxer::CsetChunk) -> Self {
+        self.cset_chunks.push(cset);
+        self
+    }
+
+    /// Builder helper: append a top-level `CSET` chunk built from the
+    /// four raw 16-bit override fields (round-377). Convenience wrapper
+    /// over [`Self::with_cset`] for callers that don't already hold a
+    /// [`crate::demuxer::CsetChunk`]. The fields map directly to the
+    /// RIFF CSET tag-index order
+    /// (`docs/container/riff/metadata/exiftool-riff-tags.html`).
+    pub fn with_cset_fields(
+        self,
+        code_page: u16,
+        country_code: u16,
+        language_code: u16,
+        dialect: u16,
+    ) -> Self {
+        self.with_cset(crate::demuxer::CsetChunk {
+            offset: 0,
+            code_page,
+            country_code,
+            language_code,
+            dialect,
+        })
     }
 
     /// Builder helper: stamp `bits` verbatim into `avih.dwFlags`
@@ -3021,6 +3080,18 @@ impl Muxer for AviMuxer {
         // `DISP` arm and surfaces them through `AviDemuxer::disp_chunks`.
         for body in &self.options.disp_chunks {
             write_chunk(self.output.as_mut(), b"DISP", body)?;
+        }
+
+        // Round-377: emit explicit top-level `CSET` (character-set)
+        // chunks as siblings of `LIST hdrl`, just before the `movi`
+        // LIST. Each entry's four 16-bit fields are serialised into the
+        // canonical 8-byte little-endian body via `CsetChunk::to_bytes`
+        // (the entry's `offset` is read-side layout metadata, ignored on
+        // write). The 8-byte body is even, so no word-pad is appended.
+        // The round-377 demuxer reads these back via `walk_riff_body`'s
+        // `CSET` arm and surfaces them through `AviDemuxer::cset_chunks`.
+        for cset in &self.options.cset_chunks {
+            write_chunk(self.output.as_mut(), b"CSET", &cset.to_bytes())?;
         }
 
         // movi LIST — size patched in write_trailer (or when this segment

@@ -458,6 +458,10 @@ fn open_avi_inner(
     // Round-373: top-level `DISP` chunks (RIFF tag registry →
     // `SoundSchemeTitle`), primary RIFF only, in file order.
     let mut top_level_disp: Vec<DispChunk> = Vec::new();
+    // Round-377: top-level `CSET` (character-set) chunks (generic RIFF
+    // chunk; four 16-bit code-page / country / language / dialect
+    // overrides), primary RIFF only, in file order.
+    let mut top_level_cset: Vec<CsetChunk> = Vec::new();
 
     walk_riff_body(
         &mut *input,
@@ -494,6 +498,7 @@ fn open_avi_inner(
         &mut smpte_timecode,
         &mut top_level_junk,
         &mut top_level_disp,
+        &mut top_level_cset,
         codecs,
         /* is_primary */ true,
     )?;
@@ -543,6 +548,7 @@ fn open_avi_inner(
                     &mut smpte_timecode,
                     &mut top_level_junk,
                     &mut top_level_disp,
+                    &mut top_level_cset,
                     codecs,
                     /* is_primary */ false,
                 )?;
@@ -599,6 +605,17 @@ fn open_avi_inner(
         metadata.push((
             "avi:disp.count".to_string(),
             top_level_disp.len().to_string(),
+        ));
+    }
+
+    // Round-377: surface top-level `CSET` (character-set) chunk presence
+    // (generic RIFF chunk). The key is omitted when no `CSET` is present
+    // so absence stays observable. The typed fields are reached via the
+    // `cset_chunks()` accessor.
+    if !top_level_cset.is_empty() {
+        metadata.push((
+            "avi:cset.count".to_string(),
+            top_level_cset.len().to_string(),
         ));
     }
 
@@ -2261,6 +2278,7 @@ fn open_avi_inner(
         top_level_junk,
         avix_riff_count,
         top_level_disp,
+        top_level_cset,
         keyframe_by_offset,
         keyframe_per_stream,
     })
@@ -2307,6 +2325,7 @@ fn walk_riff_body(
     smpte_timecode: &mut Option<String>,
     top_level_junk: &mut Vec<JunkChunk>,
     top_level_disp: &mut Vec<DispChunk>,
+    top_level_cset: &mut Vec<CsetChunk>,
     codecs: &dyn CodecResolver,
     is_primary: bool,
 ) -> Result<()> {
@@ -2452,6 +2471,30 @@ fn walk_riff_body(
             });
             // Re-seek to the chunk header start so skip_chunk advances
             // past the full declared body + word-pad consistently.
+            input.seek(SeekFrom::Start(header_offset + 8))?;
+            skip_chunk(input, &hdr)?;
+        } else if &hdr.id == b"CSET" && is_primary {
+            // Round-377: record each top-level `CSET` character-set
+            // chunk. Its body is a fixed 8-byte record of four
+            // little-endian 16-bit fields (code-page / country /
+            // language / dialect) per the RIFF CSET tag-index order in
+            // `docs/container/riff/metadata/exiftool-riff-tags.html`.
+            // Primary RIFF only — the override applies to the form's
+            // text chunks, all of which live in the first RIFF. The
+            // 8-byte chunk header was already consumed, so the header
+            // started 8 bytes before the current position.
+            let header_offset = input.stream_position()?.saturating_sub(8);
+            let pos = input.stream_position()?;
+            let avail = file_len.saturating_sub(pos);
+            let take = (hdr.size as u64).min(avail).min(8) as usize;
+            let mut buf = [0u8; 8];
+            let _ = read_up_to(input, &mut buf[..take])?;
+            if let Some(cset) = CsetChunk::parse(header_offset, &buf[..take]) {
+                top_level_cset.push(cset);
+            }
+            // Re-seek to the chunk header start so skip_chunk advances
+            // past the full declared body + word-pad consistently
+            // (the body may be longer than the 8 bytes we parsed).
             input.seek(SeekFrom::Start(header_offset + 8))?;
             skip_chunk(input, &hdr)?;
         } else {
@@ -5660,6 +5703,14 @@ pub struct AviDemuxer {
     /// [`AviDemuxer::disp_chunk_count`] + the `avi:disp.count` metadata
     /// key. Empty when the file carried no `DISP`.
     top_level_disp: Vec<DispChunk>,
+    /// Top-level `CSET` (character-set) chunks recorded during the
+    /// primary RIFF body walk (round-377). Each carries the four
+    /// 16-bit code-page / country / language / dialect overrides for
+    /// the enclosing form's text chunks. Surfaced via
+    /// [`AviDemuxer::cset_chunks`] / [`AviDemuxer::cset_chunk_count`] +
+    /// the `avi:cset.count` metadata key. Empty when the file carried
+    /// no `CSET`.
+    top_level_cset: Vec<CsetChunk>,
     /// File-absolute chunk-header offset → keyframe flag, built once at
     /// `open()` from whichever per-chunk index the file carries.
     ///
@@ -6124,6 +6175,80 @@ pub struct DispChunk {
     /// on a truncated tail). The leading 4-byte clipboard-format code
     /// is NOT split out — see the struct-level note.
     pub body: Vec<u8>,
+}
+
+/// One top-level `CSET` (character-set) chunk recorded during the
+/// primary RIFF body walk (round-377).
+///
+/// `CSET` is a generic RIFF chunk that overrides the character set,
+/// language, country and dialect of the text chunks (`LIST INFO`,
+/// `DISP` titles, etc.) in the enclosing RIFF form. Its body is a
+/// fixed 8-byte record of four little-endian 16-bit fields, in this
+/// order (`docs/container/riff/metadata/exiftool-riff-tags.html`
+/// "RIFF CSET Tags": index 0 → `CodePage`, index 1 → `CountryCode`,
+/// index 2 → `LanguageCode`, index 3 → `Dialect`):
+/// ```text
+/// WORD  wCodePage      // IBM/MS code-page number for the text
+/// WORD  wCountryCode   // country code (telephone-style)
+/// WORD  wLanguageCode  // language code
+/// WORD  wDialect       // dialect within the language
+/// ```
+/// All-zero (`0,0,0,0`) is the documented "use the current locale /
+/// no override" default. The chunk is carried at the top level
+/// alongside `LIST hdrl` / `LIST INFO` / `DISP`. Surfaced via
+/// [`AviDemuxer::cset_chunks`] / [`AviDemuxer::cset_chunk_count`] plus
+/// the `avi:cset.count` metadata key (omitted when no `CSET` is
+/// present so absence stays observable). Write-side complement:
+/// [`crate::muxer::AviMuxOptions::with_cset`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CsetChunk {
+    /// File-absolute offset of the `CSET` chunk's 8-byte RIFF header
+    /// (the position of the `CSET` FourCC itself, not its body).
+    pub offset: u64,
+    /// `wCodePage` — IBM/MS code-page number the enclosing form's text
+    /// chunks are encoded in. `0` selects the current locale.
+    pub code_page: u16,
+    /// `wCountryCode` — telephone-style country code for the text.
+    pub country_code: u16,
+    /// `wLanguageCode` — language code for the text.
+    pub language_code: u16,
+    /// `wDialect` — dialect within the language.
+    pub dialect: u16,
+}
+
+impl CsetChunk {
+    /// Parse the fixed 8-byte `CSET` body (four little-endian `u16`
+    /// fields) recorded at file-absolute `offset`. Returns `None` when
+    /// fewer than 8 bytes are available (a truncated tail); the field
+    /// order matches the RIFF CSET tag-index order documented in
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html`.
+    fn parse(offset: u64, body: &[u8]) -> Option<Self> {
+        if body.len() < 8 {
+            return None;
+        }
+        Some(Self {
+            offset,
+            code_page: u16::from_le_bytes([body[0], body[1]]),
+            country_code: u16::from_le_bytes([body[2], body[3]]),
+            language_code: u16::from_le_bytes([body[4], body[5]]),
+            dialect: u16::from_le_bytes([body[6], body[7]]),
+        })
+    }
+
+    /// Serialise the four 16-bit fields back into the canonical 8-byte
+    /// little-endian `CSET` body (`code_page`, `country_code`,
+    /// `language_code`, `dialect`). The `offset` field is layout
+    /// metadata and is not part of the on-wire body. Round-trips with
+    /// [`Self::parse`] and the muxer's
+    /// [`crate::muxer::AviMuxOptions::with_cset`] write path.
+    pub fn to_bytes(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..2].copy_from_slice(&self.code_page.to_le_bytes());
+        out[2..4].copy_from_slice(&self.country_code.to_le_bytes());
+        out[4..6].copy_from_slice(&self.language_code.to_le_bytes());
+        out[6..8].copy_from_slice(&self.dialect.to_le_bytes());
+        out
+    }
 }
 
 /// One palette entry inside a [`PaletteChange`] body — `PALETTEENTRY`
@@ -10177,6 +10302,31 @@ impl AviDemuxer {
     /// `avi:disp.count` metadata key.
     pub fn disp_chunk_count(&self) -> usize {
         self.top_level_disp.len()
+    }
+
+    /// Top-level `CSET` (character-set) chunks recorded during the
+    /// primary RIFF body walk (round-377).
+    ///
+    /// `CSET` is a generic RIFF chunk that overrides the character set,
+    /// language, country and dialect of the text chunks in the
+    /// enclosing form. Each [`CsetChunk`] carries the four typed 16-bit
+    /// fields (`code_page`, `country_code`, `language_code`, `dialect`)
+    /// decoded from the fixed 8-byte body in the RIFF CSET tag-index
+    /// order documented in
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html`, plus the
+    /// file-absolute header offset. Companion to the `avi:cset.count`
+    /// metadata key (omitted when no `CSET` is present so absence stays
+    /// observable). Empty when the file carried no `CSET`. Write-side
+    /// complement: [`crate::muxer::AviMuxOptions::with_cset`].
+    pub fn cset_chunks(&self) -> &[CsetChunk] {
+        &self.top_level_cset
+    }
+
+    /// Number of top-level `CSET` chunks (round-377) — the length of
+    /// [`Self::cset_chunks`]. `0` for a file with no `CSET`. Mirrors the
+    /// `avi:cset.count` metadata key.
+    pub fn cset_chunk_count(&self) -> usize {
+        self.top_level_cset.len()
     }
 
     /// Backward-walking strict keyframe seek (round-9 candidate 4).
