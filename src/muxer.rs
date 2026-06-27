@@ -998,6 +998,17 @@ pub struct AviMuxOptions {
     /// (typed-field-equal) and the `avi:cset.count` metadata key.
     /// Default empty (no `CSET` emitted). Use [`Self::with_cset`].
     pub cset_chunks: Vec<crate::demuxer::CsetChunk>,
+    /// Per-stream indexed (palettised) video DIB overrides (round-377).
+    /// Each entry is `(stream_index, bit_count, palette)`: for that
+    /// video stream the muxer emits a `BITMAPINFOHEADER` with
+    /// `biBitCount` of 1/4/8, `biCompression = BI_RGB`, `biClrUsed =
+    /// palette.len()`, and the `RGBQUAD` color table appended verbatim
+    /// — instead of the default 24-bpp advisory header — so the stream
+    /// round-trips through the demuxer's
+    /// [`crate::demuxer::AviDemuxer::stream_palette`] accessor. The
+    /// write-side complement of the round-355 baseline-DIB color-table
+    /// read surface. Default empty. Use [`Self::with_indexed_video`].
+    pub indexed_video_streams: Vec<(u32, u16, Vec<crate::stream_format::RgbQuad>)>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1415,6 +1426,28 @@ impl AviMuxOptions {
             language_code,
             dialect,
         })
+    }
+
+    /// Builder helper: mark `stream_index` as an indexed (palettised)
+    /// video DIB with the given `bit_count` (1/4/8) and `palette`
+    /// (round-377). The muxer emits a `BITMAPINFOHEADER` with that
+    /// `biBitCount`, `biCompression = BI_RGB`, `biClrUsed =
+    /// palette.len()`, and the `RGBQUAD` color table appended verbatim,
+    /// so the stream round-trips through the demuxer's
+    /// [`crate::demuxer::AviDemuxer::stream_palette`] accessor. Last call
+    /// per `stream_index` wins. Only meaningful for video streams — the
+    /// override is consulted only when building a `vids` strf.
+    pub fn with_indexed_video(
+        mut self,
+        stream_index: u32,
+        bit_count: u16,
+        palette: Vec<crate::stream_format::RgbQuad>,
+    ) -> Self {
+        self.indexed_video_streams
+            .retain(|(idx, _, _)| *idx != stream_index);
+        self.indexed_video_streams
+            .push((stream_index, bit_count, palette));
+        self
     }
 
     /// Builder helper: stamp `bits` verbatim into `avih.dwFlags`
@@ -2594,7 +2627,17 @@ pub fn open_avi(
             .iter()
             .find(|(idx, _, _, _)| (*idx as usize) == i)
             .map(|(_, mask, valid, guid)| (*mask, *valid, *guid));
-        let entry = build_strf(&s.params, top_down, extensible)?;
+        // Round-377: honour `indexed_video_streams` for a video stream
+        // the caller marked as an indexed (palettised) DIB — emits a
+        // BITMAPINFOHEADER with `biBitCount` 1/4/8 + an `RGBQUAD` color
+        // table instead of the default 24-bpp advisory header. No-op for
+        // streams not in the list.
+        let indexed = options
+            .indexed_video_streams
+            .iter()
+            .find(|(idx, _, _)| (*idx as usize) == i)
+            .map(|(_, bit_count, palette)| (*bit_count, palette.as_slice()));
+        let entry = build_strf(&s.params, top_down, extensible, indexed)?;
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {
             stream: s.clone(),

@@ -20,8 +20,8 @@
 use oxideav_core::{CodecId, CodecParameters, CodecTag, Error, MediaType, Result, SampleFormat};
 
 use crate::stream_format::{
-    write_bitmap_info_header, write_bitmap_info_header_oriented, write_waveformatex,
-    write_waveformatextensible, Guid, WAVE_FORMAT_EXTENSIBLE,
+    write_bitmap_info_header, write_bitmap_info_header_oriented, write_indexed_bitmap_info_header,
+    write_waveformatex, write_waveformatextensible, Guid, RgbQuad, WAVE_FORMAT_EXTENSIBLE,
 };
 
 /// Result of building a stream-format chunk for the muxer.
@@ -69,9 +69,10 @@ pub(crate) fn build_strf(
     params: &CodecParameters,
     top_down: bool,
     extensible: Option<(u32, u16, Guid)>,
+    indexed: Option<(u16, &[RgbQuad])>,
 ) -> Result<StrfEntry> {
     match params.media_type {
-        MediaType::Video => build_video_strf(params, top_down),
+        MediaType::Video => build_video_strf(params, top_down, indexed),
         MediaType::Audio => build_audio_strf(params, extensible),
         _ => Err(Error::unsupported(format!(
             "avi muxer: media type {:?} not supported",
@@ -167,7 +168,11 @@ fn extradata_fourcc_hint(extradata: &[u8]) -> Option<[u8; 4]> {
     Some(hint)
 }
 
-fn build_video_strf(params: &CodecParameters, top_down: bool) -> Result<StrfEntry> {
+fn build_video_strf(
+    params: &CodecParameters,
+    top_down: bool,
+    indexed: Option<(u16, &[RgbQuad])>,
+) -> Result<StrfEntry> {
     let width = params
         .width
         .ok_or_else(|| Error::invalid("avi muxer: video stream missing width"))?;
@@ -175,6 +180,26 @@ fn build_video_strf(params: &CodecParameters, top_down: bool) -> Result<StrfEntr
         .height
         .ok_or_else(|| Error::invalid("avi muxer: video stream missing height"))?;
     let fourcc = video_fourcc(params)?;
+    // Round-377: an indexed (palettised) BI_RGB DIB override. When the
+    // caller registered the stream via `with_indexed_video`, emit a
+    // BITMAPINFOHEADER with `biBitCount` of 1/4/8, `biClrUsed` =
+    // palette length, and the `RGBQUAD` color table appended verbatim —
+    // the write-side complement of the demuxer's `stream_palette`
+    // accessor. This forces `BI_RGB` (indexed DIBs are uncompressed) so
+    // it only applies to streams the caller deliberately marks indexed.
+    if let Some((bit_count, palette)) = indexed {
+        let strf = write_indexed_bitmap_info_header(width, height, bit_count, palette);
+        let (scale, rate) = video_scale_rate(params);
+        return Ok(StrfEntry {
+            chunk_suffix: *b"db",
+            handler_fourcc: [0, 0, 0, 0],
+            strf,
+            strh_type: *b"vids",
+            sample_size: 0,
+            scale,
+            rate,
+        });
+    }
     // bit_count: 24 for compressed bitstreams (the conventional advisory
     // value); for BI_RGB we use 24 too (24-bit packed RGB is the
     // canonical uncompressed AVI pixel format we package).
@@ -457,7 +482,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false, None).unwrap();
+        let entry = build_strf(&p, false, None, None).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         assert_eq!(entry.sample_size, 4); // 2ch × 2B
     }
@@ -468,7 +493,7 @@ mod tests {
             CodecParameters::audio(CodecId::new("mp3")).with_tag(CodecTag::wave_format(0x0055));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false, None).unwrap();
+        let entry = build_strf(&p, false, None, None).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         // First 2 bytes of the WAVEFORMATEX are the wFormatTag in LE.
         assert_eq!(&entry.strf[0..2], &0x0055u16.to_le_bytes());
@@ -479,7 +504,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("noexist"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        match build_strf(&p, false, None) {
+        match build_strf(&p, false, None, None) {
             Err(Error::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -494,7 +519,7 @@ mod tests {
             .with_tag(oxideav_core::CodecTag::fourcc(b"MJPG"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true, None).unwrap();
+        let entry = build_strf(&p, true, None, None).unwrap();
         // biHeight offset 8..12 in the BMIH; must be positive 240.
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, 240, "compressed FourCCs MUST use positive biHeight");
@@ -503,7 +528,7 @@ mod tests {
         let mut p = CodecParameters::video(CodecId::new("rgb24"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true, None).unwrap();
+        let entry = build_strf(&p, true, None, None).unwrap();
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, -240, "BI_RGB + top_down ⇒ negative biHeight");
     }

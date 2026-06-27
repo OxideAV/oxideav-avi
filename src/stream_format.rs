@@ -270,6 +270,44 @@ pub fn write_bitmap_info_header_oriented(
     out
 }
 
+/// Emit a BITMAPINFOHEADER for an **indexed** (palettised) DIB followed
+/// by its `RGBQUAD` color table (round-377).
+///
+/// `bit_count` must be `1`, `4` or `8` (the indexed depths per the RIFF
+/// MCI reference §"Interpreting the Color Table"); `biClrUsed` is set to
+/// `palette.len()` and the color table is written verbatim in on-disk
+/// `RGBQUAD` byte order (blue, green, red, reserved) so it parses back
+/// through [`parse_color_table`] entry-for-entry. `biCompression` is
+/// `BI_RGB` (the all-zero FourCC) — an indexed DIB is uncompressed.
+/// `biHeight` is written positive (bottom-up). Round-trips with the
+/// demuxer's `stream_palette` accessor.
+pub fn write_indexed_bitmap_info_header(
+    width: u32,
+    height: u32,
+    bit_count: u16,
+    palette: &[RgbQuad],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40 + palette.len() * 4);
+    out.extend_from_slice(&40u32.to_le_bytes()); // biSize (no extradata)
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&(height as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // planes = 1
+    out.extend_from_slice(&bit_count.to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]); // biCompression = BI_RGB
+    out.extend_from_slice(&0u32.to_le_bytes()); // size_image
+    out.extend_from_slice(&0i32.to_le_bytes()); // x_pels_per_meter
+    out.extend_from_slice(&0i32.to_le_bytes()); // y_pels_per_meter
+    out.extend_from_slice(&(palette.len() as u32).to_le_bytes()); // clr_used
+    out.extend_from_slice(&0u32.to_le_bytes()); // clr_important
+    for q in palette {
+        out.push(q.blue);
+        out.push(q.green);
+        out.push(q.red);
+        out.push(q.reserved);
+    }
+    out
+}
+
 /// Decoded WAVEFORMATEX + extradata.
 #[derive(Clone, Debug)]
 pub struct WaveFormatEx {
