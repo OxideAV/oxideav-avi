@@ -221,6 +221,10 @@ fn open_avi_inner(
     // (across all RIFF segments). `None` when no `LIST odml dmlh` was
     // seen in `hdrl`.
     let mut dmlh_total_frames: Option<u32> = None;
+    // Round-377: full `dmlh` layout (declared body size + trailing
+    // reserved bytes beyond `dwTotalFrames`). `None` when no `LIST odml
+    // dmlh` was present in `hdrl`.
+    let mut dmlh_info: Option<DmlhInfo> = None;
     // Per-stream audio strh `(format_tag, dwSampleSize)` capture for
     // the round-14 C2 VBR/CBR validator. Parallel to `streams`:
     // `Some` for audio, `None` otherwise.
@@ -476,6 +480,7 @@ fn open_avi_inner(
         &mut super_indexes,
         &mut vprps,
         &mut dmlh_total_frames,
+        &mut dmlh_info,
         &mut audio_infos,
         &mut video_strfs,
         &mut audio_strfs,
@@ -526,6 +531,7 @@ fn open_avi_inner(
                     &mut super_indexes,
                     &mut vprps,
                     &mut dmlh_total_frames,
+                    &mut dmlh_info,
                     &mut audio_infos,
                     &mut video_strfs,
                     &mut audio_strfs,
@@ -2252,6 +2258,7 @@ fn open_avi_inner(
         avih_reserved: avih.as_ref().map(|h| h.reserved).unwrap_or([0; 4]),
         vprps,
         dmlh_total_frames,
+        dmlh_info,
         palette_change_data,
         palette_change_positions,
         text_chunk_data,
@@ -2303,6 +2310,7 @@ fn walk_riff_body(
     super_indexes: &mut Vec<SuperIndex>,
     vprps: &mut Vec<VprpHeader>,
     dmlh_total_frames: &mut Option<u32>,
+    dmlh_info: &mut Option<DmlhInfo>,
     audio_infos: &mut Vec<Option<AudioStrhInfo>>,
     video_strfs: &mut Vec<Option<VideoStrfInfo>>,
     audio_strfs: &mut Vec<Option<AudioStrfInfo>>,
@@ -2374,6 +2382,7 @@ fn walk_riff_body(
                         fcc_types_vec,
                         idit,
                         ismp,
+                        dmlh_info_parsed,
                     ) = parse_hdrl(input, body_end, codecs)?;
                     *avih = Some(main);
                     *streams = stream_infos;
@@ -2402,6 +2411,7 @@ fn walk_riff_body(
                     *stream_fcc_types = fcc_types_vec;
                     *digitization_date = idit;
                     *smpte_timecode = ismp;
+                    *dmlh_info = dmlh_info_parsed;
                 }
                 b"movi" => {
                     movi_segments.push((body_start, body_end));
@@ -2743,6 +2753,10 @@ type HdrlOutput = (
     Vec<Option<[u8; 4]>>,
     Option<String>,
     Option<String>,
+    // Round-377: full `dmlh` layout detail (declared body size +
+    // trailing reserved bytes beyond `dwTotalFrames`). `None` when no
+    // `LIST odml dmlh` was present.
+    Option<DmlhInfo>,
 );
 
 /// Parse the `hdrl` LIST body.
@@ -2828,6 +2842,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
     // caller to interpret.
     let mut stream_fcc_types: Vec<Option<[u8; 4]>> = Vec::new();
     let mut dmlh_total_frames: Option<u32> = None;
+    let mut dmlh_info: Option<DmlhInfo> = None;
     let mut info_metadata: Vec<(String, String)> = Vec::new();
     let mut digitization_date: Option<String> = None;
     let mut smpte_timecode: Option<String> = None;
@@ -2938,7 +2953,9 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                     // covering the real total-frame count across every
                     // RIFF segment (whereas `avih.dwTotalFrames` only
                     // reflects the primary segment per spec/06 §5.0).
-                    dmlh_total_frames = parse_odml_list(r, body_end)?;
+                    let info = parse_odml_list(r, body_end)?;
+                    dmlh_total_frames = info.as_ref().and_then(|d| d.total_frames);
+                    dmlh_info = info;
                 } else if &list_type == b"INFO" {
                     // Round-6 candidate 2: AVI 1.0 spec permits
                     // `LIST INFO` either as a top-level RIFF child or
@@ -2988,6 +3005,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
         stream_fcc_types,
         digitization_date,
         smpte_timecode,
+        dmlh_info,
     ))
 }
 
@@ -3059,16 +3077,19 @@ fn parse_ismp_body(body: &[u8]) -> Option<String> {
 /// segments (per OpenDML 2.0 §5.0 "Source and Header Information
 /// Storage" / "Extended AVI Header"). Some encoders pad `dmlh` past the
 /// nominal 4 bytes; we only consume the first DWORD.
-fn parse_odml_list<R: ReadSeek + ?Sized>(r: &mut R, end_pos: u64) -> Result<Option<u32>> {
+fn parse_odml_list<R: ReadSeek + ?Sized>(r: &mut R, end_pos: u64) -> Result<Option<DmlhInfo>> {
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
             Some(h) => h,
             None => break,
         };
         if &hdr.id == b"dmlh" {
-            // dmlh body is at minimum 4 bytes; some writers emit a
-            // larger zero-padded body — read what's there and pick the
-            // first DWORD.
+            // dmlh body is at minimum 4 bytes (the spec's single
+            // `dwTotalFrames` DWORD); real OpenDML writers emit a larger
+            // zero-padded body (the spec's own example shows an 84-byte
+            // `dmlh`). Read what's there, pick the first DWORD as
+            // `dwTotalFrames`, and retain everything after it verbatim as
+            // unspecified reserved space (round-377).
             let take = (hdr.size as u64).min(4096) as u32;
             let body = read_body_bounded(r, take)?;
             // Skip any trailing bytes past what we read.
@@ -3077,11 +3098,21 @@ fn parse_odml_list<R: ReadSeek + ?Sized>(r: &mut R, end_pos: u64) -> Result<Opti
                 r.seek(SeekFrom::Current(remaining as i64))?;
             }
             skip_pad(r, hdr.size)?;
-            if body.len() >= 4 {
-                let total = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                return Ok(Some(total));
-            }
-            return Ok(None);
+            let total_frames = if body.len() >= 4 {
+                Some(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+            } else {
+                None
+            };
+            let reserved = if body.len() > 4 {
+                body[4..].to_vec()
+            } else {
+                Vec::new()
+            };
+            return Ok(Some(DmlhInfo {
+                total_frames,
+                declared_body_size: hdr.size,
+                reserved,
+            }));
         }
         skip_chunk(r, &hdr)?;
     }
@@ -5331,6 +5362,13 @@ pub struct AviDemuxer {
     /// typed [`AviDemuxer::dmlh_total_frames`] accessor in addition
     /// to the existing `avi:total_frames_all_segments` metadata key.
     dmlh_total_frames: Option<u32>,
+    /// Full `dmlh` (Extended AVI Header) layout detail beyond the
+    /// documented `dwTotalFrames` DWORD (round-377): the declared body
+    /// size plus any trailing reserved bytes. `None` when no `LIST odml
+    /// dmlh` was present. Surfaced via
+    /// [`AviDemuxer::dmlh_declared_body_size`] and
+    /// [`AviDemuxer::dmlh_reserved`].
+    dmlh_info: Option<DmlhInfo>,
     /// Per-stream buffered `xxpc` palette-change chunk bodies in file
     /// order (round-12 candidate 1). Each inner Vec is the raw chunk
     /// payload — typically an AVI 1.0 `BITMAPINFO`-style palette delta:
@@ -6249,6 +6287,41 @@ impl CsetChunk {
         out[6..8].copy_from_slice(&self.dialect.to_le_bytes());
         out
     }
+}
+
+/// Layout detail of the OpenDML 2.0 `dmlh` (Extended AVI Header) chunk
+/// beyond the single documented `dwTotalFrames` DWORD (round-377).
+///
+/// The OpenDML 2.0 spec (`docs/container/riff/opendml-avi-2.0.pdf`
+/// §"Extended AVI Header (dmlh)") documents the chunk body as exactly:
+/// ```text
+/// typedef struct { DWORD dwTotalFrames; } ODMLExtendedAVIHeader;
+/// ```
+/// i.e. a single 4-byte field. In practice OpenDML writers allocate a
+/// **larger** zero-padded `dmlh` body (the spec's own worked-example
+/// layout shows `dmlh (00000054)` — an 84-byte body), reserving space
+/// after `dwTotalFrames` for forward compatibility. That trailing space
+/// is unspecified by the spec, so the demuxer surfaces it **verbatim**
+/// (no field interpretation) and never fails `open()` over it.
+///
+/// Surfaced via [`AviDemuxer::dmlh_declared_body_size`] /
+/// [`AviDemuxer::dmlh_reserved`]. Write-side complement:
+/// [`crate::muxer::AviMuxOptions::with_dmlh_body_size`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DmlhInfo {
+    /// `dwTotalFrames` — the real total-frame count across every RIFF
+    /// segment. `None` when the `dmlh` body was shorter than 4 bytes.
+    pub total_frames: Option<u32>,
+    /// Declared `cb` body size of the `dmlh` chunk in bytes (header +
+    /// word-pad excluded). The spec's documented size is `4`; real
+    /// files frequently declare `84` (`0x54`) or other padded sizes.
+    pub declared_body_size: u32,
+    /// Raw bytes of the `dmlh` body **after** the leading 4-byte
+    /// `dwTotalFrames` field, verbatim and uninterpreted. Empty when the
+    /// body is exactly 4 bytes (the spec-minimal case) or shorter. Held
+    /// only up to the demuxer's bounded read window, so an absurdly large
+    /// declared body is truncated to what was actually read.
+    pub reserved: Vec<u8>,
 }
 
 /// One palette entry inside a [`PaletteChange`] body — `PALETTEENTRY`
@@ -8567,6 +8640,37 @@ impl AviDemuxer {
     /// future-proof).
     pub fn dmlh_total_frames(&self) -> Option<u64> {
         self.dmlh_total_frames.map(|v| v as u64)
+    }
+
+    /// Declared `cb` body size of the OpenDML 2.0 `dmlh` (Extended AVI
+    /// Header) chunk, in bytes (round-377).
+    ///
+    /// The OpenDML 2.0 spec documents the `dmlh` body as exactly the
+    /// 4-byte `dwTotalFrames` DWORD, but real writers allocate a larger
+    /// zero-padded body (the spec's own worked example shows an 84-byte
+    /// `dmlh`). This surfaces the size the file physically declared, so
+    /// a remuxer that wants to reproduce a fixture's layout can match
+    /// the original body length. `None` when no `LIST odml dmlh` was
+    /// present. Write-side complement:
+    /// [`crate::muxer::AviMuxOptions::with_dmlh_body_size`].
+    pub fn dmlh_declared_body_size(&self) -> Option<u32> {
+        self.dmlh_info.as_ref().map(|d| d.declared_body_size)
+    }
+
+    /// Trailing reserved bytes of the `dmlh` chunk body **after** the
+    /// 4-byte `dwTotalFrames` field, verbatim and uninterpreted
+    /// (round-377).
+    ///
+    /// Returns `None` when no `LIST odml dmlh` was present, and
+    /// `Some(&[])` when the `dmlh` body was exactly 4 bytes (the
+    /// spec-minimal case) — distinguishing "no dmlh" from "dmlh with no
+    /// padding". The bytes after `dwTotalFrames` are unspecified by the
+    /// OpenDML 2.0 spec, so they are handed back raw; a conforming
+    /// writer (this crate's muxer with the default 4-byte body) leaves
+    /// them empty. Held only up to the demuxer's bounded read window, so
+    /// an over-declared body is truncated to what was actually read.
+    pub fn dmlh_reserved(&self) -> Option<&[u8]> {
+        self.dmlh_info.as_ref().map(|d| d.reserved.as_slice())
     }
 
     /// Cross-check every CBR-audio `ix##` standard-index entry's

@@ -925,6 +925,22 @@ pub struct AviMuxOptions {
     /// purpose and will surface through
     /// `super_index_duration_violations()` on re-demux.
     pub dmlh_total_frames: Option<u32>,
+    /// Override for the OpenDML 2.0 `dmlh` (Extended AVI Header) chunk
+    /// body size in bytes (round-377). `None` (default) writes the
+    /// spec-minimal 4-byte body (`dwTotalFrames` only). `Some(n)` with
+    /// `n >= 4` writes `dwTotalFrames` followed by `n - 4` zero
+    /// reserved bytes, reproducing the larger zero-padded `dmlh` real
+    /// OpenDML writers allocate (the spec's worked-example layout shows
+    /// an 84-byte `dmlh`). `n < 4` is clamped up to 4 so `dwTotalFrames`
+    /// always fits. The body length is rounded up implicitly by the
+    /// RIFF word-pad on write when odd. Only applies when the envelope
+    /// emits a `dmlh` at all (always for [`AviKind::OpenDml`]; for
+    /// [`AviKind::Avi10`] only when an `indx` is also emitted); ignored
+    /// otherwise. Round-trips with the demuxer's
+    /// [`crate::demuxer::AviDemuxer::dmlh_declared_body_size`] /
+    /// [`crate::demuxer::AviDemuxer::dmlh_reserved`] surfaces. Use
+    /// [`Self::with_dmlh_body_size`].
+    pub dmlh_body_size: Option<u32>,
     /// Explicit top-level `JUNK` padding chunks to emit as siblings of
     /// `LIST hdrl`, just before the `movi` LIST (round-373). Each entry
     /// is a JUNK body size in bytes; the muxer writes one `JUNK` chunk
@@ -2407,6 +2423,21 @@ impl AviMuxOptions {
         self.dmlh_total_frames = Some(n);
         self
     }
+
+    /// Builder helper: pad the OpenDML 2.0 `dmlh` (Extended AVI Header)
+    /// chunk body to `size` bytes (round-377). The first 4 bytes carry
+    /// `dwTotalFrames` (back-patched in `write_trailer`); the remaining
+    /// `size - 4` bytes are zero reserved space. `size < 4` is clamped
+    /// up to 4. Reproduces the larger zero-padded `dmlh` real OpenDML
+    /// writers allocate (the spec's example uses an 84-byte body);
+    /// round-trips with the demuxer's
+    /// [`crate::demuxer::AviDemuxer::dmlh_declared_body_size`] /
+    /// [`crate::demuxer::AviDemuxer::dmlh_reserved`] surfaces. Only
+    /// effective when the envelope emits a `dmlh` (see the field doc).
+    pub fn with_dmlh_body_size(mut self, size: u32) -> Self {
+        self.dmlh_body_size = Some(size.max(4));
+        self
+    }
 }
 
 /// Bookkeeping for a single idx1 entry (legacy AVI 1.0 index).
@@ -2997,12 +3028,25 @@ impl Muxer for AviMuxer {
         // `write_trailer` once we know the cross-segment frame count.
         if want_indx {
             let odml_size_off = begin_list(self.output.as_mut(), &LIST, b"odml")?;
-            // dmlh body: a single DWORD dwTotalFrames (placeholder = 0;
-            // back-patched in write_trailer).
-            crate::riff::write_chunk_header(self.output.as_mut(), b"dmlh", 4)?;
+            // dmlh body: the documented single DWORD `dwTotalFrames`
+            // (placeholder = 0; back-patched in write_trailer), optionally
+            // padded out to a larger body with zero reserved bytes per
+            // `with_dmlh_body_size` (round-377) to reproduce the larger
+            // `dmlh` real OpenDML writers emit (the spec's example shows
+            // an 84-byte body). `dmlh_body_size` is pre-clamped to >= 4.
+            let dmlh_body_size = self.options.dmlh_body_size.unwrap_or(4);
+            crate::riff::write_chunk_header(self.output.as_mut(), b"dmlh", dmlh_body_size)?;
             let dmlh_off = self.output.stream_position()?;
             self.output.write_all(&0u32.to_le_bytes())?;
-            // dmlh body length is even (4) so no pad byte required.
+            // Zero reserved bytes after `dwTotalFrames`, then the RIFF
+            // word-pad if the chosen body size is odd.
+            let reserved_len = dmlh_body_size.saturating_sub(4) as usize;
+            if reserved_len > 0 {
+                self.output.write_all(&vec![0u8; reserved_len])?;
+            }
+            if dmlh_body_size % 2 == 1 {
+                self.output.write_all(&[0u8])?;
+            }
             self.dmlh_total_frames_off = Some(dmlh_off);
             finish_chunk(self.output.as_mut(), odml_size_off)?;
         }
