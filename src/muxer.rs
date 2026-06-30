@@ -33,6 +33,7 @@ use std::io::{Seek, SeekFrom, Write};
 use oxideav_core::{Error, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
+pub use crate::packaging::BmihOverrides;
 use crate::packaging::{build_strf, StrfEntry};
 use crate::riff::{
     begin_list, finish_chunk, write_chunk, write_chunk_header, AVI_FORM, LIST, RIFF,
@@ -1009,6 +1010,20 @@ pub struct AviMuxOptions {
     /// write-side complement of the round-355 baseline-DIB color-table
     /// read surface. Default empty. Use [`Self::with_indexed_video`].
     pub indexed_video_streams: Vec<(u32, u16, Vec<crate::stream_format::RgbQuad>)>,
+    /// Per-stream `BITMAPINFOHEADER` scalar-field overrides (round-381):
+    /// `(stream_index, BmihOverrides)`. Each present field is patched
+    /// verbatim into that video stream's 40-byte BMIH fixed header,
+    /// replacing the muxer's writer-default `0` (`biSizeImage`,
+    /// `biX/YPelsPerMeter`, `biClrImportant`) / `1` (`biPlanes`). Default
+    /// empty. Set via [`Self::with_size_image`] /
+    /// [`Self::with_pixels_per_meter`] / [`Self::with_clr_important`] /
+    /// [`Self::with_bmih_planes`]; the four builders accumulate into one
+    /// `BmihOverrides` per stream (last call per field wins). The
+    /// overrides round-trip through the demuxer's
+    /// [`crate::demuxer::AviDemuxer::stream_size_image`] /
+    /// `stream_pixels_per_meter` / `stream_clr_important` /
+    /// `stream_planes` accessors.
+    pub bmih_overrides: Vec<(u32, crate::packaging::BmihOverrides)>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1447,6 +1462,75 @@ impl AviMuxOptions {
             .retain(|(idx, _, _)| *idx != stream_index);
         self.indexed_video_streams
             .push((stream_index, bit_count, palette));
+        self
+    }
+
+    /// Mutable handle to the accumulating [`BmihOverrides`] for one video
+    /// stream, creating a default entry on first access. Round-381.
+    fn bmih_entry(&mut self, stream_index: u32) -> &mut crate::packaging::BmihOverrides {
+        if !self.bmih_overrides.iter().any(|(i, _)| *i == stream_index) {
+            self.bmih_overrides
+                .push((stream_index, crate::packaging::BmihOverrides::default()));
+        }
+        &mut self
+            .bmih_overrides
+            .iter_mut()
+            .find(|(i, _)| *i == stream_index)
+            .expect("just inserted")
+            .1
+    }
+
+    /// Builder helper: stamp `biSizeImage` (BITMAPINFOHEADER byte offset
+    /// 20) verbatim for `stream_index`, replacing the muxer's default of
+    /// `0` (which per VfW `wingdi.h` §"BITMAPINFOHEADER" is the legal
+    /// "may be zero for `BI_RGB` bitmaps" value the demuxer folds back to
+    /// `None`). Round-381. Last call per stream wins; only consulted when
+    /// building a `vids` strf, and never perturbs `biWidth` / `biHeight` /
+    /// `biCompression` / the trailing extradata. An explicit `0` restores
+    /// the "may be zero" sentinel. Round-trips through the demuxer's
+    /// [`crate::demuxer::AviDemuxer::stream_size_image`] accessor.
+    pub fn with_size_image(mut self, stream_index: u32, size_image: u32) -> Self {
+        self.bmih_entry(stream_index).size_image = Some(size_image);
+        self
+    }
+
+    /// Builder helper: stamp the `biXPelsPerMeter` / `biYPelsPerMeter`
+    /// resolution pair (BITMAPINFOHEADER byte offsets 24 + 28) verbatim
+    /// for `stream_index`, replacing the muxer's all-zero default. Per VfW
+    /// `wingdi.h` §"BITMAPINFOHEADER" these are the target device's
+    /// horizontal / vertical pixels-per-meter resolution. Round-381. Last
+    /// call per stream wins; an all-zero pair restores the default the
+    /// demuxer folds back to `None`. Round-trips through
+    /// [`crate::demuxer::AviDemuxer::stream_pixels_per_meter`].
+    pub fn with_pixels_per_meter(mut self, stream_index: u32, x: i32, y: i32) -> Self {
+        self.bmih_entry(stream_index).pels_per_meter = Some((x, y));
+        self
+    }
+
+    /// Builder helper: stamp `biClrImportant` (BITMAPINFOHEADER byte
+    /// offset 36) verbatim for `stream_index`, replacing the muxer's
+    /// default of `0` ("all colors are important" per VfW `wingdi.h`
+    /// §"BITMAPINFOHEADER", which the demuxer folds back to `None`).
+    /// Round-381. Last call per stream wins; `biClrUsed` stays owned by
+    /// [`Self::with_indexed_video`] (it is load-bearing for the color
+    /// table length) and is intentionally not overridable here.
+    /// Round-trips through
+    /// [`crate::demuxer::AviDemuxer::stream_clr_important`].
+    pub fn with_clr_important(mut self, stream_index: u32, clr_important: u32) -> Self {
+        self.bmih_entry(stream_index).clr_important = Some(clr_important);
+        self
+    }
+
+    /// Builder helper: stamp `biPlanes` (BITMAPINFOHEADER byte offset 12)
+    /// verbatim for `stream_index`. Per VfW `wingdi.h`
+    /// §"BITMAPINFOHEADER" `biPlanes` *"must be set to 1"*, which is the
+    /// muxer's default — so this builder exists only for fixtures
+    /// reproducing a non-conformant writer that stamped a value other than
+    /// `1`, which the demuxer surfaces via
+    /// [`crate::demuxer::AviDemuxer::stream_planes`]. Round-381. Last call
+    /// per stream wins.
+    pub fn with_bmih_planes(mut self, stream_index: u32, planes: u16) -> Self {
+        self.bmih_entry(stream_index).planes = Some(planes);
         self
     }
 
@@ -2637,7 +2721,14 @@ pub fn open_avi(
             .iter()
             .find(|(idx, _, _)| (*idx as usize) == i)
             .map(|(_, bit_count, palette)| (*bit_count, palette.as_slice()));
-        let entry = build_strf(&s.params, top_down, extensible, indexed)?;
+        // Round-381: per-stream BITMAPINFOHEADER scalar-field overrides.
+        let bmih_overrides = options
+            .bmih_overrides
+            .iter()
+            .find(|(idx, _)| (*idx as usize) == i)
+            .map(|(_, ov)| *ov)
+            .unwrap_or_default();
+        let entry = build_strf(&s.params, top_down, extensible, indexed, bmih_overrides)?;
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {
             stream: s.clone(),

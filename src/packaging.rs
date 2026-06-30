@@ -70,14 +70,73 @@ pub(crate) fn build_strf(
     top_down: bool,
     extensible: Option<(u32, u16, Guid)>,
     indexed: Option<(u16, &[RgbQuad])>,
+    bmih_overrides: BmihOverrides,
 ) -> Result<StrfEntry> {
     match params.media_type {
-        MediaType::Video => build_video_strf(params, top_down, indexed),
+        MediaType::Video => {
+            let mut entry = build_video_strf(params, top_down, indexed)?;
+            apply_bmih_overrides(&mut entry.strf, bmih_overrides);
+            Ok(entry)
+        }
         MediaType::Audio => build_audio_strf(params, extensible),
         _ => Err(Error::unsupported(format!(
             "avi muxer: media type {:?} not supported",
             params.media_type
         ))),
+    }
+}
+
+/// Optional caller overrides for the `BITMAPINFOHEADER` scalar fields the
+/// muxer otherwise leaves at their writer-default `0` / `1` per VfW
+/// `wingdi.h` §"BITMAPINFOHEADER". Each field is patched verbatim into
+/// the 40-byte fixed header *after* the default strf is built, so an
+/// override never perturbs `biWidth` / `biHeight` / `biCompression` / the
+/// trailing extradata or color table. A `None` leaves the muxer's default
+/// in place. Round-381.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BmihOverrides {
+    /// `biSizeImage` (byte offset 20).
+    pub size_image: Option<u32>,
+    /// `biXPelsPerMeter` / `biYPelsPerMeter` (byte offsets 24 + 28).
+    pub pels_per_meter: Option<(i32, i32)>,
+    /// `biClrImportant` (byte offset 36).
+    pub clr_important: Option<u32>,
+    /// `biPlanes` (byte offset 12) — for callers reproducing a
+    /// non-conformant writer that stamped a value other than `1`.
+    pub planes: Option<u16>,
+}
+
+impl BmihOverrides {
+    fn is_empty(&self) -> bool {
+        self.size_image.is_none()
+            && self.pels_per_meter.is_none()
+            && self.clr_important.is_none()
+            && self.planes.is_none()
+    }
+}
+
+/// Patch the supplied `BmihOverrides` into a freshly-built `strf`
+/// (BITMAPINFOHEADER) payload. No-op when the payload is shorter than the
+/// 40-byte fixed header (it never is for a video strf) or when no override
+/// is set. Note `biClrUsed` is deliberately NOT overridable here — it is
+/// load-bearing for the indexed-DIB color-table length the demuxer reads
+/// back, so it stays owned by `with_indexed_video`.
+fn apply_bmih_overrides(strf: &mut [u8], ov: BmihOverrides) {
+    if ov.is_empty() || strf.len() < 40 {
+        return;
+    }
+    if let Some(planes) = ov.planes {
+        strf[12..14].copy_from_slice(&planes.to_le_bytes());
+    }
+    if let Some(size_image) = ov.size_image {
+        strf[20..24].copy_from_slice(&size_image.to_le_bytes());
+    }
+    if let Some((x, y)) = ov.pels_per_meter {
+        strf[24..28].copy_from_slice(&x.to_le_bytes());
+        strf[28..32].copy_from_slice(&y.to_le_bytes());
+    }
+    if let Some(clr_important) = ov.clr_important {
+        strf[36..40].copy_from_slice(&clr_important.to_le_bytes());
     }
 }
 
@@ -482,7 +541,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false, None, None).unwrap();
+        let entry = build_strf(&p, false, None, None, BmihOverrides::default()).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         assert_eq!(entry.sample_size, 4); // 2ch × 2B
     }
@@ -493,7 +552,7 @@ mod tests {
             CodecParameters::audio(CodecId::new("mp3")).with_tag(CodecTag::wave_format(0x0055));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false, None, None).unwrap();
+        let entry = build_strf(&p, false, None, None, BmihOverrides::default()).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         // First 2 bytes of the WAVEFORMATEX are the wFormatTag in LE.
         assert_eq!(&entry.strf[0..2], &0x0055u16.to_le_bytes());
@@ -504,7 +563,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("noexist"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        match build_strf(&p, false, None, None) {
+        match build_strf(&p, false, None, None, BmihOverrides::default()) {
             Err(Error::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -519,7 +578,7 @@ mod tests {
             .with_tag(oxideav_core::CodecTag::fourcc(b"MJPG"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true, None, None).unwrap();
+        let entry = build_strf(&p, true, None, None, BmihOverrides::default()).unwrap();
         // biHeight offset 8..12 in the BMIH; must be positive 240.
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, 240, "compressed FourCCs MUST use positive biHeight");
@@ -528,7 +587,7 @@ mod tests {
         let mut p = CodecParameters::video(CodecId::new("rgb24"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true, None, None).unwrap();
+        let entry = build_strf(&p, true, None, None, BmihOverrides::default()).unwrap();
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, -240, "BI_RGB + top_down ⇒ negative biHeight");
     }
