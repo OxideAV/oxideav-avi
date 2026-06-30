@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-avi/compare/v0.0.9...v0.0.10) - 2026-06-30
+
+### Other
+
+- neutralise decorative external-tool naming in doc comments
+- README — round-381 BITMAPINFOHEADER + WAVEFORMATEX scalar fields
+- add muxer WAVEFORMATEX nAvgBytesPerSec override (write path)
+- surface raw WAVEFORMATEX nAvgBytesPerSec + wBitsPerSample (read)
+- add muxer BITMAPINFOHEADER scalar-field overrides (write path)
+- surface remaining BITMAPINFOHEADER scalar fields (read path)
+- round 377 — indexed (palettised) video DIB write side
+- round 377 — dmlh declared body size + reserved-bytes read/write symmetry
+- round 377 — top-level CSET character-set chunk read + write symmetry
+- round 373 — AVIF_HASINDEX flag ↔ idx1-presence cross-check
+- round 373 — raw nBlockAlign accessor + VBR/CBR classification
+- round 373 — top-level DISP chunk read + write symmetry
+- round 373 — AVISF_VIDEO_PALCHANGES flag ↔ xxpc-presence cross-check
+- round 373 — multi-RIFF movi segment-boundary + AVIX-count surface
+- round 373 — top-level JUNK padding-chunk read + write symmetry
+- vprp signal-shape round-trip (dwHTotalInT / dwVTotalInLines / active frame) (round 365)
+- typed OpenDML vprp signal-shape scalar accessors (round 365)
+- non-conformant AVIMETAINDEX reserved-field diagnostics (round 361)
+- typed OpenDML AVIMETAINDEX bIndexType code surface (round 361)
+- surface baseline palette + effective-palette resolution from xxpc deltas (round 355)
+- parse baseline DIB color table (RGBQUAD bmiColors[]) for indexed video (round 355)
+- public packet_is_keyframe / keyframe_indexed_packet_count accessors (round 349)
+- OpenDML ix##-sourced keyframe flags across AVIX continuations (round 349)
+- stamp true per-packet keyframe flags from idx1/ix## index (round 349)
+- typed VideoFormatToken / VideoStandard decoders + named-label metadata
+- file-global avih.dwReserved[4] trailing reserved-array accessor (round 330)
+- OpenDML ix## AVISTDINDEX nEntriesInUse declared entry-count accessor + truncation cross-check (round 325)
+- OpenDML ix## AVISTDINDEX dwChunkId FOURCC accessor + cross-wiring divergence metadata (round 322)
+- OpenDML ix## AVISTDINDEX qwBaseOffset accessor + movi-region cross-check (round 317)
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - indexed (palettised) video DIB write side — the write-side complement of the round-355 baseline-DIB color-table read surface (RIFF MCI reference §"Interpreting the Color Table"): `AviMuxOptions::with_indexed_video(stream_index, bit_count, palette)` marks a video stream as an indexed DIB so the muxer emits a `BITMAPINFOHEADER` with `biBitCount` of 1/4/8, `biCompression = BI_RGB`, `biClrUsed = palette.len()`, and the `RGBQUAD` color table appended verbatim (blue/green/red/reserved on-disk order) instead of the default 24-bpp advisory header. Before this the muxer always advertised 24-bpp (no table), so an indexed `strf` was reachable only via a hand-built fixture. A stream authored with `with_indexed_video` round-trips through the demuxer's `stream_palette()` accessor entry-for-entry (incl. partial `biClrUsed < 1<<bit_count` tables) and the `avi:vids.<n>.palette_entries` metadata key; last call per `stream_index` wins. New `write_indexed_bitmap_info_header` helper in `stream_format` (round 377)
