@@ -2608,7 +2608,7 @@ struct TrackState {
     sample_count: u64,
     /// Max chunk size seen so far (for strh.dwSuggestedBufferSize).
     max_chunk_size: u32,
-    /// Max output bytes per packet (used for ffmpeg compatibility).
+    /// Max output bytes per packet (interoperability cap for downstream demuxers).
     total_bytes: u64,
     /// Per-segment OpenDML standard-index entries (one per packet in
     /// the current segment). Flushed into an `ix##` chunk at segment

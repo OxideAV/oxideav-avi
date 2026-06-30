@@ -34,7 +34,7 @@ pub(crate) struct StrfEntry {
     pub handler_fourcc: [u8; 4],
     /// Full `strf` payload (BITMAPINFOHEADER or WAVEFORMATEX).
     pub strf: Vec<u8>,
-    /// ffmpeg-compatible four-char stream-type tag (`vids`/`auds`) for strh.
+    /// RIFF/AVI four-char stream-type tag (`vids`/`auds`) for strh.
     pub strh_type: [u8; 4],
     /// Sample size hint for `strh.dwSampleSize` — 0 means "variable" (VBR).
     pub sample_size: u32,

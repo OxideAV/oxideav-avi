@@ -4799,7 +4799,7 @@ fn is_unexpected_eof(e: &Error) -> bool {
 /// populate each entry with a synthesised per-stream pts.
 ///
 /// Offset-base detection: AVI 1.0 is ambiguous about the reference point
-/// for idx1 offsets. Some muxers (MS reference, ffmpeg) emit offsets
+/// for idx1 offsets. Some muxers emit offsets
 /// relative to the `movi` FourCC; others emit file-absolute offsets. We
 /// probe the first plausible entry by reading the 8-byte chunk header at
 /// `file_start + offset` and `movi_start - 4 + offset` (the "- 4" puts us
