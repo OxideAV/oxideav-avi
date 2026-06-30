@@ -1040,6 +1040,45 @@ fn open_avi_inner(
                 pal.len().to_string(),
             ));
         }
+        // Round-381: remaining BITMAPINFOHEADER scalar fields the
+        // demuxer parses but never surfaced. Each key is emitted only
+        // when the field departs from its "default == absent" sentinel so
+        // a plain video stream stays free of these keys (per VfW
+        // `wingdi.h` §"BITMAPINFOHEADER"):
+        //   biSizeImage   — `0` "may be zero for BI_RGB" ⇒ omitted
+        //   biX/YPelsPerMeter — `0,0` writer-skips-it default ⇒ omitted
+        //   biClrUsed     — `0` "max colors for biBitCount" ⇒ omitted
+        //   biClrImportant— `0` "all colors important" ⇒ omitted
+        //   biPlanes      — the mandated `1` ⇒ omitted; surfaced only
+        //                   when a non-conformant writer stamped != 1
+        if vs.size_image != 0 {
+            metadata.push((
+                format!("avi:vids.{i}.size_image"),
+                vs.size_image.to_string(),
+            ));
+        }
+        if vs.x_pels_per_meter != 0 || vs.y_pels_per_meter != 0 {
+            metadata.push((
+                format!("avi:vids.{i}.x_pels_per_meter"),
+                vs.x_pels_per_meter.to_string(),
+            ));
+            metadata.push((
+                format!("avi:vids.{i}.y_pels_per_meter"),
+                vs.y_pels_per_meter.to_string(),
+            ));
+        }
+        if vs.clr_used != 0 {
+            metadata.push((format!("avi:vids.{i}.clr_used"), vs.clr_used.to_string()));
+        }
+        if vs.clr_important != 0 {
+            metadata.push((
+                format!("avi:vids.{i}.clr_important"),
+                vs.clr_important.to_string(),
+            ));
+        }
+        if vs.planes != 1 {
+            metadata.push((format!("avi:vids.{i}.planes"), vs.planes.to_string()));
+        }
     }
 
     // Round-75: WAVEFORMATEXTENSIBLE side-info per audio stream.
@@ -4391,6 +4430,12 @@ fn build_stream(
                     top_down: b.top_down,
                     bitfields_masks,
                     palette,
+                    size_image: b.size_image,
+                    x_pels_per_meter: b.x_pels_per_meter,
+                    y_pels_per_meter: b.y_pels_per_meter,
+                    clr_used: b.clr_used,
+                    clr_important: b.clr_important,
+                    planes: b.planes,
                 });
             }
             // Frame rate from scale/rate (rate/scale = fps).
@@ -5089,6 +5134,46 @@ pub struct VideoStrfInfo {
     /// `xxpc` palette-change deltas are applied on top of — see
     /// [`AviDemuxer::effective_palette_at`].
     pub palette: Option<Vec<crate::stream_format::RgbQuad>>,
+    /// Verbatim `BITMAPINFOHEADER.biSizeImage` DWORD (byte offset 20 of
+    /// the 40-byte fixed header) — the size, in bytes, of the image. Per
+    /// VfW `wingdi.h` §"BITMAPINFOHEADER" this may be set to zero for
+    /// `BI_RGB` bitmaps (the size is then computable from the dimensions +
+    /// bit depth), and holds the byte count of the largest coded frame for
+    /// compressed formats. Surfaced verbatim with the `0` "may be zero"
+    /// stamp folded to `None` via [`AviDemuxer::stream_size_image`].
+    pub size_image: u32,
+    /// Verbatim `BITMAPINFOHEADER.biXPelsPerMeter` /
+    /// `biYPelsPerMeter` DWORDs (byte offsets 24 + 28) — the horizontal /
+    /// vertical resolution, in pixels-per-meter, of the target output
+    /// device. Per VfW §"BITMAPINFOHEADER" an application can use this
+    /// value to select a bitmap from a resource group that best matches
+    /// the characteristics of the current device. Signed (`i32`) on the
+    /// wire and surfaced verbatim; an all-zero pair (the writer-skips-it
+    /// default) folds to `None` via
+    /// [`AviDemuxer::stream_pixels_per_meter`].
+    pub x_pels_per_meter: i32,
+    pub y_pels_per_meter: i32,
+    /// Verbatim `BITMAPINFOHEADER.biClrUsed` DWORD (byte offset 32) — the
+    /// number of color indices in the color table actually used by the
+    /// bitmap. Per VfW §"BITMAPINFOHEADER" a `0` means the bitmap uses the
+    /// maximum number of colors corresponding to `biBitCount`. Distinct
+    /// from the `palette` slice length (which is `biClrUsed` clamped to
+    /// what the `strf` physically holds, or `1 << biBitCount` when the
+    /// field is zero); this surfaces the raw declared count verbatim via
+    /// [`AviDemuxer::stream_clr_used`].
+    pub clr_used: u32,
+    /// Verbatim `BITMAPINFOHEADER.biClrImportant` DWORD (byte offset 36) —
+    /// the number of color indices considered important for displaying
+    /// the bitmap. Per VfW §"BITMAPINFOHEADER" a `0` means all colors are
+    /// important. Surfaced verbatim with the `0` "all important" default
+    /// folded to `None` via [`AviDemuxer::stream_clr_important`].
+    pub clr_important: u32,
+    /// Verbatim `BITMAPINFOHEADER.biPlanes` WORD (byte offset 12) — the
+    /// number of planes for the target device. Per VfW
+    /// §"BITMAPINFOHEADER" this must be set to 1. Surfaced verbatim so a
+    /// forensic / repair caller can observe a non-conformant writer that
+    /// stamped a value other than 1, via [`AviDemuxer::stream_planes`].
+    pub planes: u16,
 }
 
 /// Concrete AVI demuxer. Returned by [`open_avi`] for callers that
@@ -9575,6 +9660,122 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .and_then(|v| v.as_ref())
             .and_then(|vs| vs.palette.as_deref())
+    }
+
+    /// Per-video-stream `BITMAPINFOHEADER.biSizeImage` (AVI 1.0
+    /// `strf`/BITMAPINFOHEADER, byte offset 20 of the 40-byte fixed
+    /// header).
+    ///
+    /// Returns the verbatim 32-bit value — the size, in bytes, of the
+    /// image — with the spec-documented `0` "may be zero" stamp folded to
+    /// `None` so an unspecified size reads the same as an absent one,
+    /// mirroring the "default == absent" convention used across the
+    /// sibling BMIH / strh accessors. Per VfW `wingdi.h`
+    /// §"BITMAPINFOHEADER" `biSizeImage` *"may be set to zero for `BI_RGB`
+    /// bitmaps"* (the size is then derivable from `biWidth × biHeight ×
+    /// biBitCount`); for compressed FourCC streams it carries the byte
+    /// count of the largest coded frame, so it doubles as a per-stream
+    /// read-ahead hint independent of `strh.dwSuggestedBufferSize`. The
+    /// demuxer surfaces the raw value with no validation against the
+    /// actual largest chunk observed in `movi`.
+    ///
+    /// `None` for non-video streams, video streams whose `strf` was
+    /// missing / too short to parse a BMIH, or an out-of-range index.
+    pub fn stream_size_image(&self, stream_index: u32) -> Option<u32> {
+        self.video_strf
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+            .map(|vs| vs.size_image)
+            .filter(|&v| v != 0)
+    }
+
+    /// Per-video-stream `BITMAPINFOHEADER` resolution pair
+    /// (`biXPelsPerMeter`, `biYPelsPerMeter` — byte offsets 24 + 28).
+    ///
+    /// Returns the verbatim signed `(x, y)` pixels-per-meter resolution
+    /// of the target output device. Per VfW `wingdi.h`
+    /// §"BITMAPINFOHEADER" these let an application select the bitmap from
+    /// a resource group that best matches the current device. An all-zero
+    /// pair (the writer-skips-it default that most AVI writers stamp,
+    /// since the screen resolution is rarely meaningful for video
+    /// playback) collapses to `None` so an unspecified resolution reads
+    /// the same as an absent one — matching the `avih_movie_rect` "zero
+    /// collapses the pair" shape; a non-zero value in *either* axis
+    /// surfaces the whole pair so a partially-specified header (one axis
+    /// stamped, the other left 0) stays observable.
+    ///
+    /// `None` for non-video streams, a missing / short `strf`, an
+    /// out-of-range index, or the all-zero default.
+    pub fn stream_pixels_per_meter(&self, stream_index: u32) -> Option<(i32, i32)> {
+        self.video_strf
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+            .map(|vs| (vs.x_pels_per_meter, vs.y_pels_per_meter))
+            .filter(|&(x, y)| x != 0 || y != 0)
+    }
+
+    /// Per-video-stream `BITMAPINFOHEADER.biClrUsed` (byte offset 32) —
+    /// the number of color indices in the color table actually used.
+    ///
+    /// Returns the verbatim 32-bit declared count with the spec `0` "uses
+    /// the maximum for `biBitCount`" default folded to `None`. Per VfW
+    /// `wingdi.h` §"BITMAPINFOHEADER": *"If this value is zero, the bitmap
+    /// uses the maximum number of colors corresponding to the value of the
+    /// `biBitCount` member."* This is the raw declared count, distinct
+    /// from the [`Self::stream_palette`] slice length — the slice is
+    /// `biClrUsed` clamped to what the `strf` physically holds (or
+    /// `1 << biBitCount` when this field is `0`), whereas this surface
+    /// keeps the on-disk DWORD observable verbatim so a forensic caller
+    /// can detect an over-declared / truncated color table.
+    ///
+    /// `None` for non-video streams, a missing / short `strf`, an
+    /// out-of-range index, or the `0` default.
+    pub fn stream_clr_used(&self, stream_index: u32) -> Option<u32> {
+        self.video_strf
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+            .map(|vs| vs.clr_used)
+            .filter(|&v| v != 0)
+    }
+
+    /// Per-video-stream `BITMAPINFOHEADER.biClrImportant` (byte offset
+    /// 36) — the number of color indices considered important for
+    /// display.
+    ///
+    /// Returns the verbatim 32-bit value with the spec `0` "all colors
+    /// are important" default folded to `None`. Per VfW `wingdi.h`
+    /// §"BITMAPINFOHEADER": *"If this value is zero, all colors are
+    /// important."* Surfaced verbatim with no validation against
+    /// `biClrUsed` or the actual palette length.
+    ///
+    /// `None` for non-video streams, a missing / short `strf`, an
+    /// out-of-range index, or the `0` default.
+    pub fn stream_clr_important(&self, stream_index: u32) -> Option<u32> {
+        self.video_strf
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+            .map(|vs| vs.clr_important)
+            .filter(|&v| v != 0)
+    }
+
+    /// Per-video-stream `BITMAPINFOHEADER.biPlanes` (byte offset 12) —
+    /// the number of planes for the target device.
+    ///
+    /// Returns the verbatim 16-bit value. Per VfW `wingdi.h`
+    /// §"BITMAPINFOHEADER" `biPlanes` *"must be set to 1"* — so a
+    /// conforming file always reads `Some(1)`. Unlike the other BMIH
+    /// accessors this does **not** fold any value to `None` (there is no
+    /// "absent" sentinel — `0` would itself be non-conformant), so a
+    /// forensic / repair caller can detect a writer that stamped `0` or a
+    /// multi-plane value other than the mandated `1`.
+    ///
+    /// `None` only for non-video streams, a missing / short `strf`, or an
+    /// out-of-range index.
+    pub fn stream_planes(&self, stream_index: u32) -> Option<u16> {
+        self.video_strf
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+            .map(|vs| vs.planes)
     }
 
     /// Round-75: per-audio-stream WAVEFORMATEX(TENSIBLE) typed side-info.
