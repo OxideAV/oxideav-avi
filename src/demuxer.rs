@@ -1091,6 +1091,22 @@ fn open_avi_inner(
             Some(a) => a,
             None => continue,
         };
+        // Round-381: raw WAVEFORMATEX scalar fields surfaced for EVERY
+        // audio stream (legacy or extensible) — emitted only when the
+        // field departs from its "default == absent" `0` sentinel per RFC
+        // 2361 §"WAVEFORMATEX".
+        if asi.avg_bytes_per_sec != 0 {
+            metadata.push((
+                format!("avi:auds.{i}.avg_bytes_per_sec"),
+                asi.avg_bytes_per_sec.to_string(),
+            ));
+        }
+        if asi.bits_per_sample != 0 {
+            metadata.push((
+                format!("avi:auds.{i}.bits_per_sample"),
+                asi.bits_per_sample.to_string(),
+            ));
+        }
         if asi.format_tag != WAVE_FORMAT_EXTENSIBLE {
             continue;
         }
@@ -3784,6 +3800,25 @@ pub struct AudioStrfInfo {
     /// `WAVE_FORMAT_EXTENSIBLE` escape hatch. `None` for non-
     /// extensible streams.
     pub subformat: Option<Guid>,
+    /// Verbatim `WAVEFORMATEX.nAvgBytesPerSec` DWORD (byte offset 8 of
+    /// the WAVEFORMATEX). Per RFC 2361 §"WAVEFORMATEX" this is the
+    /// *"required average data-transfer rate, in bytes per second, for the
+    /// format tag. ... a buffer of this size will fill in approximately
+    /// one second."* For CBR PCM it equals `nSamplesPerSec × nBlockAlign`;
+    /// for VBR codecs it is the writer's nominal/average rate. Surfaced
+    /// verbatim for ALL audio streams (not just extensible) via
+    /// [`AviDemuxer::stream_avg_bytes_per_sec`], distinct from the derived
+    /// `CodecParameters::bit_rate` (which is `nAvgBytesPerSec × 8`).
+    pub avg_bytes_per_sec: u32,
+    /// Verbatim `WAVEFORMATEX.wBitsPerSample` WORD (byte offset 14). Per
+    /// RFC 2361 §"WAVEFORMATEX" this is the bits-per-sample for the
+    /// `wFormatTag`. For `WAVE_FORMAT_PCM` it is the container sample
+    /// depth; for compressed formats it *"should be set to ... the value
+    /// most convenient ... or to zero if not applicable"*. Surfaced
+    /// verbatim via [`AviDemuxer::stream_bits_per_sample`]; for an
+    /// extensible stream this is the *container* size (the smaller actual
+    /// precision is in [`Self::valid_bits_per_sample`]).
+    pub bits_per_sample: u16,
 }
 
 /// One CBR-audio `ix##` standard-index entry whose `dwSize` is not a
@@ -4572,6 +4607,8 @@ fn build_stream(
                 valid_bits_per_sample: wfex.as_ref().map(|wfe| wfe.valid_bits_per_sample),
                 channel_mask: wfex.as_ref().map(|wfe| wfe.channel_mask),
                 subformat: wfex.as_ref().map(|wfe| wfe.subformat),
+                avg_bytes_per_sec: wfx.as_ref().map(|w| w.avg_bytes_per_sec).unwrap_or(0),
+                bits_per_sample: wfx.as_ref().map(|w| w.bits_per_sample).unwrap_or(0),
             });
             (MediaType::Audio, codec_id, p, *b"wb")
         }
@@ -9823,6 +9860,55 @@ impl AviDemuxer {
     pub fn stream_valid_bits_per_sample(&self, stream_index: u32) -> Option<u16> {
         self.stream_audio_strf(stream_index)
             .and_then(|asi| asi.valid_bits_per_sample)
+    }
+
+    /// Per-audio-stream `WAVEFORMATEX.nAvgBytesPerSec` (byte offset 8 of
+    /// the WAVEFORMATEX inside the `strf`).
+    ///
+    /// Returns the verbatim 32-bit average data-transfer rate, in bytes
+    /// per second, with the `0` "unspecified" stamp folded to `None` so an
+    /// unspecified rate reads the same as an absent one, mirroring the
+    /// "default == absent" convention. Per RFC 2361 §"WAVEFORMATEX" this
+    /// is the *"required average data-transfer rate ... a buffer of this
+    /// size will fill in approximately one second."* For a CBR PCM stream
+    /// it equals `nSamplesPerSec × nBlockAlign`; for a VBR codec it is the
+    /// writer's nominal / average rate.
+    ///
+    /// Surfaced for **any** audio stream (legacy `WAVEFORMATEX` or
+    /// extensible), distinct from the typed
+    /// [`oxideav_core::CodecParameters::bit_rate`] already exposed via
+    /// [`Self::streams`] — that derived value is `nAvgBytesPerSec × 8`
+    /// bits/sec, whereas this surface keeps the raw bytes/sec DWORD
+    /// observable for byte-exact round-trip or comparison against a
+    /// separately-emitted writer's stamp. `None` for non-audio streams, an
+    /// audio stream with no parsable WAVEFORMATEX, an out-of-range index,
+    /// or the `0` default.
+    pub fn stream_avg_bytes_per_sec(&self, stream_index: u32) -> Option<u32> {
+        self.stream_audio_strf(stream_index)
+            .map(|asi| asi.avg_bytes_per_sec)
+            .filter(|&v| v != 0)
+    }
+
+    /// Per-audio-stream `WAVEFORMATEX.wBitsPerSample` (byte offset 14 of
+    /// the WAVEFORMATEX inside the `strf`).
+    ///
+    /// Returns the verbatim 16-bit container sample depth with the `0`
+    /// "not applicable" stamp folded to `None`. Per RFC 2361
+    /// §"WAVEFORMATEX": for `WAVE_FORMAT_PCM` this is the bits per sample;
+    /// for compressed formats it *"should be set to ... the value most
+    /// convenient ... or to zero if not applicable."* So a `0` here is the
+    /// documented "not applicable" stamp many VBR-codec writers use, which
+    /// folds to `None`.
+    ///
+    /// For an extensible (`0xFFFE`) stream this is the *container* size;
+    /// the smaller actual precision (e.g. 24 valid bits in a 32-bit
+    /// container) is on [`Self::stream_valid_bits_per_sample`]. `None` for
+    /// non-audio streams, an audio stream with no parsable WAVEFORMATEX,
+    /// an out-of-range index, or the `0` default.
+    pub fn stream_bits_per_sample(&self, stream_index: u32) -> Option<u16> {
+        self.stream_audio_strf(stream_index)
+            .map(|asi| asi.bits_per_sample)
+            .filter(|&v| v != 0)
     }
 
     /// Round-75 convenience: `SubFormat` GUID for an extensible audio
