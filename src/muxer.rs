@@ -1024,6 +1024,15 @@ pub struct AviMuxOptions {
     /// `stream_pixels_per_meter` / `stream_clr_important` /
     /// `stream_planes` accessors.
     pub bmih_overrides: Vec<(u32, crate::packaging::BmihOverrides)>,
+    /// Per-stream `WAVEFORMATEX.nAvgBytesPerSec` overrides (round-381):
+    /// `(stream_index, bytes_per_sec)`. Stamps the supplied value verbatim
+    /// at byte offset 8 of that audio stream's WAVEFORMATEX, replacing the
+    /// muxer's computed `nSamplesPerSec × nBlockAlign`. Default empty; set
+    /// via [`Self::with_avg_bytes_per_sec`]. Only the nominal/average-rate
+    /// DWORD is overridable — the container-layout fields stay
+    /// muxer-owned. Round-trips through the demuxer's
+    /// [`crate::demuxer::AviDemuxer::stream_avg_bytes_per_sec`] accessor.
+    pub avg_bytes_per_sec_overrides: Vec<(u32, u32)>,
 }
 
 /// Per-stream override values for the OpenDML 2.0 `vprp` Video
@@ -1531,6 +1540,26 @@ impl AviMuxOptions {
     /// per stream wins.
     pub fn with_bmih_planes(mut self, stream_index: u32, planes: u16) -> Self {
         self.bmih_entry(stream_index).planes = Some(planes);
+        self
+    }
+
+    /// Builder helper: stamp `WAVEFORMATEX.nAvgBytesPerSec` (byte offset 8
+    /// of the WAVEFORMATEX) verbatim for an audio `stream_index`,
+    /// replacing the muxer's computed `nSamplesPerSec × nBlockAlign`.
+    /// Round-381. Useful for a VBR stream that wants to advertise a
+    /// nominal / average byte rate distinct from the CBR product, or for a
+    /// fixture exercising the demuxer's
+    /// [`crate::demuxer::AviDemuxer::stream_avg_bytes_per_sec`] accessor.
+    /// Last call per stream wins; only consulted when building an `auds`
+    /// strf, and never perturbs `wBitsPerSample` / `nBlockAlign` (so the
+    /// CBR sample-size invariant and byte-stream framing stay intact). An
+    /// explicit `0` stamps the "unspecified" sentinel the demuxer folds
+    /// back to `None`.
+    pub fn with_avg_bytes_per_sec(mut self, stream_index: u32, bytes_per_sec: u32) -> Self {
+        self.avg_bytes_per_sec_overrides
+            .retain(|(idx, _)| *idx != stream_index);
+        self.avg_bytes_per_sec_overrides
+            .push((stream_index, bytes_per_sec));
         self
     }
 
@@ -2728,7 +2757,20 @@ pub fn open_avi(
             .find(|(idx, _)| (*idx as usize) == i)
             .map(|(_, ov)| *ov)
             .unwrap_or_default();
-        let entry = build_strf(&s.params, top_down, extensible, indexed, bmih_overrides)?;
+        // Round-381: per-stream WAVEFORMATEX nAvgBytesPerSec override.
+        let avg_bytes_override = options
+            .avg_bytes_per_sec_overrides
+            .iter()
+            .find(|(idx, _)| (*idx as usize) == i)
+            .map(|(_, v)| *v);
+        let entry = build_strf(
+            &s.params,
+            top_down,
+            extensible,
+            indexed,
+            bmih_overrides,
+            avg_bytes_override,
+        )?;
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {
             stream: s.clone(),

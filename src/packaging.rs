@@ -71,6 +71,7 @@ pub(crate) fn build_strf(
     extensible: Option<(u32, u16, Guid)>,
     indexed: Option<(u16, &[RgbQuad])>,
     bmih_overrides: BmihOverrides,
+    avg_bytes_per_sec: Option<u32>,
 ) -> Result<StrfEntry> {
     match params.media_type {
         MediaType::Video => {
@@ -78,7 +79,21 @@ pub(crate) fn build_strf(
             apply_bmih_overrides(&mut entry.strf, bmih_overrides);
             Ok(entry)
         }
-        MediaType::Audio => build_audio_strf(params, extensible),
+        MediaType::Audio => {
+            let mut entry = build_audio_strf(params, extensible)?;
+            // Round-381: stamp a caller-supplied `nAvgBytesPerSec` over the
+            // muxer's computed value (byte offset 8 of the WAVEFORMATEX).
+            // Only the nominal/average-rate DWORD is overridable — the
+            // container-layout fields (`wBitsPerSample`, `nBlockAlign`)
+            // stay owned by the PCM/codec packaging since they determine
+            // byte-stream framing and the CBR sample-size invariant.
+            if let Some(avg) = avg_bytes_per_sec {
+                if entry.strf.len() >= 12 {
+                    entry.strf[8..12].copy_from_slice(&avg.to_le_bytes());
+                }
+            }
+            Ok(entry)
+        }
         _ => Err(Error::unsupported(format!(
             "avi muxer: media type {:?} not supported",
             params.media_type
@@ -541,7 +556,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false, None, None, BmihOverrides::default()).unwrap();
+        let entry = build_strf(&p, false, None, None, BmihOverrides::default(), None).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         assert_eq!(entry.sample_size, 4); // 2ch × 2B
     }
@@ -552,7 +567,7 @@ mod tests {
             CodecParameters::audio(CodecId::new("mp3")).with_tag(CodecTag::wave_format(0x0055));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false, None, None, BmihOverrides::default()).unwrap();
+        let entry = build_strf(&p, false, None, None, BmihOverrides::default(), None).unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         // First 2 bytes of the WAVEFORMATEX are the wFormatTag in LE.
         assert_eq!(&entry.strf[0..2], &0x0055u16.to_le_bytes());
@@ -563,7 +578,7 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("noexist"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        match build_strf(&p, false, None, None, BmihOverrides::default()) {
+        match build_strf(&p, false, None, None, BmihOverrides::default(), None) {
             Err(Error::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -578,7 +593,7 @@ mod tests {
             .with_tag(oxideav_core::CodecTag::fourcc(b"MJPG"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true, None, None, BmihOverrides::default()).unwrap();
+        let entry = build_strf(&p, true, None, None, BmihOverrides::default(), None).unwrap();
         // biHeight offset 8..12 in the BMIH; must be positive 240.
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, 240, "compressed FourCCs MUST use positive biHeight");
@@ -587,7 +602,7 @@ mod tests {
         let mut p = CodecParameters::video(CodecId::new("rgb24"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true, None, None, BmihOverrides::default()).unwrap();
+        let entry = build_strf(&p, true, None, None, BmihOverrides::default(), None).unwrap();
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, -240, "BI_RGB + top_down ⇒ negative biHeight");
     }

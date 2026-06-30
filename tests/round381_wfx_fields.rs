@@ -226,3 +226,50 @@ fn pcm_mux_roundtrips_derived_avg_and_bits() {
     assert_eq!(dmx.stream_avg_bytes_per_sec(0), Some(192_000));
     assert_eq!(dmx.stream_bits_per_sample(0), Some(16));
 }
+
+#[test]
+fn avg_bytes_override_replaces_computed() {
+    let mut params =
+        CodecParameters::audio(CodecId::new("pcm_s16le")).with_tag(CodecTag::wave_format(0x0001));
+    params.media_type = MediaType::Audio;
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(SampleFormat::S16);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+
+    let tmp = std::env::temp_dir().join("oxideav-avi-r381-avg-override.avi");
+    let ws: Box<dyn WriteSeek> = Box::new(std::fs::File::create(&tmp).unwrap());
+    // Override the computed 192000 with a nominal 200000.
+    let opts = AviMuxOptions::new().with_avg_bytes_per_sec(0, 200_000);
+    let mut mux =
+        open_with_options(ws, std::slice::from_ref(&stream), AviKind::Avi10, opts).unwrap();
+    mux.write_header().unwrap();
+    for i in 0..3 {
+        let mut pkt = Packet::new(0, stream.time_base, vec![0u8; 192]);
+        pkt.pts = Some(i as i64);
+        mux.write_packet(&pkt).unwrap();
+    }
+    mux.write_trailer().unwrap();
+
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let dmx = open_avi(rs, &pcm_registry()).unwrap();
+
+    // The override replaced the computed value; wBitsPerSample +
+    // nBlockAlign (and thus the CBR sample-size invariant) untouched.
+    assert_eq!(dmx.stream_avg_bytes_per_sec(0), Some(200_000));
+    assert_eq!(dmx.stream_bits_per_sample(0), Some(16));
+    assert_eq!(dmx.stream_block_align(0), Some(4));
+    assert_eq!(
+        dmx.metadata()
+            .iter()
+            .find(|(k, _)| k == "avi:auds.0.avg_bytes_per_sec")
+            .map(|(_, v)| v.as_str()),
+        Some("200000")
+    );
+}
