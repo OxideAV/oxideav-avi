@@ -1,5 +1,7 @@
 # oxideav-avi
 
+[![CI](https://github.com/OxideAV/oxideav-avi/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-avi/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-avi.svg)](https://crates.io/crates/oxideav-avi) [![docs.rs](https://docs.rs/oxideav-avi/badge.svg)](https://docs.rs/oxideav-avi) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **AVI (RIFF)** container — demuxer + muxer for the legacy
 Microsoft AVI 1.0 format with a wide FourCC / WAVEFORMATEX mapping table
 into stable oxideav codec ids. Zero C dependencies.
