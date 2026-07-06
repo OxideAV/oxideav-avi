@@ -250,10 +250,18 @@ fn opendml_two_riff_segments_recover_8_frames_in_order() {
 }
 
 #[test]
-fn opendml_indx_super_index_entries_match_riff_offsets() {
-    // 16 frames at 512 B each, limit 4 KiB → multiple RIFFs. The
-    // indx super-index must reflect each RIFF's qwOffset / dwSize /
-    // dwDuration.
+fn opendml_indx_super_index_entries_point_at_ix_chunks() {
+    // 16 frames at 512 B each, limit 4 KiB → multiple RIFFs, each
+    // carrying one `ix00` AVISTDINDEX chunk at its movi tail. Per
+    // OpenDML 2.0 §"AVI Super Index Chunk"
+    // (docs/container/riff/opendml-avi-2.0.pdf) each used
+    // `_avisuperindex_entry` must carry the "absolute file offset"
+    // of an ix## index chunk in qwOffset (the spec marks 0 as an
+    // UNUSED entry), the "size of index chunk at this offset" in
+    // dwSize, and the "time span in stream ticks" in dwDuration.
+    // Pre-round-394 the muxer stamped the RIFF segment offset/size
+    // instead — unusable by a conformant reader dereferencing the
+    // super-index (and the primary segment's 0 read as "unused").
     let stream = magicyuv_stream(64, 64);
     let frames: Vec<Vec<u8>> = (0..16).map(|i| synthesize_payload(i + 200, 512)).collect();
     let reg = registry_with_magicyuv();
@@ -312,6 +320,31 @@ fn opendml_indx_super_index_entries_match_riff_offsets() {
     }
     let indx_off = indx_off.expect("indx chunk in first RIFF");
     let payload_off = indx_off + 8;
+
+    // Locate every `ix00` AVISTDINDEX chunk header in the whole file
+    // by walking chunk-by-chunk is overkill for a fixture this size —
+    // a byte scan anchored on the FourCC plus a sanity check that the
+    // following DWORD is a plausible chunk size is enough here.
+    let mut ix_chunks: Vec<(u64, u64)> = Vec::new(); // (hdr offset, 8 + cb)
+    let mut k = 0usize;
+    while k + 8 <= bytes.len() {
+        if &bytes[k..k + 4] == b"ix00" {
+            let cb =
+                u32::from_le_bytes([bytes[k + 4], bytes[k + 5], bytes[k + 6], bytes[k + 7]]) as u64;
+            if cb >= 24 && (k as u64 + 8 + cb) <= bytes.len() as u64 {
+                ix_chunks.push((k as u64, 8 + cb));
+                k += (8 + cb) as usize;
+                continue;
+            }
+        }
+        k += 1;
+    }
+    assert_eq!(
+        ix_chunks.len(),
+        riff_offsets_and_sizes.len(),
+        "one ix00 per RIFF segment (no mid-movi flush configured)"
+    );
+
     // Preamble: 2 + 1 + 1 + 4 + 4 + 12 = 24 B.
     let n_entries = u32::from_le_bytes([
         bytes[payload_off + 4],
@@ -321,15 +354,15 @@ fn opendml_indx_super_index_entries_match_riff_offsets() {
     ]) as usize;
     assert_eq!(
         n_entries,
-        riff_offsets_and_sizes.len(),
-        "nEntriesInUse should match actual segment count"
+        ix_chunks.len(),
+        "nEntriesInUse should match the number of ix00 chunks"
     );
     let chunk_id = &bytes[payload_off + 8..payload_off + 12];
     assert_eq!(chunk_id, b"00dc", "indx dwChunkId should be '00dc'");
 
     let entries_start = payload_off + 24;
     let mut frames_seen: u64 = 0;
-    for (i, &(expected_off, expected_size)) in riff_offsets_and_sizes.iter().enumerate() {
+    for (i, &(expected_off, expected_size)) in ix_chunks.iter().enumerate() {
         let base = entries_start + 16 * i;
         let qw_off = u64::from_le_bytes([
             bytes[base],
@@ -353,8 +386,9 @@ fn opendml_indx_super_index_entries_match_riff_offsets() {
             bytes[base + 14],
             bytes[base + 15],
         ]) as u64;
-        assert_eq!(qw_off, expected_off, "indx[{i}].qwOffset");
-        assert_eq!(dw_size, expected_size, "indx[{i}].dwSize");
+        assert_eq!(qw_off, expected_off, "indx[{i}].qwOffset → ix00 header");
+        assert_ne!(qw_off, 0, "qwOffset 0 is the spec's UNUSED-entry mark");
+        assert_eq!(dw_size, expected_size, "indx[{i}].dwSize = ix00 chunk size");
         frames_seen += dw_duration;
     }
     assert_eq!(

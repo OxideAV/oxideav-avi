@@ -2615,6 +2615,15 @@ struct TrackState {
     /// close. Always populated so the OpenDML emit path can decide
     /// whether to write `ix##` regardless of stream type.
     ix_entries: Vec<IxStdEntry>,
+    /// One record per `ix##` chunk flushed for this track, in file
+    /// order (round 394). These become the stream's `indx`
+    /// super-index entries in `write_trailer` — pointing at the index
+    /// chunks themselves per OpenDML 2.0 §"AVI Super Index Chunk".
+    ix_chunk_records: Vec<IxChunkRecord>,
+    /// Value of [`Self::sample_count`] at the previous `ix##` flush
+    /// for this track. The delta at the next flush is that chunk's
+    /// super-index `dwDuration` ("time span in stream ticks").
+    ticks_at_last_ix_flush: u64,
 }
 
 /// One snapshot record taken from the primary segment for the
@@ -2658,6 +2667,29 @@ struct IxStdEntry {
     /// when the parent index has `bIndexSubType == AVI_INDEX_2FIELD`
     /// (round-4 P1).
     dw_offset_field2: u32,
+}
+
+/// Location + span of one flushed `ix##` AVISTDINDEX chunk, recorded
+/// per track at flush time (round 394). The `indx` super-index
+/// back-patch points each `_avisuperindex_entry` at the index chunk
+/// itself per OpenDML 2.0 §"AVI Super Index Chunk"
+/// (`docs/container/riff/opendml-avi-2.0.pdf`): `qwOffset` is the
+/// *"absolute file offset"* of the `ix##` chunk (the spec marks `0`
+/// as an unused entry, so a real chunk offset is mandatory), `dwSize`
+/// the *"size of index chunk at this offset"*, and `dwDuration` the
+/// *"time span in stream ticks"* of the chunks that `ix##` indexes.
+#[derive(Clone, Copy, Debug)]
+struct IxChunkRecord {
+    /// File-absolute offset of the `ix##` chunk's 8-byte header.
+    qw_offset: u64,
+    /// Total byte length of the `ix##` chunk (8-byte header +
+    /// payload; the payload is always even so no pad byte applies).
+    dw_size: u32,
+    /// Stream-tick span of the chunks this `ix##` indexes: frames for
+    /// video (1 tick per packet), `dwLength` units for audio (samples
+    /// for CBR, accumulated `Packet.duration` for VBR) — the same
+    /// units [`TrackState::sample_count`] accumulates.
+    dw_duration: u32,
 }
 
 /// Open an AVI muxer with the legacy single-`RIFF AVI ` envelope.
@@ -2781,6 +2813,8 @@ pub fn open_avi(
             max_chunk_size: 0,
             total_bytes: 0,
             ix_entries: Vec::new(),
+            ix_chunk_records: Vec::new(),
+            ticks_at_last_ix_flush: 0,
         });
     }
     Ok(AviMuxer {
@@ -2823,12 +2857,23 @@ fn packet_fourcc_for(index: u32, suffix: [u8; 2]) -> [u8; 4] {
 /// the `indx` super-index in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct SegmentRecord {
-    /// File-absolute offset of this segment's `RIFF` 4-CC.
+    /// File-absolute offset of this segment's `RIFF` 4-CC. Diagnostic
+    /// only since round 394: the `indx` super-index entries point at
+    /// the per-track `ix##` chunks themselves (per OpenDML 2.0 §"AVI
+    /// Super Index Chunk", `qwOffset` is the *"absolute file offset"*
+    /// of the index chunk and `dwSize` the *"size of index chunk at
+    /// this offset"*), not at the RIFF segment — see
+    /// [`IxChunkRecord`]. Pre-round-394 this crate's writer stamped
+    /// the RIFF segment offset/size here, which a spec-conformant
+    /// reader dereferencing `qwOffset` cannot use (and the primary
+    /// segment's `0` offset reads as the spec's "unused entry"
+    /// sentinel).
+    #[allow(dead_code)]
     riff_offset: u64,
     /// Total byte length of the segment (= 8 + dwSize, including any
-    /// even-pad byte). Stored as the value to write into `dwSize` of
-    /// the indx entry per spec/06 §6.1 ("dwSize is the byte count of
-    /// the entire RIFF chunk including the 8-byte RIFF header").
+    /// even-pad byte). Diagnostic only since round 394 — see
+    /// [`Self::riff_offset`].
+    #[allow(dead_code)]
     total_size: u64,
     /// Number of packets (frames) carried in this segment's `movi`
     /// LIST, summed across all streams. Retained for diagnostics; the
@@ -2837,14 +2882,12 @@ struct SegmentRecord {
     #[allow(dead_code)]
     packet_count: u32,
     /// Number of packets carried in this segment's `movi` LIST for the
-    /// indexed stream (stream 0). Becomes `dwDuration` in the `indx`
-    /// super-index entry per OpenDML 2.0 §"AVI Super Index Chunk" —
-    /// "time span in stream ticks" of the chunks the segment's `ix##`
-    /// indexes. For a one-tick-per-frame video stream this is the
-    /// segment's frame count, matching OpenDML's intent even when the
-    /// file carries additional audio / data streams (round-101 fixes
-    /// the previous all-stream sum, which over-counted multi-stream
-    /// files).
+    /// indexed stream (stream 0). Diagnostic only since round 394: the
+    /// super-index `dwDuration` now comes from each flushed `ix##`
+    /// chunk's own tick span ([`IxChunkRecord::dw_duration`]), which
+    /// also covers mid-`movi` periodic flushes that split a segment
+    /// across several `ix##` chunks.
+    #[allow(dead_code)]
     indexed_packet_count: u32,
 }
 
@@ -4136,6 +4179,27 @@ impl AviMuxer {
                 payload.extend_from_slice(&e.dw_offset_field2.to_le_bytes());
             }
         }
+        // Round 394: record where this `ix##` chunk lands so the
+        // `indx` super-index back-patch can point its entry at the
+        // index chunk itself per OpenDML 2.0 §"AVI Super Index Chunk"
+        // (`qwOffset` = "absolute file offset" of the index chunk,
+        // `dwSize` = "size of index chunk at this offset",
+        // `dwDuration` = "time span in stream ticks"). The duration is
+        // the track's tick delta since its previous flush — frames for
+        // video (1 tick per packet), `dwLength` units for audio — so
+        // mid-`movi` periodic flushes each carry their own span.
+        let chunk_offset = self.output.stream_position()?;
+        let chunk_size = (8 + payload.len()).min(u32::MAX as usize) as u32;
+        let ticks_now = self.tracks[track_idx].sample_count;
+        let duration = ticks_now
+            .saturating_sub(self.tracks[track_idx].ticks_at_last_ix_flush)
+            .min(u32::MAX as u64) as u32;
+        self.tracks[track_idx].ticks_at_last_ix_flush = ticks_now;
+        self.tracks[track_idx].ix_chunk_records.push(IxChunkRecord {
+            qw_offset: chunk_offset,
+            dw_size: chunk_size,
+            dw_duration: duration,
+        });
         write_chunk(self.output.as_mut(), &ix_id, &payload)?;
         Ok(())
     }
@@ -4546,8 +4610,15 @@ impl AviMuxer {
         if self.indx_entries_capacity == 0 {
             return 0;
         }
-        self.segments
-            .len()
+        // Round 394: entries are per flushed `ix##` chunk of the
+        // indexed stream (one per segment without mid-`movi` flushes;
+        // more when `with_mid_movi_index` splits a segment across
+        // several `ix##` chunks), so the overflow count is measured
+        // against that list rather than the segment list.
+        self.tracks
+            .first()
+            .map(|t| t.ix_chunk_records.len())
+            .unwrap_or(0)
             .saturating_sub(self.indx_entries_capacity)
     }
 
@@ -4638,24 +4709,37 @@ impl AviMuxer {
             return Ok(());
         };
         let end_pos = self.output.stream_position()?;
-        let n_to_write = self.segments.len().min(self.indx_entries_capacity);
+        // One super-index entry per `ix##` chunk flushed for the
+        // indexed stream (stream 0), per OpenDML 2.0 §"AVI Super
+        // Index Chunk" (`docs/container/riff/opendml-avi-2.0.pdf`):
+        // `qwOffset` is the *"absolute file offset"* of the index
+        // chunk (the spec marks `0` as an unused entry), `dwSize` the
+        // *"size of index chunk at this offset"*, and `dwDuration`
+        // the *"time span in stream ticks"* of the chunks that index
+        // covers. Pre-round-394 this crate stamped the enclosing RIFF
+        // segment's offset/size instead — unusable by a conformant
+        // reader dereferencing `qwOffset` (it lands on a `RIFF`
+        // FourCC, and the primary segment's `0` reads as the "unused
+        // entry" sentinel). With mid-`movi` periodic flushes a single
+        // segment legitimately contributes several entries — exactly
+        // the spec's growth model ("New 'ix##' chunks can be added to
+        // grow the file", §"Index Locations in RIFF File").
+        let records = self
+            .tracks
+            .first()
+            .map(|t| t.ix_chunk_records.clone())
+            .unwrap_or_default();
+        let n_to_write = records.len().min(self.indx_entries_capacity);
         // nEntriesInUse.
         self.output.seek(SeekFrom::Start(n_off))?;
         self.output.write_all(&(n_to_write as u32).to_le_bytes())?;
         // Per-entry slots.
-        for (i, seg) in self.segments.iter().take(n_to_write).enumerate() {
+        for (i, rec) in records.iter().take(n_to_write).enumerate() {
             let slot = start_off + (i as u64) * 16;
             self.output.seek(SeekFrom::Start(slot))?;
-            self.output.write_all(&seg.riff_offset.to_le_bytes())?;
-            // dwSize: total RIFF byte length per spec/06 §6.1.
-            let dw_size = seg.total_size.min(u32::MAX as u64) as u32;
-            self.output.write_all(&dw_size.to_le_bytes())?;
-            // dwDuration: the indexed stream's per-segment frame count
-            // (OpenDML 2.0 §"AVI Super Index Chunk" — the time span of
-            // the chunks this segment's `ix##` indexes), not the
-            // all-stream packet total (round-101).
-            self.output
-                .write_all(&seg.indexed_packet_count.to_le_bytes())?;
+            self.output.write_all(&rec.qw_offset.to_le_bytes())?;
+            self.output.write_all(&rec.dw_size.to_le_bytes())?;
+            self.output.write_all(&rec.dw_duration.to_le_bytes())?;
         }
         self.output.seek(SeekFrom::Start(end_pos))?;
         Ok(())

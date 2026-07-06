@@ -1912,6 +1912,27 @@ fn open_avi_inner(
         }
     }
 
+    // Round-394: surface a super-index whose entries don't point at the
+    // `ix##` chunks the in-`movi` scan actually found. Per OpenDML 2.0
+    // §"AVI Super Index Chunk" every used `_avisuperindex_entry.qwOffset`
+    // is the "absolute file offset" of an AVISTDINDEX chunk; an entry
+    // pointing anywhere else (a legacy writer stamping RIFF-segment
+    // offsets — this crate's own pre-round-394 muxer included — or a
+    // hand-edited / partially-rewritten file) is unusable by a conformant
+    // reader that dereferences the super-index. Divergence-only key
+    // `avi:indx.<n>.stale_targets = "<count>"`; the well-formed case
+    // emits nothing so absence stays observable. Mirrors the typed
+    // [`AviDemuxer::super_index_target_violations`] surface.
+    for (i, sx) in super_indexes.iter().enumerate() {
+        let stale = super_index_stale_targets(sx, &std_indexes, i as u32);
+        if !stale.is_empty() {
+            metadata.push((
+                format!("avi:indx.{i}.stale_targets"),
+                stale.len().to_string(),
+            ));
+        }
+    }
+
     // Round-361: surface a non-conformant non-zero `dwReserved[3]` on a
     // stream's `indx` super-index. Per the AVISUPERINDEX layout the 3
     // DWORDs after `dwChunkId` are reserved (*"0 if unused"*); a
@@ -3671,6 +3692,10 @@ fn parse_ix_chunk(own_fourcc: [u8; 4], body: &[u8]) -> Option<StdIndex> {
     Some(StdIndex {
         own_fourcc,
         chunk_id,
+        // The parser only sees the chunk body; the caller that knows
+        // where the chunk header sits in the file fills this in
+        // (`scan_ix_in_movi`). `0` = unknown / not applicable.
+        chunk_offset: 0,
         qw_base_offset,
         b_index_sub_type,
         b_index_type,
@@ -3694,6 +3719,14 @@ fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
     for &(start, end) in movi_segments {
         r.seek(SeekFrom::Start(start))?;
         while r.stream_position()? + 8 <= end {
+            // File-absolute offset of the chunk header about to be
+            // read — retained on parsed `ix##` chunks so the
+            // round-394 super-index target cross-check can compare
+            // each `_avisuperindex_entry.qwOffset` (per OpenDML 2.0
+            // §"AVI Super Index Chunk" the "absolute file offset" of
+            // the index chunk) against where the `ix##` chunks
+            // actually sit.
+            let hdr_pos = r.stream_position()?;
             let hdr = match read_chunk_header_lenient(r)? {
                 Some(h) => h,
                 None => break,
@@ -3708,7 +3741,8 @@ fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
             if hdr.id[0] == b'i' && hdr.id[1] == b'x' {
                 let body = read_body_bounded(r, hdr.size).ok();
                 if let Some(b) = body {
-                    if let Some(idx) = parse_ix_chunk(hdr.id, &b) {
+                    if let Some(mut idx) = parse_ix_chunk(hdr.id, &b) {
+                        idx.chunk_offset = hdr_pos;
                         out.push(idx);
                     }
                 }
@@ -3999,6 +4033,94 @@ pub struct StdIndexEntryCountViolation {
     /// from the (truncated) body. Always `< declared_entries` for a
     /// reported violation.
     pub parsed_entries: u32,
+}
+
+/// One `(qwOffset, dwSize, dwDuration)` triple from a stream's `indx`
+/// super-index, surfaced verbatim by
+/// [`AviDemuxer::super_index_entries`] (round 394).
+///
+/// Per AVISUPERINDEX (clean-room sources:
+/// `docs/container/riff/avi-riff-file-reference.md` Appendix F +
+/// `docs/container/riff/opendml-avi-2.0.pdf` §"AVI Super Index
+/// Chunk"): `qwOffset` is the *"64-bit file offset to the AVISTDINDEX
+/// segment"* (the spec's inline comment marks offset `0` as an unused
+/// entry), `dwSize` the *"size of index chunk at this offset"*, and
+/// `dwDuration` the *"time span in stream ticks"* of the chunks that
+/// standard index covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperIndexEntryInfo {
+    /// File-absolute offset of the pointed-to `ix##` chunk header.
+    pub qw_offset: u64,
+    /// Declared byte size of the pointed-to index chunk.
+    pub dw_size: u32,
+    /// Stream-tick span of the chunks indexed by that `ix##`.
+    pub dw_duration: u32,
+}
+
+/// One `indx` super-index entry whose `qwOffset` does not land on any
+/// `ix##` standard-index chunk actually present in the file's `movi`
+/// LISTs (round 394).
+///
+/// Per OpenDML 2.0 §"AVI Super Index Chunk" every used
+/// `_avisuperindex_entry.qwOffset` is the *"absolute file offset"* of
+/// an `AVISTDINDEX` (`ix##`) chunk, so for a well-formed file each
+/// non-zero `qwOffset` must equal the file position of one of the
+/// stream's `ix##` chunk headers. An entry pointing anywhere else —
+/// at the enclosing `RIFF` segment header (a known legacy-writer
+/// shape, including this crate's own pre-round-394 muxer), into the
+/// middle of packet data, or past EOF — is unusable by a conformant
+/// reader that dereferences the super-index instead of scanning
+/// `movi`. `qwOffset == 0` entries are skipped: the spec marks offset
+/// `0` as an unused-entry sentinel.
+///
+/// Returned (possibly empty) by
+/// [`AviDemuxer::super_index_target_violations`]. Informational only —
+/// never fails `open()`, and this demuxer's own OpenDML machinery
+/// resolves `ix##` chunks by scanning `movi` rather than
+/// dereferencing `qwOffset`, so a stale super-index stays observable
+/// without breaking playback. Same family as
+/// [`StdIndexBaseOffsetViolation`] / [`StdIndexEntryCountViolation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperIndexTargetViolation {
+    /// Stream whose `indx` super-index carries the stale entry.
+    pub stream_index: u32,
+    /// Zero-based position of the entry within the super-index's
+    /// `aIndex[]` array.
+    pub entry_index: usize,
+    /// The entry's verbatim `qwOffset` that matched no `ix##` chunk
+    /// header position.
+    pub qw_offset: u64,
+}
+
+/// Round-394 helper shared by [`AviDemuxer::super_index_target_violations`]
+/// and the `open()`-time `avi:indx.<n>.stale_targets` metadata key:
+/// list the `(entry_index, qw_offset)` pairs of `sx`'s used entries
+/// whose `qwOffset` doesn't equal any scanned `ix##` chunk-header
+/// offset belonging to `stream_index` (keyed by the body `dwChunkId`
+/// digits, matching every other per-stream `std_index_*` surface).
+/// `qwOffset == 0` entries are skipped per the spec's unused-entry
+/// sentinel, and `ix##` chunks whose own scan offset is unknown (`0`)
+/// can't anchor a match.
+fn super_index_stale_targets(
+    sx: &SuperIndex,
+    std_indexes: &[StdIndex],
+    stream_index: u32,
+) -> Vec<(usize, u64)> {
+    let mut out = Vec::new();
+    for (k, e) in sx.entries.iter().enumerate() {
+        if e.qw_offset == 0 {
+            continue;
+        }
+        let hit = std_indexes.iter().any(|ix| {
+            ix.chunk_offset != 0
+                && ix.chunk_offset == e.qw_offset
+                && parse_stream_index(&ix.chunk_id) == Some(stream_index)
+        });
+        if !hit {
+            out.push((k, e.qw_offset));
+        }
+    }
+    out
 }
 
 /// 8-tuple returned by [`build_stream`]: the [`StreamInfo`], the
@@ -7162,6 +7284,15 @@ struct StdIndex {
     /// compare the declared indexed-chunk FourCC against the stream the
     /// `ix##` chunk itself was emitted for.
     own_fourcc: [u8; 4],
+    /// File-absolute offset of this `ix##` chunk's own 8-byte header
+    /// as found by `scan_ix_in_movi` (round 394). This is what a
+    /// well-formed super-index entry's `qwOffset` must equal per
+    /// OpenDML 2.0 §"AVI Super Index Chunk" ("absolute file offset"
+    /// of the index chunk) — the round-394 target cross-check
+    /// ([`AviDemuxer::super_index_target_violations`]) compares the
+    /// two. `0` when unknown (e.g. a unit-test `parse_ix_chunk` call
+    /// that never saw the enclosing file).
+    chunk_offset: u64,
     /// FourCC of indexed chunks (`dwChunkId`, e.g. `00dc`). The two ASCII
     /// digits at `chunk_id[0..2]` give the stream number.
     chunk_id: [u8; 4],
@@ -9090,6 +9221,87 @@ impl AviDemuxer {
                     stream_index: i as u32,
                     super_index_duration_total: total,
                     dmlh_total_frames: dmlh_total,
+                });
+            }
+        }
+        out
+    }
+
+    /// Verbatim `(qwOffset, dwSize, dwDuration)` triples of a stream's
+    /// `indx` super-index `aIndex[]` array, in declared order
+    /// (round 394).
+    ///
+    /// Per AVISUPERINDEX (clean-room sources:
+    /// `docs/container/riff/avi-riff-file-reference.md` Appendix F +
+    /// `docs/container/riff/opendml-avi-2.0.pdf` §"AVI Super Index
+    /// Chunk"): `qwOffset` is the *"absolute file offset"* of the
+    /// pointed-to `ix##` standard-index chunk (`0` = unused entry),
+    /// `dwSize` the *"size of index chunk at this offset"*, and
+    /// `dwDuration` the *"time span in stream ticks"* it covers. The
+    /// triples are surfaced verbatim — no offset normalisation, no
+    /// dereference — so a caller can audit where the super-index
+    /// *claims* its standard indexes live independently of where the
+    /// in-`movi` scan actually found them (the positional cross-check
+    /// is [`Self::super_index_target_violations`]).
+    ///
+    /// Returns `None` for `stream_index` out of range or streams that
+    /// didn't declare an `indx` super-index, and `Some(vec![])` for a
+    /// present super-index with zero used entries — so "no super-index"
+    /// stays distinguishable from "empty super-index", mirroring the
+    /// `present`-gated `super_index_index_type` accessor.
+    pub fn super_index_entries(&self, stream_index: u32) -> Option<Vec<SuperIndexEntryInfo>> {
+        let sx = self.super_indexes.get(stream_index as usize)?;
+        if !sx.present {
+            return None;
+        }
+        Some(
+            sx.entries
+                .iter()
+                .map(|e| SuperIndexEntryInfo {
+                    qw_offset: e.qw_offset,
+                    dw_size: e.dw_size,
+                    dw_duration: e.dw_duration,
+                })
+                .collect(),
+        )
+    }
+
+    /// Cross-check every stream's `indx` super-index entry `qwOffset`
+    /// against the file positions of the `ix##` standard-index chunks
+    /// actually found in the `movi` LISTs (round 394).
+    ///
+    /// Per OpenDML 2.0 §"AVI Super Index Chunk" each used entry's
+    /// `qwOffset` is the *"absolute file offset"* of an `AVISTDINDEX`
+    /// chunk, so for a well-formed file every non-zero `qwOffset`
+    /// equals the header position of one of the stream's scanned
+    /// `ix##` chunks. This returns one [`SuperIndexTargetViolation`]
+    /// per entry that points anywhere else — the hallmark of a legacy
+    /// writer that stamped RIFF-segment offsets instead of index-chunk
+    /// offsets (this crate's own muxer did exactly that before round
+    /// 394), a file rewritten without re-patching the super-index, or
+    /// a hand-edited header. `qwOffset == 0` entries are skipped (the
+    /// spec's unused-entry sentinel).
+    ///
+    /// Informational only — never fails `open()`. This demuxer
+    /// resolves `ix##` chunks by scanning `movi` rather than
+    /// dereferencing `qwOffset`, so playback and seek keep working on
+    /// files with a stale super-index; the violation list (and the
+    /// divergence-only `avi:indx.<n>.stale_targets = "<count>"`
+    /// metadata key) exists so a repair / conformance tool can detect
+    /// that a *conformant* reader following the super-index would come
+    /// up empty. Same informational family as
+    /// [`Self::std_index_base_offset_violations`] /
+    /// [`Self::std_index_entry_count_violations`].
+    pub fn super_index_target_violations(&self) -> Vec<SuperIndexTargetViolation> {
+        let mut out = Vec::new();
+        for (i, sx) in self.super_indexes.iter().enumerate() {
+            for (entry_index, qw_offset) in
+                super_index_stale_targets(sx, &self.std_indexes, i as u32)
+            {
+                out.push(SuperIndexTargetViolation {
+                    stream_index: i as u32,
+                    entry_index,
+                    qw_offset,
                 });
             }
         }
