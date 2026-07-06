@@ -4980,8 +4980,24 @@ fn sample_format_for(codec: &str, bits: u16) -> Option<SampleFormat> {
 }
 
 fn read_body_bounded<R: std::io::Read + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; size as usize];
-    r.read_exact(&mut buf)?;
+    // Grow the buffer in 64 KiB steps instead of trusting the declared
+    // chunk size up-front: a corrupt / hostile `cb` near `0xFFFFFFFF`
+    // would otherwise commit a ~4 GiB allocation before the read has a
+    // chance to hit EOF (round-394 index-walker fuzz hardening). A
+    // legitimate oversized chunk still reads fully — only the
+    // allocation is incremental; a truncated body fails `read_exact`
+    // exactly as before, with at most one 64 KiB step of overshoot.
+    const STEP: usize = 64 * 1024;
+    let total = size as usize;
+    let mut buf: Vec<u8> = Vec::with_capacity(total.min(STEP));
+    let mut filled = 0usize;
+    while filled < total {
+        let want = (total - filled).min(STEP);
+        let old_len = buf.len();
+        buf.resize(old_len + want, 0);
+        r.read_exact(&mut buf[old_len..])?;
+        filled += want;
+    }
     Ok(buf)
 }
 
