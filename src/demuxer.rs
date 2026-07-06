@@ -823,7 +823,7 @@ fn open_avi_inner(
 
     // OpenDML 2.0 §5.0 dmlh: real total-frame count across every RIFF
     // segment. `avih.dwTotalFrames` only reflects the primary segment
-    // (per spec/06 §5.0 "Required Information"); a multi-segment file
+    // (per `opendml-avi-2.0.pdf` §5.0 "Required Information"); a multi-segment file
     // built with the OpenDML envelope writes the cross-segment count
     // here. Surface as a separate key so the avih-derived
     // `avi:total_frames` (from `avih.total_frames`, emitted above as
@@ -912,7 +912,7 @@ fn open_avi_inner(
         }
         if vp.frame_aspect_ratio > 0 {
             // Encode as "X:Y" for human consumption; the high WORD is
-            // X, low WORD is Y per spec/06 §5.0 "Active Frame Aspect
+            // X, low WORD is Y per `opendml-avi-2.0.pdf` §5.0 "Active Frame Aspect
             // Ratio".
             let x = (vp.frame_aspect_ratio >> 16) & 0xFFFF;
             let y = vp.frame_aspect_ratio & 0xFFFF;
@@ -1615,8 +1615,8 @@ fn open_avi_inner(
     //     (round-4 P3) — even a single-segment file may carry
     //     2-field std-indexes that we need to surface for downstream
     //     consumers, and the primary segment's qwOffset = 0 makes
-    //     parse_indx drop the entry slot per spec/06's "0 is unused"
-    //     convention.
+    //     parse_indx drop the entry slot per the spec's §"AVI Super
+    //     Index Chunk" offset-0-is-unused-entry convention.
     let want_ix_scan = super_indexes.iter().any(|s| !s.entries.is_empty())
         || movi_segments.len() > 1
         || super_indexes
@@ -3060,7 +3060,7 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                     // `dmlh`'s body is a single DWORD (`dwTotalFrames`)
                     // covering the real total-frame count across every
                     // RIFF segment (whereas `avih.dwTotalFrames` only
-                    // reflects the primary segment per spec/06 §5.0).
+                    // reflects the primary segment per `opendml-avi-2.0.pdf` §5.0).
                     let info = parse_odml_list(r, body_end)?;
                     dmlh_total_frames = info.as_ref().and_then(|d| d.total_frames);
                     dmlh_info = info;

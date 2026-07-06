@@ -87,8 +87,14 @@ impl Rng {
 }
 
 fn mux_fixture(tag: &str, kind: AviKind, opts: AviMuxOptions, frames: usize) -> Vec<u8> {
+    // Unique per call: the three #[test]s build the same fixture set
+    // concurrently, so a shared filename races create/read/remove.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let unique = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
     let streams = [video_stream(0), audio_stream(1)];
-    let tmp = std::env::temp_dir().join(format!("oxideav-avi-r394-fuzz-{tag}.avi"));
+    let tmp = std::env::temp_dir().join(format!("oxideav-avi-r394-fuzz-{tag}-{pid}-{unique}.avi"));
     {
         let f = std::fs::File::create(&tmp).unwrap();
         let ws: Box<dyn WriteSeek> = Box::new(f);

@@ -86,13 +86,19 @@ impl RiffSegmentLimit {
 /// AVI envelope variant.
 ///
 /// `Avi10` is the legacy single-`RIFF AVI ` form; `OpenDml` is the
-/// OpenDML 2.0 multi-`RIFF` form per spec/06 §6.1. The OpenDML
-/// envelope's primary RIFF carries the `indx` super-index in the
-/// first video stream's `strl`; per-stream `ix##` chunks are
-/// intentionally omitted (spec/06 §6.1: "from the codec's POV, the
-/// super-index is informational"). Decoders that need per-frame
-/// random access inside an OpenDML continuation can fall back to
-/// linear walking — the demuxer in this crate already does so.
+/// OpenDML 2.0 multi-`RIFF` form per `opendml-avi-2.0.pdf` §2.0
+/// "Extension for File Size > 1 GB" (*"An AVI file can be extended
+/// beyond 1 GB by placing more than one RIFF chunk in the same file
+/// … Subsequent RIFF chunks will be identified by the AVIX (for AVI
+/// extended) chunk id."*). The OpenDML envelope carries an `indx`
+/// super-index in every stream's `strl` plus per-stream `ix##`
+/// standard-index chunks at each segment's `movi` tail, per §3.0
+/// "Index Locations in RIFF File" (round 394; earlier rounds emitted
+/// stream 0's `indx` only, and a stale doc comment here claimed
+/// per-stream `ix##` chunks were "intentionally omitted" citing a
+/// spec quote that does not exist). Readers that ignore the indexes
+/// can still walk the continuations linearly — the demuxer in this
+/// crate does both.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum AviKind {
     /// AVI 1.0: single top-level `RIFF AVI ` chunk. Output must stay
@@ -113,9 +119,12 @@ pub enum AviKind {
 #[derive(Clone, Debug, Default)]
 pub struct AviMuxOptions {
     /// When `Some(n)`, group every `n` consecutive packet chunks into
-    /// a `LIST rec ` cluster inside `movi`. Per OpenDML 2.0 spec/06
-    /// §"Stream Data ('movi' List)", `LIST rec ` clusters keep the
-    /// per-cluster size manageable for files that grow past 1 GiB.
+    /// a `LIST rec ` cluster inside `movi`. Per AVI 1.0 §"AVI RIFF
+    /// Form" (`docs/container/riff/avi-riff-file-reference.md`: data
+    /// chunks "might be grouped within 'rec ' lists. The 'rec '
+    /// grouping implies that the grouped chunks should be read from
+    /// disk all at once, and is intended for files that are
+    /// interleaved to play from CD-ROM.").
     /// Default `None` (no clustering). The minimum useful value is
     /// 2; `Some(0)` and `Some(1)` are treated as `None`.
     pub rec_cluster_packets: Option<u32>,
@@ -3525,8 +3534,9 @@ impl Muxer for AviMuxer {
             }
         }
 
-        // Optional `LIST rec ` clustering (OpenDML 2.0 spec/06 §"Stream
-        // Data ('movi' List)"). Open a new cluster when we don't have
+        // Optional `LIST rec ` clustering (AVI 1.0 §"AVI RIFF Form" —
+        // chunks "might be grouped within 'rec ' lists" for one-shot
+        // CD-ROM-interleave reads). Open a new cluster when we don't have
         // one; close+reopen when the current one has reached either
         // its packet-count cap or — when set — its byte budget. The
         // caps are independent: whichever fires first closes the
@@ -5344,7 +5354,10 @@ fn write_strl<W: Write + Seek + ?Sized>(
         indx_entries_start_off = Some(payload_off + 24);
         indx_payload_len_out = payload_len;
     } else if with_indx {
-        // OpenDML 2.0 super-index. Layout per spec/06 §6.1:
+        // OpenDML 2.0 super-index. Layout per the AVISUPERINDEX
+        // struct (`docs/container/riff/avi-riff-file-reference.md`
+        // Appendix F / `opendml-avi-2.0.pdf` §3.0 "AVI Super Index
+        // Chunk"):
         //   WORD  wLongsPerEntry  = 4
         //   BYTE  bIndexSubType   = 0
         //   BYTE  bIndexType      = 0x00 (AVI_INDEX_OF_INDEXES)
