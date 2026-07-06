@@ -146,6 +146,30 @@ pub struct AviMuxOptions {
     /// every continuation. Clamped to a minimum of 16 slots; values
     /// below that fall back to the default.
     pub super_index_capacity: Option<usize>,
+    /// Opt-in compact in-`strl` standard index (round 394). Per
+    /// OpenDML 2.0 §"Index Locations in RIFF File" the strl `indx`
+    /// *"may either be an index of indexes (super index), or may be
+    /// an index to the chunks directly. … If the 'indx' chunk is a
+    /// standard or field index chunk (i.e., not an index of indexes)
+    /// then the stream has only one index chunk and there is none in
+    /// the 'movi' data."* `Some(n)` reserves room for `n`
+    /// standard-index entries per stream in each `strl`'s `indx`
+    /// chunk (8 bytes per entry; 12 for a `with_field2_stream`
+    /// 2-field stream) and, when the finished file stayed
+    /// single-segment with every stream's packet count ≤ `n`,
+    /// back-patches each `indx` as that stream's single
+    /// `AVI_INDEX_OF_CHUNKS` standard index and emits NO `ix##`
+    /// chunks in `movi`. If the file rolls into a `RIFF AVIX`
+    /// continuation or any stream overflows `n`, the muxer falls
+    /// back transparently to the two-tier layout — `ix##` chunks at
+    /// segment tails plus an `AVI_INDEX_OF_INDEXES` super-index
+    /// patched into the same reserved bytes (holding
+    /// `n * entry_size / 16` super entries) — exactly the spec's
+    /// "file can be easily grown" migration. Ignored for
+    /// [`AviKind::Avi10`] and when any `with_mid_movi_index` cadence
+    /// is registered (mid-`movi` flushing implies the two-tier
+    /// layout). Default `None` (always two-tier).
+    pub strl_std_index_capacity: Option<usize>,
     /// Optional `LIST INFO` metadata payload (round-6 candidate 2).
     /// Each entry is `(chunk_id, value)` where `chunk_id` is a
     /// 4-byte `INFO` sub-chunk FourCC such as `*b"INAM"` (title),
@@ -1783,6 +1807,15 @@ impl AviMuxOptions {
         self
     }
 
+    /// Builder helper: opt in to the compact in-`strl` standard
+    /// index with room for `capacity` entries per stream (round 394).
+    /// See [`Self::strl_std_index_capacity`] for the full layout /
+    /// fallback semantics. `capacity == 0` disables the option.
+    pub fn with_strl_std_index(mut self, capacity: usize) -> Self {
+        self.strl_std_index_capacity = if capacity > 0 { Some(capacity) } else { None };
+        self
+    }
+
     /// Builder helper: mark `stream_index` as a top-down DIB video
     /// stream (round-19 candidate 1). The muxer stamps a negative
     /// `biHeight` in that stream's BMIH `strf` payload per VfW
@@ -2642,6 +2675,13 @@ struct TrackState {
     /// File offset of this track's first `indx` entry slot. `None`
     /// for `AviKind::Avi10`.
     indx_entries_off: Option<u64>,
+    /// Reserved byte length of this track's `indx` **payload** (the
+    /// 24-byte AVIMETAINDEX preamble + zero-filled entry table), as
+    /// written at header time. The trailer patches derive how many
+    /// entries fit from this — 16-byte super entries for the
+    /// two-tier layout, 8- / 12-byte standard entries for the
+    /// round-394 in-`strl` standard index.
+    indx_payload_len: usize,
 }
 
 /// One snapshot record taken from the primary segment for the
@@ -2709,6 +2749,15 @@ struct IxChunkRecord {
     /// units [`TrackState::sample_count`] accumulates.
     dw_duration: u32,
 }
+
+/// One pending `indx` back-patch in [`AviMuxer::patch_super_index`]:
+/// `(payload_off, payload_len, chunk_id, is_2field, ix_chunk_records)`.
+type SuperIndexPatch = (u64, usize, [u8; 4], bool, Vec<IxChunkRecord>);
+
+/// One pending `indx` back-patch in
+/// [`AviMuxer::patch_strl_std_indexes`]: `(payload_off, payload_len,
+/// chunk_id, is_2field, drained_std_entries)`.
+type StrlStdIndexPatch = (u64, usize, [u8; 4], bool, Vec<IxStdEntry>);
 
 /// Open an AVI muxer with the legacy single-`RIFF AVI ` envelope.
 ///
@@ -2836,8 +2885,15 @@ pub fn open_avi(
             strh_body_off: 0,
             indx_count_off: None,
             indx_entries_off: None,
+            indx_payload_len: 0,
         });
     }
+    // Round-394 in-strl standard index: only meaningful for OpenDML,
+    // and mutually exclusive with mid-movi periodic flushing (inline
+    // ix## chunks imply the two-tier layout).
+    let strl_std_requested = matches!(kind, AviKind::OpenDml(_))
+        && options.strl_std_index_capacity.is_some()
+        && options.mid_movi_index_streams.is_empty();
     Ok(AviMuxer {
         output,
         tracks,
@@ -2848,6 +2904,7 @@ pub fn open_avi(
         movi_start_off: 0,
         index: Vec::new(),
         indx_entries_capacity: 0,
+        strl_std_active: strl_std_requested,
         dmlh_total_frames_off: None,
         segments: Vec::new(),
         current_segment_packets: 0,
@@ -2939,6 +2996,15 @@ pub struct AviMuxer {
     /// `ix##` chunk count, so we reserve a generous fixed capacity;
     /// back-patching only writes `min(actual, capacity)` slots.
     indx_entries_capacity: usize,
+    /// True while the round-394 in-`strl` standard-index layout
+    /// ([`AviMuxOptions::strl_std_index_capacity`]) is still
+    /// achievable: the file hasn't rolled into a `RIFF AVIX`
+    /// continuation and no stream has overflowed the reserved entry
+    /// capacity. Deactivated permanently the moment either happens —
+    /// the trailer then emits `ix##` chunks and patches the reserved
+    /// `indx` bytes as a two-tier super-index instead (the spec's
+    /// "file can be easily grown" migration, in reverse order).
+    strl_std_active: bool,
     /// File offset of the `dwTotalFrames` DWORD inside the
     /// `LIST odml dmlh` chunk. Back-patched in `write_trailer` once
     /// every packet has been written. `None` for `AviKind::Avi10`.
@@ -3066,10 +3132,19 @@ impl Muxer for AviMuxer {
             .super_index_capacity
             .filter(|n| *n >= OPENDML_SUPER_INDEX_MIN_CAPACITY)
             .unwrap_or(OPENDML_SUPER_INDEX_DEFAULT_CAPACITY);
-        // Collected `(strh_body_off, indx_count_off, indx_entries_off)`
-        // per track; applied to `self.tracks` after the loop (the loop
-        // holds an immutable borrow of the tracks).
-        let mut strl_offsets: Vec<(u64, Option<u64>, Option<u64>)> =
+        // Round-394 in-strl standard index: when requested (and still
+        // achievable — `open_avi` clears the flag for Avi10 / mid-movi
+        // combos), each strl's `indx` is reserved as an
+        // AVI_INDEX_OF_CHUNKS standard index instead of a super-index.
+        let strl_std_capacity = if self.strl_std_active {
+            self.options.strl_std_index_capacity
+        } else {
+            None
+        };
+        // Collected `(strh_body_off, indx_count_off, indx_entries_off,
+        // indx_payload_len)` per track; applied to `self.tracks` after
+        // the loop (the loop holds an immutable borrow of the tracks).
+        let mut strl_offsets: Vec<(u64, Option<u64>, Option<u64>, usize)> =
             Vec::with_capacity(self.tracks.len());
         for (i, t) in self.tracks.iter().enumerate() {
             let with_indx = want_indx;
@@ -3233,7 +3308,7 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(idx, _)| *idx == i as u32)
                 .map(|(_, t)| *t);
-            let (strh_body_off, indx_count_off, indx_entries_off) = write_strl(
+            let (strh_body_off, indx_count_off, indx_entries_off, indx_payload_len) = write_strl(
                 self.output.as_mut(),
                 i as u32,
                 t,
@@ -3242,6 +3317,7 @@ impl Muxer for AviMuxer {
                 vprp_override,
                 indx_2field_here,
                 indx_capacity,
+                strl_std_capacity,
                 stream_name,
                 stream_header_data,
                 frame_rect_override,
@@ -3256,17 +3332,23 @@ impl Muxer for AviMuxer {
                 timebase_override,
                 fcc_type_override,
             )?;
-            strl_offsets.push((strh_body_off, indx_count_off, indx_entries_off));
+            strl_offsets.push((
+                strh_body_off,
+                indx_count_off,
+                indx_entries_off,
+                indx_payload_len,
+            ));
         }
         if want_indx {
             self.indx_entries_capacity = indx_capacity;
         }
-        for (t, (strh_body_off, indx_count_off, indx_entries_off)) in
+        for (t, (strh_body_off, indx_count_off, indx_entries_off, indx_payload_len)) in
             self.tracks.iter_mut().zip(strl_offsets)
         {
             t.strh_body_off = strh_body_off;
             t.indx_count_off = indx_count_off;
             t.indx_entries_off = indx_entries_off;
+            t.indx_payload_len = indx_payload_len;
         }
         // OpenDML 2.0 §5.0 "Source and Header Information Storage":
         // emit `LIST odml` carrying the `dmlh` extended header inside
@@ -3566,6 +3648,7 @@ impl Muxer for AviMuxer {
                         dw_offset_field2,
                     };
                     self.tracks[idx].ix_entries.push(ix_entry);
+                    self.check_strl_std_overflow(idx);
                     // Round-16 C1: snapshot every primary-segment ix##
                     // record so `serialize_idx1_from_ix` can rebuild
                     // idx1 from the standard-index view. We only pay
@@ -3712,7 +3795,11 @@ impl Muxer for AviMuxer {
         // OpenDML: flush `ix##` chunks at the tail of the current
         // segment's movi LIST before closing it. Mirrors the
         // close_current_segment path for the trailing partial segment.
-        if matches!(self.kind, AviKind::OpenDml(_)) {
+        // Round-394: skipped while the in-strl standard-index layout is
+        // still active — the retained entries are patched into each
+        // stream's `strl` `indx` instead, and per the spec "there is
+        // none in the 'movi' data".
+        if matches!(self.kind, AviKind::OpenDml(_)) && !self.strl_std_active {
             self.flush_ix_chunks()?;
         }
         // Close movi LIST (patch its size).
@@ -3758,10 +3845,15 @@ impl Muxer for AviMuxer {
         // relative to the RIFF start.
         self.patch_post_counts()?;
 
-        // For OpenDML, back-patch the indx super-index entries with each
-        // segment's qwOffset / dwSize / dwDuration.
+        // For OpenDML, back-patch each stream's `indx`: the in-strl
+        // standard index when the round-394 compact layout survived
+        // the whole write, otherwise the two-tier super-index.
         if matches!(self.kind, AviKind::OpenDml(_)) {
-            self.patch_super_index()?;
+            if self.strl_std_active {
+                self.patch_strl_std_indexes()?;
+            } else {
+                self.patch_super_index()?;
+            }
         }
 
         // Round-18 candidate 1: per-stream `dwMaxBytesPerSec` cap
@@ -4092,6 +4184,15 @@ impl AviMuxer {
     /// then finishes the outer RIFF and records the segment's
     /// `(offset, total_size, packet_count)`.
     fn close_current_segment(&mut self) -> Result<()> {
+        // Round-394: rolling into a `RIFF AVIX` continuation rules out
+        // the compact in-strl standard index (its 32-bit offsets are
+        // relative to ONE segment's qwBaseOffset, and the spec's
+        // single-index layout means "there is none in the 'movi'
+        // data"). Deactivate permanently — the primary segment's
+        // retained entries flush into a normal ix## tail chunk right
+        // below, and `write_trailer` patches the reserved indx bytes
+        // as a two-tier super-index instead.
+        self.strl_std_active = false;
         let in_primary = self.segments.is_empty();
         // Close any open `LIST rec ` cluster first so ix## lands at
         // the tail of movi, not nested inside the cluster.
@@ -4545,6 +4646,7 @@ impl AviMuxer {
                         dw_offset_field2: 0,
                     };
                     self.tracks[idx].ix_entries.push(ix_entry);
+                    self.check_strl_std_overflow(idx);
                     if self.options.synthesise_idx1_from_ix && self.segments.is_empty() {
                         // Side-band chunks (xxtx / xxpc) carry no
                         // AVIIF_KEYFRAME bit so the demuxer's
@@ -4729,33 +4831,138 @@ impl AviMuxer {
         // legitimately contributes several entries — exactly the
         // spec's growth model ("New 'ix##' chunks can be added to
         // grow the file", §"Index Locations in RIFF File").
-        let capacity = self.indx_entries_capacity;
-        let patches: Vec<(u64, u64, Vec<IxChunkRecord>)> = self
+        //
+        // The whole payload (24-byte AVISUPERINDEX preamble + entry
+        // table) is rewritten, not just the entries: when the
+        // round-394 in-strl standard-index layout was requested but
+        // outgrown (RIFF AVIX roll / capacity overflow), the header
+        // holds a standard-index preamble that must be migrated to
+        // the super-index shape — the spec's "a new super index can
+        // be inserted into the stream header ('indx' position)".
+        let field2 = self.options.field2_streams.clone();
+        let patches: Vec<SuperIndexPatch> = self
             .tracks
             .iter()
-            .filter_map(|t| match (t.indx_count_off, t.indx_entries_off) {
-                (Some(n_off), Some(start_off)) => {
-                    Some((n_off, start_off, t.ix_chunk_records.clone()))
-                }
-                _ => None,
+            .enumerate()
+            .filter_map(|(i, t)| {
+                t.indx_count_off.map(|n_off| {
+                    (
+                        n_off - 4,
+                        t.indx_payload_len,
+                        t.packet_fourcc,
+                        field2.contains(&(i as u32)),
+                        t.ix_chunk_records.clone(),
+                    )
+                })
             })
             .collect();
-        for (n_off, start_off, records) in patches {
-            let n_to_write = records.len().min(capacity);
-            // nEntriesInUse.
-            self.output.seek(SeekFrom::Start(n_off))?;
-            self.output.write_all(&(n_to_write as u32).to_le_bytes())?;
-            // Per-entry slots.
-            for (i, rec) in records.iter().take(n_to_write).enumerate() {
-                let slot = start_off + (i as u64) * 16;
-                self.output.seek(SeekFrom::Start(slot))?;
-                self.output.write_all(&rec.qw_offset.to_le_bytes())?;
-                self.output.write_all(&rec.dw_size.to_le_bytes())?;
-                self.output.write_all(&rec.dw_duration.to_le_bytes())?;
+        for (payload_off, payload_len, chunk_id, is_2field, records) in patches {
+            if payload_len < 24 {
+                continue;
             }
+            let capacity = (payload_len - 24) / 16;
+            let n = records.len().min(capacity);
+            let mut buf = vec![0u8; payload_len];
+            buf[0..2].copy_from_slice(&4u16.to_le_bytes()); // wLongsPerEntry
+            if is_2field {
+                buf[2] = 0x01; // AVI_INDEX_SUB_2FIELD
+            }
+            // buf[3] = 0x00 AVI_INDEX_OF_INDEXES.
+            buf[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+            buf[8..12].copy_from_slice(&chunk_id);
+            // dwReserved[3] stay zero.
+            for (k, rec) in records.iter().take(n).enumerate() {
+                let base = 24 + k * 16;
+                buf[base..base + 8].copy_from_slice(&rec.qw_offset.to_le_bytes());
+                buf[base + 8..base + 12].copy_from_slice(&rec.dw_size.to_le_bytes());
+                buf[base + 12..base + 16].copy_from_slice(&rec.dw_duration.to_le_bytes());
+            }
+            self.output.seek(SeekFrom::Start(payload_off))?;
+            self.output.write_all(&buf)?;
         }
         self.output.seek(SeekFrom::Start(end_pos))?;
         Ok(())
+    }
+
+    /// Round-394: back-patch each stream's reserved `indx` bytes as
+    /// the stream's single in-strl **standard** (or 2-field field)
+    /// index, per OpenDML 2.0 §"Index Locations in RIFF File" ("may
+    /// be an index to the chunks directly … the stream has only one
+    /// index chunk and there is none in the 'movi' data"). Only
+    /// called when [`Self::strl_std_active`] survived the whole
+    /// write, i.e. the file is single-segment and every stream's
+    /// entry count fits the reserved capacity; the per-track
+    /// `ix_entries` (never flushed into `ix##` chunks in this mode)
+    /// are drained into the patch.
+    fn patch_strl_std_indexes(&mut self) -> Result<()> {
+        let end_pos = self.output.stream_position()?;
+        // Single segment throughout, so the current movi is the
+        // primary movi: same base the entries' dw_offset were
+        // computed against in write_packet.
+        let qw_base = self.movi_start_off + 4;
+        let field2 = self.options.field2_streams.clone();
+        let patches: Vec<StrlStdIndexPatch> = self
+            .tracks
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                t.indx_count_off.map(|n_off| {
+                    (
+                        n_off - 4,
+                        t.indx_payload_len,
+                        t.packet_fourcc,
+                        field2.contains(&(i as u32)),
+                        std::mem::take(&mut t.ix_entries),
+                    )
+                })
+            })
+            .collect();
+        for (payload_off, payload_len, chunk_id, is_2field, entries) in patches {
+            if payload_len < 24 {
+                continue;
+            }
+            let entry_size = if is_2field { 12usize } else { 8usize };
+            let capacity = (payload_len - 24) / entry_size;
+            let n = entries.len().min(capacity);
+            let mut buf = vec![0u8; payload_len];
+            let w_longs: u16 = if is_2field { 3 } else { 2 };
+            buf[0..2].copy_from_slice(&w_longs.to_le_bytes());
+            if is_2field {
+                buf[2] = 0x01; // AVI_INDEX_SUB_2FIELD
+            }
+            buf[3] = 0x01; // AVI_INDEX_OF_CHUNKS
+            buf[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+            buf[8..12].copy_from_slice(&chunk_id);
+            buf[12..20].copy_from_slice(&qw_base.to_le_bytes());
+            // dwReserved3 stays zero.
+            for (k, e) in entries.iter().take(n).enumerate() {
+                let base = 24 + k * entry_size;
+                buf[base..base + 4].copy_from_slice(&e.dw_offset.to_le_bytes());
+                buf[base + 4..base + 8].copy_from_slice(&e.dw_size_with_flag.to_le_bytes());
+                if is_2field {
+                    buf[base + 8..base + 12].copy_from_slice(&e.dw_offset_field2.to_le_bytes());
+                }
+            }
+            self.output.seek(SeekFrom::Start(payload_off))?;
+            self.output.write_all(&buf)?;
+        }
+        self.output.seek(SeekFrom::Start(end_pos))?;
+        Ok(())
+    }
+
+    /// Round-394: deactivate the in-strl standard-index layout the
+    /// moment any stream's accumulated entries exceed the reserved
+    /// per-stream capacity — the trailer then emits `ix##` chunks
+    /// and patches the reserved bytes as a super-index (the spec's
+    /// grown-file layout) instead of silently dropping index entries.
+    fn check_strl_std_overflow(&mut self, idx: usize) {
+        if !self.strl_std_active {
+            return;
+        }
+        let cap = self.options.strl_std_index_capacity.unwrap_or(0);
+        if self.tracks[idx].ix_entries.len() > cap {
+            self.strl_std_active = false;
+        }
     }
 }
 
@@ -4896,6 +5103,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     vprp_override: Option<VprpConfig>,
     indx_2field: bool,
     indx_capacity: usize,
+    strl_std_capacity: Option<usize>,
     stream_name: Option<&str>,
     stream_header_data: Option<&[u8]>,
     frame_rect_override: Option<[i16; 4]>,
@@ -4909,7 +5117,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     flags_override: Option<u32>,
     timebase_override: Option<(u32, u32)>,
     fcc_type_override: Option<[u8; 4]>,
-) -> Result<(u64, Option<u64>, Option<u64>)> {
+) -> Result<(u64, Option<u64>, Option<u64>, usize)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
     // strh body (56 bytes).
@@ -5089,7 +5297,45 @@ fn write_strl<W: Write + Seek + ?Sized>(
 
     let mut indx_n_entries_off: Option<u64> = None;
     let mut indx_entries_start_off: Option<u64> = None;
-    if with_indx {
+    let mut indx_payload_len_out: usize = 0;
+    if let (true, Some(cap)) = (with_indx, strl_std_capacity) {
+        // Round-394 in-strl STANDARD index reservation. Per OpenDML
+        // 2.0 §"Index Locations in RIFF File" the strl `indx` "may be
+        // an index to the chunks directly"; layout = AVISTDINDEX with
+        // the `indx` FourCC:
+        //   WORD  wLongsPerEntry  = 2 (8-B entries) | 3 (2-field, 12 B)
+        //   BYTE  bIndexSubType   = 0 | AVI_INDEX_2FIELD
+        //   BYTE  bIndexType      = 0x01 (AVI_INDEX_OF_CHUNKS)
+        //   DWORD nEntriesInUse   (back-patched)
+        //   DWORD dwChunkId       (this stream's packet FourCC)
+        //   QWORD qwBaseOffset    (back-patched)
+        //   DWORD dwReserved3     = 0
+        //   <8- or 12-byte entries> x cap (zero-filled, back-patched)
+        // If the file outgrows the compact layout the same reserved
+        // bytes are re-patched as a super-index by `write_trailer`'s
+        // fallback path.
+        let chunk_id = packet_fourcc_for(index, t.entry.chunk_suffix);
+        let entry_size = if indx_2field { 12usize } else { 8usize };
+        let payload_len = 24 + cap * entry_size;
+        write_chunk_header(w, b"indx", payload_len as u32)?;
+        let payload_off = w.stream_position()?;
+        let mut buf = vec![0u8; payload_len];
+        let w_longs: u16 = if indx_2field { 3 } else { 2 };
+        buf[0..2].copy_from_slice(&w_longs.to_le_bytes());
+        if indx_2field {
+            buf[2] = 0x01; // AVI_INDEX_SUB_2FIELD
+        }
+        buf[3] = 0x01; // AVI_INDEX_OF_CHUNKS
+                       // nEntriesInUse / qwBaseOffset: zero, back-patched.
+        buf[8..12].copy_from_slice(&chunk_id);
+        w.write_all(&buf)?;
+        if payload_len & 1 == 1 {
+            w.write_all(&[0])?;
+        }
+        indx_n_entries_off = Some(payload_off + 4);
+        indx_entries_start_off = Some(payload_off + 24);
+        indx_payload_len_out = payload_len;
+    } else if with_indx {
         // OpenDML 2.0 super-index. Layout per spec/06 §6.1:
         //   WORD  wLongsPerEntry  = 4
         //   BYTE  bIndexSubType   = 0
@@ -5131,6 +5377,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
         }
         indx_n_entries_off = Some(payload_off + 4);
         indx_entries_start_off = Some(payload_off + 24);
+        indx_payload_len_out = payload_len;
     }
 
     // OpenDML 2.0 §5.0 "Video Properties Header" — emit one `vprp`
@@ -5173,7 +5420,12 @@ fn write_strl<W: Write + Seek + ?Sized>(
     }
 
     finish_chunk(w, strl_off)?;
-    Ok((strh_body_off, indx_n_entries_off, indx_entries_start_off))
+    Ok((
+        strh_body_off,
+        indx_n_entries_off,
+        indx_entries_start_off,
+        indx_payload_len_out,
+    ))
 }
 
 /// Build a `vprp` body for a video track. 9 fixed DWORDs followed by

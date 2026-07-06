@@ -1612,6 +1612,23 @@ fn open_avi_inner(
     } else {
         Vec::new()
     };
+    // Round-394: per OpenDML 2.0 §"Index Locations in RIFF File" a
+    // strl `indx` may itself BE the stream's single standard (or
+    // field) index — "may be an index to the chunks directly … the
+    // stream has only one index chunk and there is none in the 'movi'
+    // data". Fold any in-strl standard index into the same
+    // per-stream std-index list the seek / keyframe / accessor /
+    // validator machinery consumes, ahead of the movi-scan results
+    // (the strl precedes movi in file order; for a conforming file
+    // the scan found nothing for such a stream anyway).
+    let std_indexes = {
+        let mut all: Vec<StdIndex> = super_indexes
+            .iter()
+            .filter_map(|sx| sx.strl_std_index.as_deref().cloned())
+            .collect();
+        all.extend(std_indexes);
+        all
+    };
 
     // Round-4 P3: surface per-stream 2-field signalling so downstream
     // consumers can detect interlaced AVIs from `Demuxer::metadata`.
@@ -3316,9 +3333,31 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 // files). The standard-index chunks themselves are
                 // located opportunistically during the per-segment
                 // movi scan in `scan_ix_in_movi`.
+                let indx_hdr_pos = r.stream_position()?.saturating_sub(8);
                 let body = read_body_bounded(r, hdr.size)?;
                 skip_pad(r, hdr.size)?;
                 super_index = parse_indx(&body)?;
+                // Round-394: per OpenDML 2.0 §"Index Locations in RIFF
+                // File" the strl `indx` "may either be an index of
+                // indexes (super index), or may be an index to the
+                // chunks directly" — a compact single-index layout
+                // where "the stream has only one index chunk and there
+                // is none in the 'movi' data". When the declared
+                // `bIndexType` is `AVI_INDEX_OF_CHUNKS`, parse the same
+                // body as this stream's standard (or 2-field field)
+                // index. The synthetic `ix##` own-FourCC carries the
+                // strl's stream number — the FourCC the chunk would get
+                // if the file were grown per the spec's "chunk can be
+                // moved to a new 'ix##' chunk" model — so every
+                // per-stream `std_index_*` surface keys it correctly.
+                if body.len() >= 4 && body[3] == AVI_INDEX_OF_CHUNKS {
+                    let tens = (index / 10) as u8 + b'0';
+                    let ones = (index % 10) as u8 + b'0';
+                    if let Some(mut ix) = parse_ix_chunk([b'i', b'x', tens, ones], &body) {
+                        ix.chunk_offset = indx_hdr_pos;
+                        super_index.strl_std_index = Some(Box::new(ix));
+                    }
+                }
             }
             b"vprp" => {
                 // OpenDML 2.0 §5.0 "Video Properties Header" — captures
@@ -3514,26 +3553,35 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
         u32::from_le_bytes([body[16], body[17], body[18], body[19]]),
         u32::from_le_bytes([body[20], body[21], body[22], body[23]]),
     ];
-    let entries_byte_len = n_entries_in_use.saturating_mul(16);
-    let need = 24usize.saturating_add(entries_byte_len);
-    if body.len() < need {
-        return Err(Error::invalid(
-            "AVI: indx super-index entry table truncated",
-        ));
-    }
     if b_index_type != AVI_INDEX_OF_INDEXES {
-        // Per spec/06 §6.1 the `indx` chunk in the strl always carries
-        // bIndexType = AVI_INDEX_OF_INDEXES. Some encoders are sloppy
-        // here, so we tolerate it but won't have working seek. Retain the
-        // declared `b_index_type` + `present` flag so the round-361
-        // `super_index_index_type` accessor can report the mislabelling
-        // (entries stay empty ⇒ the seek path treats it as absent).
+        // Not a super-index. Per OpenDML 2.0 §"Index Locations in RIFF
+        // File" the strl `indx` "may either be an index of indexes
+        // (super index), or may be an index to the chunks directly" —
+        // the `AVI_INDEX_OF_CHUNKS` case is the spec's compact
+        // single-index layout, which the caller (`parse_strl`) parses
+        // via `parse_ix_chunk` into the stream's standard index
+        // (round 394). Any other type (`AVI_INDEX_IS_DATA`, unknown
+        // codes) stays an entry-less slot. Either way the declared
+        // `b_index_type` + `present` flag are retained so the
+        // round-361 `super_index_index_type` accessor reports the
+        // declared layout, and the super-`entries` stay empty. This
+        // check MUST run before the 16-byte-stride entry-table bound
+        // below — a standard index's 8-byte entries would otherwise
+        // trip the super-index truncation error and fail `open()` on
+        // a spec-legal file (pre-round-394 behaviour).
         return Ok(SuperIndex {
             b_index_type,
             present: true,
             dw_reserved,
             ..SuperIndex::default()
         });
+    }
+    let entries_byte_len = n_entries_in_use.saturating_mul(16);
+    let need = 24usize.saturating_add(entries_byte_len);
+    if body.len() < need {
+        return Err(Error::invalid(
+            "AVI: indx super-index entry table truncated",
+        ));
     }
     let mut entries = Vec::with_capacity(n_entries_in_use);
     for i in 0..n_entries_in_use {
@@ -3589,6 +3637,7 @@ fn parse_indx(body: &[u8]) -> Result<SuperIndex> {
         dw_reserved,
         chunk_id,
         entries,
+        strl_std_index: None,
     })
 }
 
@@ -7250,6 +7299,18 @@ struct SuperIndex {
     /// FourCC of indexed chunks (`00dc` etc.). Tags every `ix##` slot.
     chunk_id: [u8; 4],
     entries: Vec<SuperIndexEntry>,
+    /// Round-394: the `strl`-level `indx` parsed as this stream's
+    /// single **standard** (or field) index when its `bIndexType` is
+    /// `AVI_INDEX_OF_CHUNKS`. Per OpenDML 2.0 §"Index Locations in
+    /// RIFF File" the `indx` chunk *"may either be an index of
+    /// indexes (super index), or may be an index to the chunks
+    /// directly. … If the 'indx' chunk is a standard or field index
+    /// chunk (i.e., not an index of indexes) then the stream has
+    /// only one index chunk and there is none in the 'movi' data."*
+    /// `open()` folds this into the same per-stream std-index list
+    /// the seek / keyframe / accessor machinery consumes. `None` for
+    /// a super-index, a pad slot, or an unparseable body.
+    strl_std_index: Option<Box<StdIndex>>,
 }
 
 /// One `AVISTDINDEX_ENTRY` parsed from an `ix##` chunk.
