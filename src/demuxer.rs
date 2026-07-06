@@ -1557,6 +1557,21 @@ fn open_avi_inner(
         );
         palette_change_positions = compute_palette_change_positions(&raw, &streams);
         sideband_data_loaded = true;
+        // Round-394: streams DECLARED `txts` deliver their `##tx`
+        // chunks as packets through `next_packet` — for those slots
+        // the tx chunks are the stream's data, not side-band, so the
+        // side-band text counters / body buffers stay reserved for
+        // `##tx` chunks riding on non-text streams.
+        for (s, suf) in packet_chunk_suffix.iter().enumerate() {
+            if suf == b"tx" {
+                if let Some(c) = text_chunk_counts.get_mut(s) {
+                    *c = 0;
+                }
+                if let Some(d) = text_chunk_data.get_mut(s) {
+                    d.clear();
+                }
+            }
+        }
         let (table, recs) = build_idx_table(&mut *input, &raw, movi_start, &streams)?;
         idx1_rec_entries = recs;
         table
@@ -4783,8 +4798,30 @@ fn build_stream(
             });
             (MediaType::Audio, codec_id, p, *b"wb")
         }
+        b"txts" => {
+            // Round-394: text streams are first-class. Per AVI 1.0
+            // §"AVISTREAMHEADER" (`fccType` row: "txts (text stream)")
+            // a declared text stream's movi chunks use the `##tx`
+            // suffix (the same `mmsystem.h` text-chunk family the
+            // side-band scan recognises), so declare `tx` as the
+            // stream's packet suffix — `next_packet` then delivers
+            // `##tx` chunks as data packets ON this stream instead of
+            // side-banding them. The side-band `text_chunk_*` surfaces
+            // remain reserved for `##tx` chunks riding on streams NOT
+            // declared `txts` (e.g. subtitle side-band interleaved
+            // under a video stream's slot).
+            let codec_id = CodecId::new("avi:txts");
+            let mut p = CodecParameters::audio(codec_id.clone());
+            p.media_type = MediaType::Subtitle;
+            // The spec pins no stream-format layout for text streams;
+            // surface the raw `strf` bytes verbatim as extradata so a
+            // remux can hand them back (write-side symmetry: the muxer
+            // writes `params.extradata` verbatim as the text `strf`).
+            p.extradata = strf.to_vec();
+            (MediaType::Subtitle, codec_id, p, *b"tx")
+        }
         _ => {
-            // "txts", "mids", "dats" — represent as data.
+            // "mids", "dats", vendor types — represent as data.
             let codec_id = CodecId::new(format!(
                 "avi:{}",
                 std::str::from_utf8(&fcc_type).unwrap_or("????")
@@ -7552,7 +7589,7 @@ impl Demuxer for AviDemuxer {
                     // [`AviDemuxer::text_chunk_count`] accessor stay
                     // in sync with what the static idx1 scan
                     // produced for files that have an idx1.
-                    if suffix == *b"tx" {
+                    if suffix == *b"tx" && expected != *b"tx" {
                         let s = idx as usize;
                         if self.text_chunk_counts.len() <= s {
                             self.text_chunk_counts.resize(s + 1, 0);

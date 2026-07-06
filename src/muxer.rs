@@ -2862,6 +2862,13 @@ pub fn open_avi(
             .iter()
             .find(|(idx, _)| (*idx as usize) == i)
             .map(|(_, v)| *v);
+        // Round-394: subtitle (text) streams derive their strh
+        // (dwScale, dwRate) pair from the stream's own time base —
+        // there's no frame_rate / sample_rate to source it from.
+        let tb = (
+            s.time_base.num().clamp(0, u32::MAX as i64) as u32,
+            s.time_base.den().clamp(0, u32::MAX as i64) as u32,
+        );
         let entry = build_strf(
             &s.params,
             top_down,
@@ -2869,6 +2876,7 @@ pub fn open_avi(
             indexed,
             bmih_overrides,
             avg_bytes_override,
+            tb,
         )?;
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {

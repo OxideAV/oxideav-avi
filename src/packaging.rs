@@ -72,6 +72,7 @@ pub(crate) fn build_strf(
     indexed: Option<(u16, &[RgbQuad])>,
     bmih_overrides: BmihOverrides,
     avg_bytes_per_sec: Option<u32>,
+    time_base: (u32, u32),
 ) -> Result<StrfEntry> {
     match params.media_type {
         MediaType::Video => {
@@ -93,6 +94,31 @@ pub(crate) fn build_strf(
                 }
             }
             Ok(entry)
+        }
+        MediaType::Subtitle => {
+            // Round-394: text streams. Per AVI 1.0 §"AVISTREAMHEADER"
+            // (`fccType` row: "txts (text stream)") a text stream is a
+            // first-class strl with `fccType = txts`; its movi chunks
+            // carry the `##tx` suffix (the `mmsystem.h` text-chunk
+            // family). The spec does not pin a stream-format layout
+            // for text streams — the `strf` body is written verbatim
+            // from `params.extradata` (empty extradata ⇒ a zero-length
+            // `strf`, structurally valid RIFF), leaving the format
+            // definition to the caller exactly like the demuxer's
+            // raw-bytes surfaces do. `dwScale`/`dwRate` come from the
+            // stream's own time base (`rate/scale` = ticks per second,
+            // the unit `Packet.pts` is expressed in), `dwSampleSize`
+            // is 0 (each text chunk is one sample, sizes vary).
+            let (scale, rate) = (time_base.0.max(1), time_base.1.max(1));
+            Ok(StrfEntry {
+                chunk_suffix: *b"tx",
+                handler_fourcc: [0u8; 4],
+                strf: params.extradata.clone(),
+                strh_type: *b"txts",
+                sample_size: 0,
+                scale,
+                rate,
+            })
         }
         _ => Err(Error::unsupported(format!(
             "avi muxer: media type {:?} not supported",
@@ -556,7 +582,16 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false, None, None, BmihOverrides::default(), None).unwrap();
+        let entry = build_strf(
+            &p,
+            false,
+            None,
+            None,
+            BmihOverrides::default(),
+            None,
+            (1, 25),
+        )
+        .unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         assert_eq!(entry.sample_size, 4); // 2ch × 2B
     }
@@ -567,7 +602,16 @@ mod tests {
             CodecParameters::audio(CodecId::new("mp3")).with_tag(CodecTag::wave_format(0x0055));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        let entry = build_strf(&p, false, None, None, BmihOverrides::default(), None).unwrap();
+        let entry = build_strf(
+            &p,
+            false,
+            None,
+            None,
+            BmihOverrides::default(),
+            None,
+            (1, 25),
+        )
+        .unwrap();
         assert_eq!(&entry.strh_type, b"auds");
         // First 2 bytes of the WAVEFORMATEX are the wFormatTag in LE.
         assert_eq!(&entry.strf[0..2], &0x0055u16.to_le_bytes());
@@ -578,7 +622,15 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new("noexist"));
         p.channels = Some(2);
         p.sample_rate = Some(48_000);
-        match build_strf(&p, false, None, None, BmihOverrides::default(), None) {
+        match build_strf(
+            &p,
+            false,
+            None,
+            None,
+            BmihOverrides::default(),
+            None,
+            (1, 25),
+        ) {
             Err(Error::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -593,7 +645,16 @@ mod tests {
             .with_tag(oxideav_core::CodecTag::fourcc(b"MJPG"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true, None, None, BmihOverrides::default(), None).unwrap();
+        let entry = build_strf(
+            &p,
+            true,
+            None,
+            None,
+            BmihOverrides::default(),
+            None,
+            (1, 25),
+        )
+        .unwrap();
         // biHeight offset 8..12 in the BMIH; must be positive 240.
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, 240, "compressed FourCCs MUST use positive biHeight");
@@ -602,7 +663,16 @@ mod tests {
         let mut p = CodecParameters::video(CodecId::new("rgb24"));
         p.width = Some(320);
         p.height = Some(240);
-        let entry = build_strf(&p, true, None, None, BmihOverrides::default(), None).unwrap();
+        let entry = build_strf(
+            &p,
+            true,
+            None,
+            None,
+            BmihOverrides::default(),
+            None,
+            (1, 25),
+        )
+        .unwrap();
         let h = i32::from_le_bytes([entry.strf[8], entry.strf[9], entry.strf[10], entry.strf[11]]);
         assert_eq!(h, -240, "BI_RGB + top_down ⇒ negative biHeight");
     }
