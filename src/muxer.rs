@@ -3515,12 +3515,22 @@ impl Muxer for AviMuxer {
             return Err(Error::invalid("avi muxer: packet larger than 4 GiB"));
         }
 
+        // Position of the upcoming packet chunk header, queried at
+        // most once (round-415 perf): the OpenDML segment-roll
+        // projection, the index-entry offset, and the AVI 1.0 2-GiB
+        // ceiling check all previously issued their own
+        // `stream_position` call per packet. The cached value is
+        // dropped whenever an intervening write (segment roll,
+        // `LIST rec ` open/close, alignment JUNK) moves the position.
+        let mut cached_pos: Option<u64> = None;
+
         // OpenDML: roll a new RIFF AVIX segment if this packet would
         // push the current segment past the configured byte ceiling.
         // The check fires only after the segment already has at least
         // one packet — every segment must carry at least one frame.
         if let AviKind::OpenDml(limit) = self.kind {
-            let projected = self.output.stream_position()?
+            let pos = self.output.stream_position()?;
+            let projected = pos
                 + 8 // chunk header
                 + packet.data.len() as u64
                 + (packet.data.len() & 1) as u64
@@ -3531,6 +3541,8 @@ impl Muxer for AviMuxer {
             if self.current_segment_packets > 0 && segment_used > limit.bytes() {
                 self.close_current_segment()?;
                 self.open_avix_segment()?;
+            } else {
+                cached_pos = Some(pos);
             }
         }
 
@@ -3563,9 +3575,11 @@ impl Muxer for AviMuxer {
                 .unwrap_or(false);
             if self.rec_open_size_off.is_none() {
                 self.open_rec_cluster()?;
+                cached_pos = None;
             } else if needs_close_for_packets || needs_close_for_bytes {
                 self.close_rec_cluster()?;
                 self.open_rec_cluster()?;
+                cached_pos = None;
             }
         }
 
@@ -3588,11 +3602,15 @@ impl Muxer for AviMuxer {
             if self.rec_open_size_off.is_some() {
                 self.rec_bytes_in_cluster += after.saturating_sub(before);
             }
+            cached_pos = Some(after);
         }
 
         let fourcc = self.tracks[idx].packet_fourcc;
         // Record offset (relative to 'movi' fourcc) BEFORE writing the chunk.
-        let chunk_off = self.output.stream_position()?;
+        let chunk_off = match cached_pos {
+            Some(p) => p,
+            None => self.output.stream_position()?,
+        };
         let rel_off_opt = chunk_off.checked_sub(self.movi_start_off);
         let size = packet.data.len() as u32;
 
@@ -3781,9 +3799,14 @@ impl Muxer for AviMuxer {
         }
 
         // Enforce the 2 GiB ceiling for AVI 1.0 mode only — OpenDML
-        // can grow arbitrarily large because it segments.
+        // can grow arbitrarily large because it segments. The
+        // position after `write_chunk` is derivable from the recorded
+        // chunk offset (header + body + word-pad), so no extra
+        // position query is needed (round-415 perf; nothing else
+        // writes between the chunk emit and this check in Avi10
+        // mode — the mid-movi ix## flush above is OpenDML-only).
         if matches!(self.kind, AviKind::Avi10) {
-            let cur = self.output.stream_position()?;
+            let cur = chunk_off + 8 + size as u64 + (size & 1) as u64;
             if cur > (2 * 1024 * 1024 * 1024) - 1024 {
                 return Err(Error::unsupported(
                     "avi muxer: file would exceed 2 GiB; use AviKind::OpenDml",

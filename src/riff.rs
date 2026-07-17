@@ -104,9 +104,15 @@ pub fn skip_pad<R: Seek + ?Sized>(r: &mut R, size: u32) -> Result<()> {
 }
 
 /// Write an 8-byte chunk header with the given id and size.
+///
+/// Emitted as a single 8-byte write (round-415 perf): the muxer calls
+/// this once per packet, and two 4-byte `write_all`s doubled the
+/// per-chunk small-write overhead on every writer backend.
 pub fn write_chunk_header<W: Write + ?Sized>(w: &mut W, id: &[u8; 4], size: u32) -> Result<()> {
-    w.write_all(id)?;
-    w.write_all(&size.to_le_bytes())?;
+    let mut hdr = [0u8; 8];
+    hdr[..4].copy_from_slice(id);
+    hdr[4..].copy_from_slice(&size.to_le_bytes());
+    w.write_all(&hdr)?;
     Ok(())
 }
 
