@@ -2440,6 +2440,7 @@ fn open_avi_inner(
         top_level_cset,
         keyframe_by_offset,
         keyframe_per_stream,
+        seek_cache: None,
     })
 }
 
@@ -6186,6 +6187,63 @@ pub struct AviDemuxer {
     /// building a seek-point table doesn't have to walk every packet.
     /// Empty for streams the file carries no per-chunk index for.
     keyframe_per_stream: Vec<Vec<bool>>,
+    /// Lazily-built per-stream seek acceleration tables (round-415
+    /// perf). `None` until the first `seek_to` call; the source
+    /// tables (`idx_table`, `std_indexes`) are immutable after
+    /// `open()` so the cache never invalidates. See [`SeekCache`].
+    seek_cache: Option<SeekCache>,
+}
+
+/// Per-stream seek tables derived once from `idx_table` /
+/// `std_indexes` (round-415 perf). Before this cache, every
+/// `seek_to` call re-walked the FULL index — the `idx1` path scanned
+/// every entry of every stream per seek, and the OpenDML std-index
+/// path re-allocated and re-derived the requested stream's whole
+/// `(offset, pts, keyframe)` table per seek plus a second full walk
+/// for the counter reset. All derivations here replicate those walks
+/// entry-for-entry (same iteration order, same saturating pts
+/// arithmetic), so seek results are identical; the per-seek work
+/// drops to a binary search when the derived table is monotonic
+/// (every writer this crate has seen, including its own muxer) and a
+/// flat linear scan of the cached table otherwise.
+/// All per-stream vectors are parallel to `streams`. The std-index
+/// running pts is derived twice on purpose: `std_keyframes` carries
+/// the `i64`-saturating running pts the landed-keyframe selection
+/// historically computed, while `std_entries` carries the independent
+/// `u64`-saturating running pts the post-seek counter reset
+/// historically computed — they only diverge on pathological tick
+/// sums beyond `i64::MAX`, but keeping both preserves the pre-cache
+/// behaviour bit-for-bit.
+struct SeekCache {
+    /// idx1 keyframe entries per stream, file order: `(pts,
+    /// file-absolute chunk-header offset)` for every `idx_table`
+    /// entry of that stream with `AVIIF_KEYFRAME` set.
+    idx1_keyframes: Vec<Vec<(i64, u64)>>,
+    /// Whether `idx1_keyframes[s]` pts values are nondecreasing
+    /// (binary-searchable).
+    idx1_kf_monotonic: Vec<bool>,
+    /// EVERY idx1 entry per stream (keyframe or not), file order:
+    /// `(header offset, pts)` for the post-seek counter reset.
+    idx1_entries: Vec<Vec<(u64, i64)>>,
+    /// Whether the WHOLE `idx_table`'s offsets are nondecreasing in
+    /// file order — across streams, not per stream. The historical
+    /// counter-reset walk stops at the FIRST file-order entry past
+    /// the landed offset, so the per-stream binary-search shortcut is
+    /// only equivalent when the global sequence is ordered; otherwise
+    /// the reset falls back to the verbatim file-order walk.
+    idx1_off_globally_monotonic: bool,
+    /// std-index keyframe entries per stream, file order:
+    /// `(running pts, header offset)` where the header offset is
+    /// `qwBaseOffset + dwOffset - 8` (saturating).
+    std_keyframes: Vec<Vec<(i64, u64)>>,
+    /// Whether `std_keyframes[s]` pts values are nondecreasing.
+    std_kf_monotonic: Vec<bool>,
+    /// EVERY std-index entry per stream (keyframe or not), file
+    /// order: `(header offset, running pts)` for the post-seek
+    /// per-stream counter reset.
+    std_entries: Vec<Vec<(u64, u64)>>,
+    /// Whether `std_entries[s]` header offsets are nondecreasing.
+    std_off_monotonic: Vec<bool>,
 }
 
 /// Result of [`AviDemuxer::seek_to_keyframe_strict`] (round-9
@@ -7765,30 +7823,20 @@ impl Demuxer for AviDemuxer {
             ));
         }
 
-        // Find the last keyframe entry for `stream_index` with pts <= target.
-        let mut best: Option<&IdxEntry> = None;
-        for e in &self.idx_table {
-            if e.stream != stream_index || (e.flags & AVIIF_KEYFRAME) == 0 {
-                continue;
-            }
-            if e.pts <= pts {
-                best = match best {
-                    Some(b) if b.pts >= e.pts => Some(b),
-                    _ => Some(e),
-                };
-            }
-        }
-        // Fall back to the first keyframe of this stream if nothing matches
-        // (e.g. caller asked for a negative pts).
-        if best.is_none() {
-            for e in &self.idx_table {
-                if e.stream == stream_index && (e.flags & AVIIF_KEYFRAME) != 0 {
-                    best = Some(e);
-                    break;
-                }
-            }
-        }
-        let landed = best.ok_or_else(|| {
+        // Find the last keyframe entry for `stream_index` with
+        // pts <= target (falling back to the stream's first keyframe
+        // for e.g. a negative requested pts), via the per-stream
+        // keyframe table built once on first seek (round-415 perf —
+        // previously every seek re-scanned the full idx1 table across
+        // all streams).
+        self.ensure_seek_cache();
+        let cache = self.seek_cache.as_ref().expect("seek cache just built");
+        let landed = seek_cache_select_keyframe(
+            &cache.idx1_keyframes[stream_index as usize],
+            cache.idx1_kf_monotonic[stream_index as usize],
+            pts,
+        );
+        let (landed_pts, landed_offset) = landed.ok_or_else(|| {
             Error::unsupported(format!(
                 "AVI: no keyframes in idx1 for stream {stream_index}"
             ))
@@ -7798,7 +7846,7 @@ impl Demuxer for AviDemuxer {
         // segment the offset lives in (idx1 only covers the primary
         // segment, but we re-locate the matching segment anyway so a
         // future indx/ix##-backed seek can point into later segments).
-        let mut target_off = landed.offset;
+        let mut target_off = landed_offset;
         if target_off < self.movi_start {
             target_off = self.movi_start;
         }
@@ -7822,18 +7870,38 @@ impl Demuxer for AviDemuxer {
                 *c = 0;
             }
         }
-        for e in &self.idx_table {
-            if e.offset > target_off {
-                break;
+        let cache = self.seek_cache.as_ref().expect("seek cache built above");
+        if cache.idx1_off_globally_monotonic {
+            // Latest idx entry at-or-before target_off, per stream,
+            // via the cached per-stream tables (round-415 perf).
+            // Equivalent to the historical file-order walk-with-break
+            // below because the global offset sequence is ordered.
+            for (s, entries) in cache.idx1_entries.iter().enumerate() {
+                if s >= self.per_stream_counter.len() {
+                    break;
+                }
+                let p = entries.partition_point(|&(off, _)| off <= target_off);
+                if let Some(i) = p.checked_sub(1) {
+                    self.per_stream_counter[s] = entries[i].1.max(0) as u64;
+                }
             }
-            let s = e.stream as usize;
-            if s < self.per_stream_counter.len() {
-                // Latest idx entry at-or-before target_off for this stream.
-                self.per_stream_counter[s] = e.pts.max(0) as u64;
+        } else {
+            // Hostile/unordered idx1: keep the verbatim historical
+            // walk (stop at the FIRST file-order entry past the
+            // landed offset).
+            for e in &self.idx_table {
+                if e.offset > target_off {
+                    break;
+                }
+                let s = e.stream as usize;
+                if s < self.per_stream_counter.len() {
+                    // Latest idx entry at-or-before target_off for this stream.
+                    self.per_stream_counter[s] = e.pts.max(0) as u64;
+                }
             }
         }
 
-        Ok(landed.pts)
+        Ok(landed_pts)
     }
 
     fn metadata(&self) -> &[(String, String)] {
@@ -11345,60 +11413,27 @@ impl AviDemuxer {
     /// Per-stream PTS counters are reset to the landed entry's value so
     /// `next_packet` resumes synthesising correct PTS post-seek.
     fn seek_via_std_indexes(&mut self, stream_index: u32, target_pts: i64) -> Result<i64> {
-        // Collect every entry for this stream from `std_indexes`,
-        // tagged with the running per-stream pts, the file offset of
-        // the chunk header, and the keyframe flag. Std-indexes appear
-        // in file order so the running pts is monotonic across them.
-        let mut per_stream_entries: Vec<(u64, i64, bool)> = Vec::new();
-        let mut running_pts: i64 = 0;
-        for ix in &self.std_indexes {
-            let stream = match parse_stream_index(&ix.chunk_id) {
-                Some(s) => s,
-                None => continue,
-            };
-            if stream != stream_index {
-                continue;
-            }
-            let s = stream as usize;
-            for e in &ix.entries {
-                let abs_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
-                // The std-index dwOffset points at the chunk *data*
-                // (just past the 8-byte header). Our `next_packet`
-                // expects to land on the chunk header, so back off 8.
-                let header_off = abs_off.saturating_sub(8);
-                per_stream_entries.push((header_off, running_pts, e.is_keyframe));
-                let bump = packet_time_delta(&self.streams[s], e.dw_size as usize) as i64;
-                running_pts = running_pts.saturating_add(bump);
-            }
-        }
-        if per_stream_entries.is_empty() {
+        // Round-415 perf: the per-stream `(header offset, running
+        // pts, keyframe)` tables — previously re-allocated and
+        // re-derived from `std_indexes` on EVERY seek, plus a second
+        // full all-streams walk for the counter reset — are built
+        // once into [`SeekCache`] and only consulted here.
+        self.ensure_seek_cache();
+        let cache = self.seek_cache.as_ref().expect("seek cache just built");
+        let s = stream_index as usize;
+        if cache.std_entries[s].is_empty() {
             return Err(Error::unsupported(format!(
                 "AVI: no OpenDML std-index entries for stream {stream_index}"
             )));
         }
-        // Find last keyframe entry with pts <= target_pts.
-        let mut best: Option<(u64, i64)> = None;
-        for &(off, pts, kf) in &per_stream_entries {
-            if !kf {
-                continue;
-            }
-            if pts <= target_pts {
-                best = Some(match best {
-                    Some(b) if b.1 >= pts => b,
-                    _ => (off, pts),
-                });
-            }
-        }
-        // Fall back to the first keyframe if nothing matches.
-        if best.is_none() {
-            for &(off, pts, kf) in &per_stream_entries {
-                if kf {
-                    best = Some((off, pts));
-                    break;
-                }
-            }
-        }
-        let (target_off, landed_pts) = best.ok_or_else(|| {
+        // Find the last keyframe entry with pts <= target_pts,
+        // falling back to the stream's first keyframe.
+        let landed = seek_cache_select_keyframe(
+            &cache.std_keyframes[s],
+            cache.std_kf_monotonic[s],
+            target_pts,
+        );
+        let (landed_pts, target_off) = landed.ok_or_else(|| {
             Error::unsupported(format!(
                 "AVI: no keyframes in std-index for stream {stream_index}"
             ))
@@ -11425,38 +11460,176 @@ impl AviDemuxer {
                 *c = 0;
             }
         }
-        // Per-stream running pts threaded across every ix-block so
-        // boundary entries carry over correctly. (A naive
-        // re-initialisation from per_stream_counter[s] at the start
-        // of every ix block would drop one tick each time because
-        // we assign-before-bump and the previous block's tail bump
-        // is in a local that doesn't survive the boundary.) For each
-        // entry, we always advance running_pts; we only stamp
-        // per_stream_counter when the entry sits at-or-before
-        // target_off — that way per_stream_counter ends up holding
-        // the pts of the latest qualifying entry per stream.
-        let mut running_pts: Vec<u64> = vec![0u64; self.streams.len()];
-        for ix in &self.std_indexes {
-            let stream = match parse_stream_index(&ix.chunk_id) {
-                Some(s) => s,
-                None => continue,
-            };
-            let s = stream as usize;
+        // Each stream's counter becomes the cached running pts of its
+        // latest entry (file order) at-or-before `target_off`; streams
+        // with no qualifying entry stay at 0. `next_packet` then
+        // resumes synthesising correct timestamps because it picks up
+        // from per_stream_counter[s] and only bumps after returning
+        // each packet.
+        for (s, entries) in cache.std_entries.iter().enumerate() {
             if s >= self.per_stream_counter.len() {
-                continue;
+                break;
             }
-            for e in &ix.entries {
-                let abs_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
-                let header_off = abs_off.saturating_sub(8);
-                if header_off <= target_off {
-                    self.per_stream_counter[s] = running_pts[s];
-                }
-                let bump = packet_time_delta(&self.streams[s], e.dw_size as usize);
-                running_pts[s] = running_pts[s].saturating_add(bump);
+            let latest = if cache.std_off_monotonic[s] {
+                let p = entries.partition_point(|&(off, _)| off <= target_off);
+                p.checked_sub(1).map(|i| entries[i].1)
+            } else {
+                // Hostile/unordered offsets: replicate the historical
+                // file-order walk (latest qualifying entry wins).
+                entries
+                    .iter()
+                    .rfind(|&&(off, _)| off <= target_off)
+                    .map(|&(_, pts)| pts)
+            };
+            if let Some(pts) = latest {
+                self.per_stream_counter[s] = pts;
             }
         }
         Ok(landed_pts)
     }
+
+    /// Build [`SeekCache`] on first use (round-415 perf). The source
+    /// tables are immutable after `open()`, so this runs at most once
+    /// per demuxer.
+    fn ensure_seek_cache(&mut self) {
+        if self.seek_cache.is_none() {
+            self.seek_cache = Some(build_seek_cache(
+                &self.idx_table,
+                &self.std_indexes,
+                &self.streams,
+            ));
+        }
+    }
+}
+
+/// Derive the per-stream seek tables. Replicates — entry-for-entry,
+/// in the same iteration order and with the same saturating pts
+/// arithmetic — the walks `seek_to` / `seek_via_std_indexes`
+/// historically performed per seek call.
+fn build_seek_cache(
+    idx_table: &[IdxEntry],
+    std_indexes: &[StdIndex],
+    streams: &[StreamInfo],
+) -> SeekCache {
+    let n = streams.len();
+    let mut idx1_keyframes: Vec<Vec<(i64, u64)>> = vec![Vec::new(); n];
+    let mut idx1_kf_monotonic = vec![true; n];
+    let mut idx1_entries: Vec<Vec<(u64, i64)>> = vec![Vec::new(); n];
+    let mut idx1_off_globally_monotonic = true;
+    let mut prev_global_off = 0u64;
+    for e in idx_table {
+        if e.offset < prev_global_off {
+            idx1_off_globally_monotonic = false;
+        }
+        prev_global_off = e.offset;
+        let s = e.stream as usize;
+        if s >= n {
+            continue;
+        }
+        idx1_entries[s].push((e.offset, e.pts));
+        if (e.flags & AVIIF_KEYFRAME) == 0 {
+            continue;
+        }
+        if let Some(&(prev_pts, _)) = idx1_keyframes[s].last() {
+            if e.pts < prev_pts {
+                idx1_kf_monotonic[s] = false;
+            }
+        }
+        idx1_keyframes[s].push((e.pts, e.offset));
+    }
+
+    let mut std_keyframes: Vec<Vec<(i64, u64)>> = vec![Vec::new(); n];
+    let mut std_kf_monotonic = vec![true; n];
+    let mut std_entries: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n];
+    let mut std_off_monotonic = vec![true; n];
+    // Running pts per stream, threaded across ix-blocks in file order
+    // (assign-before-bump). Kept in BOTH the i64 flavour the landed-
+    // keyframe selection historically used and the u64 flavour the
+    // counter reset historically used.
+    let mut running_signed = vec![0i64; n];
+    let mut running_unsigned = vec![0u64; n];
+    for ix in std_indexes {
+        let stream = match parse_stream_index(&ix.chunk_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        let s = stream as usize;
+        if s >= n {
+            continue;
+        }
+        for e in &ix.entries {
+            let abs_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
+            // The std-index dwOffset points at the chunk *data*
+            // (just past the 8-byte header). Our `next_packet`
+            // expects to land on the chunk header, so back off 8.
+            let header_off = abs_off.saturating_sub(8);
+            if let Some(&(prev_off, _)) = std_entries[s].last() {
+                if header_off < prev_off {
+                    std_off_monotonic[s] = false;
+                }
+            }
+            std_entries[s].push((header_off, running_unsigned[s]));
+            if e.is_keyframe {
+                if let Some(&(prev_pts, _)) = std_keyframes[s].last() {
+                    if running_signed[s] < prev_pts {
+                        std_kf_monotonic[s] = false;
+                    }
+                }
+                std_keyframes[s].push((running_signed[s], header_off));
+            }
+            let bump = packet_time_delta(&streams[s], e.dw_size as usize);
+            running_signed[s] = running_signed[s].saturating_add(bump as i64);
+            running_unsigned[s] = running_unsigned[s].saturating_add(bump);
+        }
+    }
+
+    SeekCache {
+        idx1_keyframes,
+        idx1_kf_monotonic,
+        idx1_entries,
+        idx1_off_globally_monotonic,
+        std_keyframes,
+        std_kf_monotonic,
+        std_entries,
+        std_off_monotonic,
+    }
+}
+
+/// Pick the landed keyframe for a seek target from one stream's
+/// `(pts, header offset)` keyframe table: the LAST entry with
+/// `pts <= target` — on a tie, the FIRST entry of the equal-pts run,
+/// matching the historical linear scan's keep-first-maximum rule —
+/// falling back to the stream's first keyframe (e.g. a negative
+/// requested pts), or `None` when the stream has no keyframes at all.
+/// Binary search when the table's pts are nondecreasing; otherwise a
+/// linear replica of the historical scan.
+fn seek_cache_select_keyframe(
+    keyframes: &[(i64, u64)],
+    monotonic: bool,
+    target: i64,
+) -> Option<(i64, u64)> {
+    if monotonic {
+        let p = keyframes.partition_point(|&(pts, _)| pts <= target);
+        if p == 0 {
+            return keyframes.first().copied();
+        }
+        let mut i = p - 1;
+        let best_pts = keyframes[i].0;
+        while i > 0 && keyframes[i - 1].0 == best_pts {
+            i -= 1;
+        }
+        return Some(keyframes[i]);
+    }
+    let mut best: Option<(i64, u64)> = None;
+    for &(pts, off) in keyframes {
+        if pts <= target {
+            best = Some(match best {
+                Some(b) if b.0 >= pts => b,
+                _ => (pts, off),
+            });
+        }
+    }
+    best.or_else(|| keyframes.first().copied())
 }
 
 /// Parse "NNsf" where NN is two ASCII digits into the stream index.
