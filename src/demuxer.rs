@@ -68,6 +68,39 @@ use crate::stream_format::{
     ChannelLayout, ChannelMask, Guid, WAVE_FORMAT_EXTENSIBLE,
 };
 
+/// Cheap deterministic hasher for `u64` file-offset map keys
+/// (round-415 perf). The keyframe map is built once per `open()` with
+/// one insert per indexed packet chunk and probed once per
+/// `next_packet`; the default DoS-resistant hasher dominated the
+/// build cost in profiles. The keys are chunk offsets the demuxer
+/// computed itself — not attacker-chosen map keys — so hash-flood
+/// resistance buys nothing here. Multiplying by the 64-bit golden
+/// ratio (Fibonacci multiplicative hashing) spreads the regular
+/// stride of consecutive chunk offsets across the table's high bits.
+#[derive(Clone, Copy, Default)]
+struct OffsetHasher(u64);
+
+impl std::hash::Hasher for OffsetHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // Generic byte path — required by the trait, not used for the
+        // `u64` keys this hasher is scoped to.
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// `HashMap` keyed by self-computed `u64` file offsets via
+/// [`OffsetHasher`].
+type OffsetKeyMap<V> =
+    std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<OffsetHasher>>;
+
 /// `bIndexType` of an `AVIMETAINDEX` super-index (`indx` of indexes).
 const AVI_INDEX_OF_INDEXES: u8 = 0x00;
 /// `bIndexType` of an `AVIMETAINDEX` chunk index (`ix##`).
@@ -2262,8 +2295,19 @@ fn open_avi_inner(
     // `ix##` entries not already keyed (OpenDML continuation segments,
     // or idx1-less files). Offsets in both forms name the chunk's 8-byte
     // header — exactly where `next_packet` sits when reading a payload.
-    let mut keyframe_by_offset: std::collections::HashMap<u64, bool> =
-        std::collections::HashMap::new();
+    // Round-415 perf: the map is built once per `open()` from every
+    // index entry in the file (one insert per packet chunk) and probed
+    // once per `next_packet`, so it's pre-sized to the exact entry
+    // count (no rehash-and-move churn while inserting thousands of
+    // entries) and keyed through the cheap multiplicative
+    // [`OffsetHasher`] instead of the DoS-resistant default hasher —
+    // the keys are file offsets we computed ourselves, not
+    // attacker-chosen map keys, so hash-flood resistance buys nothing
+    // here.
+    let keyframe_map_capacity =
+        idx_table.len() + std_indexes.iter().map(|ix| ix.entries.len()).sum::<usize>();
+    let mut keyframe_by_offset: OffsetKeyMap<bool> =
+        OffsetKeyMap::with_capacity_and_hasher(keyframe_map_capacity, Default::default());
     for e in &idx_table {
         keyframe_by_offset.insert(e.offset, (e.flags & AVIIF_KEYFRAME) != 0);
     }
@@ -6121,7 +6165,7 @@ pub struct AviDemuxer {
     /// every payload chunk as a keyframe (the historical behaviour —
     /// correct for the all-intra / uncompressed streams that are the
     /// only ones a no-index AVI 1.0 file can describe randomly).
-    keyframe_by_offset: std::collections::HashMap<u64, bool>,
+    keyframe_by_offset: OffsetKeyMap<bool>,
     /// Per-stream keyframe flags in packet order, unifying idx1 and
     /// `ix##`. Outer index is `stream_index`, inner index is the
     /// zero-based packet ordinal `next_packet` assigns. Backs the
