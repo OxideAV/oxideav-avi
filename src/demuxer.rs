@@ -3844,7 +3844,14 @@ fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
     let mut out: Vec<StdIndex> = Vec::new();
     for &(start, end) in movi_segments {
         r.seek(SeekFrom::Start(start))?;
-        while r.stream_position()? + 8 <= end {
+        // Position tracked arithmetically (round-415 perf): every
+        // operation in this loop advances the stream by a known
+        // amount, and the old two `stream_position` queries per
+        // walked chunk dominated the OpenDML `open()` profile. The
+        // only resync point is a failed body read (truncated file),
+        // where the actual consumed length is unknowable.
+        let mut pos = start;
+        while pos + 8 <= end {
             // File-absolute offset of the chunk header about to be
             // read — retained on parsed `ix##` chunks so the
             // round-394 super-index target cross-check can compare
@@ -3852,36 +3859,45 @@ fn scan_ix_in_movi<R: ReadSeek + ?Sized>(
             // §"AVI Super Index Chunk" the "absolute file offset" of
             // the index chunk) against where the `ix##` chunks
             // actually sit.
-            let hdr_pos = r.stream_position()?;
+            let hdr_pos = pos;
             let hdr = match read_chunk_header_lenient(r)? {
                 Some(h) => h,
                 None => break,
             };
+            pos += 8;
             // `ix##` FourCCs (ASCII digits at bytes 2..4 instead of
             // 0..2 — note the spec's "##ix" → "ix##" reversal for AVI
             // backward compatibility): the two ASCII digits live at
             // hdr.id[2..4] for std-index chunks. Microsoft's
             // aviriff.h-style notation is "ix##"; some files in the
             // wild also flip and emit "##ix" but those are rare.
-            let body_end = (r.stream_position()? + hdr.size as u64).min(end);
             if hdr.id[0] == b'i' && hdr.id[1] == b'x' {
-                let body = read_body_bounded(r, hdr.size).ok();
-                if let Some(b) = body {
-                    if let Some(mut idx) = parse_ix_chunk(hdr.id, &b) {
-                        idx.chunk_offset = hdr_pos;
-                        out.push(idx);
+                match read_body_bounded(r, hdr.size) {
+                    Ok(b) => {
+                        pos += hdr.size as u64;
+                        if let Some(mut idx) = parse_ix_chunk(hdr.id, &b) {
+                            idx.chunk_offset = hdr_pos;
+                            out.push(idx);
+                        }
+                    }
+                    Err(_) => {
+                        // Truncated body — resync the tracked
+                        // position from the stream (rare path).
+                        pos = r.stream_position()?;
                     }
                 }
                 skip_pad(r, hdr.size)?;
+                pos += (hdr.size & 1) as u64;
             } else if hdr.id == LIST {
                 // Skip the 4-byte form-type and continue scanning the
                 // body — `LIST rec ` clusters can contain ix## too.
                 let _ = read_form_type(r)?;
+                pos += 4;
                 continue;
             } else {
                 // Skip every other chunk (frames, JUNK, …).
-                let _ = body_end; // documentation aid
                 skip_chunk(r, &hdr)?;
+                pos += hdr.padded_size();
             }
         }
     }
