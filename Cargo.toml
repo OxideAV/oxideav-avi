@@ -22,3 +22,8 @@ oxideav-core = "0.1"
 # codec_id ↔ tag mappings + use random/JPEG-shaped synthetic payloads
 # to exercise the AVI muxer + demuxer in isolation.
 [dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "avi_perf"
+harness = false
