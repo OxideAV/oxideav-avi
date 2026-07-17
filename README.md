@@ -290,6 +290,58 @@ if `write_packet` would push the file past ~2 GiB, it returns
   `RIFF....AVI ` magic.
 - Registered via `oxideav_avi::register(&mut ContainerRegistry)`.
 
+## Performance
+
+Round-415 depth round: Criterion suite (`benches/avi_perf.rs`) over a
+synthetic in-memory two-stream fixture — MJPG video (2048 B/frame,
+keyframe every 8th) + PCM S16 stereo (1920 B/packet), 3000 packets,
+~5.7 MiB per file — covering the mux write path, demuxer `open()`,
+the `next_packet` walk, and keyframe seek on both the AVI 1.0 and
+OpenDML envelopes. Run with `cargo bench --bench avi_perf`.
+
+Before/after for the round-415 optimization passes (Apple Silicon,
+in-memory `Cursor` I/O; times are Criterion medians from isolated
+runs):
+
+| bench | before | after | delta |
+|---|---|---|---|
+| `mux/avi10_3000pkts` | 166.2 µs (33.3 GiB/s) | 156.0 µs (35.5 GiB/s) | −5.8 % |
+| `mux/opendml_1mib_segments_3000pkts` | 175.0 µs | 164.4 µs | −6.1 % |
+| `open/avi10` | 87.9 µs | 30.3 µs | −65.8 % |
+| `open/opendml` | 118.0 µs | 63.8 µs | −46 % |
+| `walk/avi10_3000pkts` | 189.4 µs | 174–188 µs | −3–9 % (noise-bounded) |
+| `walk/opendml_3000pkts` | 193.4 µs | 180–187 µs | −3–7 % (noise-bounded) |
+| `seek/idx1_32_seeks` | 56.7 µs (1.77 µs/seek) | 0.94 µs (29 ns/seek) | −98.3 % |
+| `seek/stdindex_32_seeks` | 185.0 µs (5.78 µs/seek) | 1.01 µs (32 ns/seek) | −99.4 % |
+
+What changed (each pass byte-identical on the muxer side, gated by
+the `tests/round415_golden_mux_hash.rs` FNV pins, and
+output-identical on the demuxer side, gated by the full round-trip
+suite):
+
+- `open()`: the per-chunk keyframe map is pre-sized and keyed through
+  a cheap multiplicative `u64` hasher (offsets are self-computed, not
+  attacker-chosen); the idx1 `pc`/`tx` side-band counts collect in
+  one pass instead of two, and the eager side-band body walks +
+  palette-position pass are skipped when the counts prove them empty;
+  the pts-assignment pass hoists the per-stream block-align divisor.
+- `next_packet`: chunk bodies read straight into uninitialised spare
+  capacity (`Take`-bounded `read_to_end`, hostile-`cb` bound kept)
+  instead of a `resize`-zeroed buffer; one position query per chunk.
+- `seek_to`: per-stream keyframe/entry tables built lazily ONCE, then
+  binary-searched (monotonic tables; hostile/unordered indexes fall
+  back to verbatim linear replicas) — seeks went from O(index) per
+  call to O(log n).
+- mux: at most one position query per packet, one 8-byte write per
+  chunk header, 2-GiB ceiling check derived arithmetically.
+- `scan_ix_in_movi`: arithmetic position tracking; bench-neutral on
+  `Cursor` but drops two `lseek` syscalls per walked chunk on
+  file-backed input.
+
+The mux and walk paths are near memcpy-bound after these passes
+(profiles show `memmove` of packet payloads dominating), so further
+wins there would need API-level zero-copy, not micro-optimization.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
