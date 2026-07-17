@@ -1570,25 +1570,42 @@ fn open_avi_inner(
     // `avih.dwFlags` `AVIF_HASINDEX` cross-check.
     let has_idx1 = idx1_raw.is_some();
     let idx_table = if let Some(raw) = idx1_raw {
-        scan_idx1_for_suffix(&raw, &streams, *b"pc", &mut palette_change_counts);
-        scan_idx1_for_suffix(&raw, &streams, *b"tx", &mut text_chunk_counts);
-        read_sideband_data_from_idx1(
-            &mut *input,
+        scan_idx1_sideband_counts(
             &raw,
-            movi_start,
             &streams,
-            *b"pc",
-            &mut palette_change_data,
+            &mut palette_change_counts,
+            &mut text_chunk_counts,
         );
-        read_sideband_data_from_idx1(
-            &mut *input,
-            &raw,
-            movi_start,
-            &streams,
-            *b"tx",
-            &mut text_chunk_data,
-        );
-        palette_change_positions = compute_palette_change_positions(&raw, &streams);
+        // Round-415 perf: the eager side-band body walks and the
+        // palette-position derivation are full idx1 passes (the body
+        // walks also probe + seek); the counts just computed tell us
+        // for free whether any qualifying entry exists, so the common
+        // no-side-band file skips all three. Skipping is
+        // output-identical: with no qualifying entries the walks fill
+        // nothing and the position table stays all-empty.
+        let any_pc = palette_change_counts.iter().any(|&c| c != 0);
+        let any_tx = text_chunk_counts.iter().any(|&c| c != 0);
+        if any_pc {
+            read_sideband_data_from_idx1(
+                &mut *input,
+                &raw,
+                movi_start,
+                &streams,
+                *b"pc",
+                &mut palette_change_data,
+            );
+            palette_change_positions = compute_palette_change_positions(&raw, &streams);
+        }
+        if any_tx {
+            read_sideband_data_from_idx1(
+                &mut *input,
+                &raw,
+                movi_start,
+                &streams,
+                *b"tx",
+                &mut text_chunk_data,
+            );
+        }
         sideband_data_loaded = true;
         // Round-394: streams DECLARED `txts` deliver their `##tx`
         // chunks as packets through `next_packet` — for those slots
@@ -1701,7 +1718,7 @@ fn open_avi_inner(
                 }
             }
         }
-        for (stream, _) in per_stream_2field.iter() {
+        for stream in per_stream_2field.keys() {
             metadata.push((format!("avi:ix.{stream}.is_2field"), "true".into()));
             field2_streams_seen.insert(*stream);
             if let Some(offsets) = per_stream_offsets.get(stream) {
@@ -5087,31 +5104,38 @@ fn is_unexpected_eof(e: &Error) -> bool {
 /// `file_start + offset` and `movi_start - 4 + offset` (the "- 4" puts us
 /// at the `movi` FourCC byte) and picking whichever yields the matching
 /// `ckid`. Default to movi-relative if the file is too small to probe.
-/// Scan raw idx1 bytes for chunks whose ckid ends with the given
-/// 2-byte suffix and bump per-stream counts (round-8 C3 / round-10 C1).
+/// Scan raw idx1 bytes for chunks whose ckid ends in the side-band
+/// suffixes `pc` (palette change, per `aviriff.h`'s `cktypePALchange
+/// = "PC"`, round-8 C3) or `tx` (text/subtitle per `mmsystem.h`'s
+/// text-stream FourCC family, round-10 C1) and bump the matching
+/// per-stream counts — both families in ONE pass over the entries
+/// (round-415 perf; this was two separate full scans).
 ///
 /// Each idx1 entry is a 16-byte `AVIINDEXENTRY`: ckid(4) + flags(4) +
-/// offset(4) + size(4). We treat any ckid whose final two bytes match
-/// `suffix` (e.g. `b"pc"` per `aviriff.h`'s `cktypePALchange = "PC"`,
-/// or `b"tx"` for text/subtitle chunks per `mmsystem.h`'s text-stream
-/// FourCC family) as belonging to that family and bump the per-stream
-/// count. The first two bytes of ckid are ASCII digits encoding the
-/// stream index.
+/// offset(4) + size(4). The first two bytes of ckid are ASCII digits
+/// encoding the stream index.
 ///
 /// Counts beyond `u32::MAX - 1` saturate; that's a single-frame
 /// chunk-soup file with ~4G of one suffix per stream, well outside
 /// any real-world capture pattern.
-fn scan_idx1_for_suffix(raw: &[u8], streams: &[StreamInfo], suffix: [u8; 2], counts: &mut [u32]) {
-    if raw.len() < 16 || counts.len() < streams.len() {
+fn scan_idx1_sideband_counts(
+    raw: &[u8],
+    streams: &[StreamInfo],
+    pc_counts: &mut [u32],
+    tx_counts: &mut [u32],
+) {
+    if raw.len() < 16 || pc_counts.len() < streams.len() || tx_counts.len() < streams.len() {
         return;
     }
     let n = raw.len() / 16;
     for i in 0..n {
         let base = i * 16;
         let ckid = [raw[base], raw[base + 1], raw[base + 2], raw[base + 3]];
-        if ckid[2] != suffix[0] || ckid[3] != suffix[1] {
-            continue;
-        }
+        let counts: &mut [u32] = match [ckid[2], ckid[3]] {
+            s if s == *b"pc" => &mut *pc_counts,
+            s if s == *b"tx" => &mut *tx_counts,
+            _ => continue,
+        };
         if let Some(stream) = parse_stream_index(&ckid) {
             let s = stream as usize;
             if s < counts.len() && s < streams.len() {
@@ -5384,11 +5408,14 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
 
     // Second pass: assign per-stream pts by walking each stream's entries
     // in idx1 order, mirroring the pts-bump logic in `next_packet`.
+    // The per-stream block-align divisor is hoisted out of the loop
+    // (round-415 perf — `packet_time_delta` re-derived it per entry).
+    let divisors = time_delta_divisors(streams);
     let mut per_stream_pts: Vec<i64> = vec![0; streams.len()];
     for e in entries.iter_mut() {
         let s = e.stream as usize;
         e.pts = per_stream_pts[s];
-        let bump = packet_time_delta(&streams[s], e.size as usize) as i64;
+        let bump = time_delta_with_divisor(divisors[s], e.size as usize) as i64;
         per_stream_pts[s] = per_stream_pts[s].saturating_add(bump);
     }
 
@@ -11548,6 +11575,7 @@ fn build_seek_cache(
     // counter reset historically used.
     let mut running_signed = vec![0i64; n];
     let mut running_unsigned = vec![0u64; n];
+    let divisors = time_delta_divisors(streams);
     for ix in std_indexes {
         let stream = match parse_stream_index(&ix.chunk_id) {
             Some(s) => s,
@@ -11577,7 +11605,7 @@ fn build_seek_cache(
                 }
                 std_keyframes[s].push((running_signed[s], header_off));
             }
-            let bump = packet_time_delta(&streams[s], e.dw_size as usize);
+            let bump = time_delta_with_divisor(divisors[s], e.dw_size as usize);
             running_signed[s] = running_signed[s].saturating_add(bump as i64);
             running_unsigned[s] = running_unsigned[s].saturating_add(bump);
         }
@@ -11650,21 +11678,45 @@ fn ascii_hex(b: u8) -> Option<u8> {
 }
 
 fn packet_time_delta(stream: &StreamInfo, payload_len: usize) -> u64 {
+    time_delta_with_divisor(time_delta_divisor(stream), payload_len)
+}
+
+/// The per-stream state behind [`packet_time_delta`], factored out so
+/// batch walks (idx1 pts assignment, seek-cache build) can derive it
+/// once per stream instead of once per entry (round-415 perf).
+/// `Some(block_align)` ⇒ the stream ticks `payload / block_align` per
+/// packet (CBR audio); `None` ⇒ one tick per packet (video, data,
+/// audio with no usable block align).
+fn time_delta_divisor(stream: &StreamInfo) -> Option<usize> {
     match stream.params.media_type {
-        MediaType::Video => 1,
         MediaType::Audio => {
             // PCM: duration = frames = payload / block_align. Non-PCM: one
             // tick per packet is a reasonable fallback.
-            let block_align = stream
+            stream
                 .params
                 .channels
                 .zip(stream.params.sample_format)
                 .map(|(c, f)| (c as usize) * f.bytes_per_sample())
                 .filter(|&v| v > 0)
-                .unwrap_or(0);
-            payload_len.checked_div(block_align).unwrap_or(1) as u64
         }
-        _ => 1,
+        _ => None,
+    }
+}
+
+/// Per-stream divisors for a whole stream table (see
+/// [`time_delta_divisor`]).
+fn time_delta_divisors(streams: &[StreamInfo]) -> Vec<Option<usize>> {
+    streams.iter().map(time_delta_divisor).collect()
+}
+
+/// Apply a precomputed [`time_delta_divisor`] to one packet's payload
+/// length. Matches [`packet_time_delta`] exactly, including the
+/// integer division yielding 0 ticks for a sub-block-align payload.
+#[inline]
+fn time_delta_with_divisor(divisor: Option<usize>, payload_len: usize) -> u64 {
+    match divisor {
+        Some(block_align) => (payload_len / block_align) as u64,
+        None => 1,
     }
 }
 
