@@ -5024,23 +5024,36 @@ fn sample_format_for(codec: &str, bits: u16) -> Option<SampleFormat> {
 }
 
 fn read_body_bounded<R: std::io::Read + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
-    // Grow the buffer in 64 KiB steps instead of trusting the declared
-    // chunk size up-front: a corrupt / hostile `cb` near `0xFFFFFFFF`
-    // would otherwise commit a ~4 GiB allocation before the read has a
-    // chance to hit EOF (round-394 index-walker fuzz hardening). A
-    // legitimate oversized chunk still reads fully — only the
-    // allocation is incremental; a truncated body fails `read_exact`
-    // exactly as before, with at most one 64 KiB step of overshoot.
+    // Never trust the declared chunk size for the up-front allocation:
+    // a corrupt / hostile `cb` near `0xFFFFFFFF` would otherwise commit
+    // a ~4 GiB allocation before the read has a chance to hit EOF
+    // (round-394 index-walker fuzz hardening). The initial capacity is
+    // capped at 64 KiB; `Take`-bounded `read_to_end` grows the buffer
+    // driven by the bytes ACTUALLY present in the stream, so a
+    // legitimate oversized chunk still reads fully while a hostile
+    // declared size stays bounded by real content. Round-415 perf:
+    // this replaced a `resize`-then-`read_exact` step loop whose
+    // zero-fill memset touched every byte twice — `read_to_end` reads
+    // straight into the uninitialised spare capacity.
     const STEP: usize = 64 * 1024;
     let total = size as usize;
-    let mut buf: Vec<u8> = Vec::with_capacity(total.min(STEP));
-    let mut filled = 0usize;
-    while filled < total {
-        let want = (total - filled).min(STEP);
-        let old_len = buf.len();
-        buf.resize(old_len + want, 0);
-        r.read_exact(&mut buf[old_len..])?;
-        filled += want;
+    // Small slack past the exact size so `read_to_end`'s final
+    // buffer-full probe doesn't force one more grow-and-move for the
+    // common exactly-sized small chunk.
+    let mut buf: Vec<u8> = Vec::with_capacity(total.min(STEP) + 64);
+    // UFCS: `R` is `?Sized`, so bound the read through the sized
+    // `&mut R` reader instead of `R` itself.
+    let mut bounded = <&mut R as std::io::Read>::take(&mut *r, size as u64);
+    let got = std::io::Read::read_to_end(&mut bounded, &mut buf)?;
+    if got < total {
+        // Truncated body — same `UnexpectedEof` kind `read_exact`
+        // surfaced so `is_unexpected_eof` callers translate it into a
+        // clean `Error::Eof` exactly as before.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "AVI: truncated chunk body",
+        )
+        .into());
     }
     Ok(buf)
 }
@@ -7554,7 +7567,13 @@ impl Demuxer for AviDemuxer {
                 .get(self.current_segment)
                 .map(|s| s.1)
                 .ok_or(Error::Eof)?;
-            if self.input.stream_position()? >= current_end {
+            // File-absolute offset of this chunk's 8-byte header. The
+            // per-chunk keyframe map (`keyframe_by_offset`) is keyed on
+            // exactly this position, so capture it before consuming the
+            // header. Also doubles as the segment-end bound check
+            // (round-415 perf: one position query per chunk, not two).
+            let chunk_header_off = self.input.stream_position()?;
+            if chunk_header_off >= current_end {
                 // Advance to the next movi segment if there is one; its
                 // start is a separate region of the file.
                 self.current_segment += 1;
@@ -7564,11 +7583,6 @@ impl Demuxer for AviDemuxer {
                 }
                 return Err(Error::Eof);
             }
-            // File-absolute offset of this chunk's 8-byte header. The
-            // per-chunk keyframe map (`keyframe_by_offset`) is keyed on
-            // exactly this position, so capture it before consuming the
-            // header.
-            let chunk_header_off = self.input.stream_position()?;
             // Lenient header read: a short read at the segment tail
             // (truncated-head AVI; segment_end = file_len) means "stop"
             // rather than "I/O error".
