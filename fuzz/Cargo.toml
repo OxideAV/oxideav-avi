@@ -1,0 +1,94 @@
+[package]
+name = "oxideav-avi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The AVI (RIFF) container is a length-prefixed chunk tree where every
+# walk decision is driven by attacker-controlled 32-bit little-endian
+# size fields: the outer `RIFF AVI ` / `RIFF AVIX` segments, nested
+# `LIST hdrl / strl / movi / odml / INFO / rec ` forms, the 56-byte
+# `avih` main header, per-stream `strh` + `strf` (BITMAPINFOHEADER /
+# WAVEFORMATEX(TENSIBLE)) + `strd/strn/vprp/indx`, the legacy `idx1`
+# table (with its file-absolute vs movi-relative offset-base probe and
+# `rec ` LIST entries), and the OpenDML 2.0 two-tier index machinery
+# (`indx` AVISUPERINDEX in `strl` pointing at per-segment `ix##`
+# AVISTDINDEX chunks in `movi`, plus the compact single-index
+# `AVI_INDEX_OF_CHUNKS` in-`strl` layout and `AVI_INDEX_2FIELD`
+# 12-byte field entries).
+#
+# Classic attacker primitives exercised here:
+#
+#   * chunk-size arithmetic — `cb` near `u32::MAX`, sizes that
+#     overshoot the parent LIST or the file, odd sizes and the RIFF
+#     word-pad rule, zero-size chunks;
+#   * allocation bounds — a declared `cb` must never translate into
+#     an up-front allocation proportional to the attacker's claim
+#     (the round-394 `read_body_bounded` 64 KiB growth-step bound);
+#   * index arithmetic — idx1 entry counts vs body size, the
+#     offset-base probe, super-index `nEntriesInUse` / stride /
+#     `qwOffset` targets, `ix##` `qwBaseOffset` + delta-bit decode,
+#     duration ticks, palette-change / text side-band scans;
+#   * multi-segment walking — `RIFF AVIX` continuations, per-segment
+#     `movi` ranges, `dmlh` cross-segment frame totals.
+#
+# Workspace policy bars external multimedia-library source as a
+# cross-decode oracle, so the contracts are internal: the demux legs
+# assert panic-freedom (any byte sequence must open-or-error and
+# drain-or-error without panicking, aborting, overflowing in a debug
+# build, or allocating proportional to a claimed size); the mux leg
+# asserts the full round-trip identity contract on valid-by-
+# construction recipes (mux succeeds, output re-demuxes, per-stream
+# payload bytes and keyframe flags survive, strict idx1<->ix##
+# cross-validation accepts our own writer's output).
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-avi]
+path = ".."
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[lib]
+name = "oxideav_avi_fuzz"
+path = "src/lib.rs"
+
+# Target 1: arbitrary hostile bytes through all three demuxer front
+# doors (`open_avi` / `open_avi_lenient` / `open_avi_strict`), then a
+# bounded packet drain, both seek paths, and the full accessor
+# battery on anything that opens. Panic-free contract only.
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
+test = false
+doc = false
+
+# Target 2: structure-aware write-side recipes — decode the fuzz
+# bytes into a valid-by-construction mux recipe (streams x packets x
+# AviKind x rec-clusters x index layout x vprp/info/side-band
+# options), mux it, and assert the round-trip identity contract
+# through our own demuxer.
+[[bin]]
+name = "mux_roundtrip"
+path = "fuzz_targets/mux_roundtrip.rs"
+test = false
+doc = false
+
+# Target 3: structure-aware hostile mutation — build a writer-shaped
+# fixture from the recipe bytes, then apply fuzz-directed byte flips,
+# truncations, and targeted idx1/indx/ix## corruption before feeding
+# the mutant back through the demux battery. Panic-free contract.
+[[bin]]
+name = "structured_mutate"
+path = "fuzz_targets/structured_mutate.rs"
+test = false
+doc = false

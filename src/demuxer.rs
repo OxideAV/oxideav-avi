@@ -734,9 +734,13 @@ fn open_avi_inner(
 
     // Duration: the AVI main header carries microseconds-per-frame and
     // total-frame-count for the primary (first) video stream. Multiply.
+    // Saturating: both DWORDs are advisory, attacker-controlled header
+    // fields, and a hostile `0xFFFFFFFF x 0xFFFFFFFF` pair overflows
+    // i64 (round-442 fuzz finding) — a nonsense header saturates the
+    // derived duration instead of aborting the open.
     let duration_micros: i64 = match avih {
         Some(h) if h.micro_sec_per_frame > 0 && h.total_frames > 0 => {
-            (h.total_frames as i64) * (h.micro_sec_per_frame as i64)
+            (h.total_frames as i64).saturating_mul(h.micro_sec_per_frame as i64)
         }
         _ => 0,
     };
@@ -3067,7 +3071,19 @@ fn parse_hdrl<R: ReadSeek + ?Sized>(
                 let list_type = read_form_type(r)?;
                 let body_len = hdr.size.saturating_sub(4);
                 let body_start = r.stream_position()?;
-                let body_end = body_start + body_len as u64;
+                // Clamp the declared body end to the enclosing `hdrl`
+                // extent (which the caller has already clamped to the
+                // enclosing RIFF and the physical file length). Per the
+                // RIFF chunk-nesting rule a child cannot extend past its
+                // parent LIST, so a nested `LIST` whose declared size
+                // overshoots `hdrl` is corrupt / truncated — without the
+                // clamp, the hdrl-nested `LIST INFO` branch below sized
+                // its read buffer from the DECLARED length and a hostile
+                // `cb` near `0xFFFFFFFF` committed a ~4 GiB zeroed
+                // allocation before the read could hit EOF (round-442
+                // structure-aware fuzz finding, same class as the
+                // round-394 `read_body_bounded` hardening).
+                let body_end = (body_start + body_len as u64).min(end_pos);
                 if &list_type == b"strl" {
                     let (
                         si,

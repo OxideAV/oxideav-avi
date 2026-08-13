@@ -1,0 +1,28 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The AVI
+# (RIFF) container walk is driven entirely by attacker-controlled
+# 32-bit LE size fields: top-level `RIFF AVI ` / `RIFF AVIX`
+# segments, nested `LIST hdrl/strl/movi/odml/INFO/rec ` forms, the
+# `avih` / `strh` / `strf` header suite, the legacy `idx1` table with
+# its offset-base probe, and the OpenDML 2.0 two-tier index (`indx`
+# super-index -> per-segment `ix##`, plus the compact in-`strl`
+# layout and 2-field entries). Three targets share the 30-minute
+# budget: `demux` (arbitrary bytes must open-or-error, never panic),
+# `mux_roundtrip` (structure-aware valid-by-construction recipes must
+# mux, re-demux byte-exactly, keep video keyframe flags, and pass
+# strict idx1 <-> ix## cross-validation), and `structured_mutate`
+# (writer-shaped fixtures with fuzz-directed flips / truncations /
+# targeted index corruption must never panic the demux battery).
+
+on:
+  schedule:
+    - cron: "41 6 * * *"   # daily 06:41 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

@@ -342,6 +342,56 @@ The mux and walk paths are near memcpy-bound after these passes
 (profiles show `memmove` of packet payloads dominating), so further
 wins there would need API-level zero-copy, not micro-optimization.
 
+## Fuzzing
+
+Round-442 depth round: cargo-fuzz harness (`fuzz/`) with three
+structure-aware targets, plus a daily scheduled Fuzz workflow
+(`.github/workflows/fuzz.yml`, 30-minute budget split across the
+targets). The in-tree deterministic round-394 mutation harness
+(`tests/round394_fuzz_index_walkers.rs`) stays as the CI-side quick
+check; the coverage-guided targets extend it:
+
+- `demux` — arbitrary hostile bytes through all three open front
+  doors (`open_avi` / `open_avi_lenient` / `open_avi_strict`), a
+  bounded packet drain, both seek paths (idx1 + `ix##` std-index),
+  and the full accessor battery (index validators, avih/strh/strf
+  typed accessors, vprp, palette/text side-bands, INFO). Contract:
+  open-or-error, never panic, never allocate proportional to an
+  attacker-claimed size field.
+- `mux_roundtrip` — decodes the fuzz bytes into a
+  valid-by-construction mux recipe (1–3 streams × 0–24 packets ×
+  `AviKind` × rec-clusters / in-`strl` compact index / mid-`movi`
+  flushes / idx1 synthesis / super-index capacity / JUNK padding /
+  vprp / INFO / CSET / DISP / 2-field / indexed-video palette /
+  side-band records) and asserts the strict round-trip contract:
+  every write succeeds, the output passes `open_avi_strict`'s
+  idx1 ↔ `ix##` cross-validation, per-stream payload bytes are
+  byte-identical in order, video keyframe flags survive (idx1
+  `AVIIF_KEYFRAME` + `ix##` delta bit), and `seek_to(0, 0)` lands
+  when stream 0 opens on a keyframe.
+- `structured_mutate` — builds a writer-shaped fixture from the
+  recipe, then applies fuzz-directed byte flips, truncations, and
+  targeted overwrites right after each `idx1` / `indx` / `ix##`
+  FourCC (entry counts, strides, `qwOffset` / `qwBaseOffset`,
+  duration ticks) before feeding the mutant to the demux battery —
+  reaching parser states raw random bytes almost never assemble.
+
+Round-442 campaign: ~11.5 M executions across the three targets
+(ASan, debug assertions). Two findings, both fixed in the same
+round: the hdrl-nested `LIST INFO` read buffer was sized from the
+DECLARED list length (a hostile `cb` near `0xFFFFFFFF` committed a
+~4 GiB zeroed allocation before the read could fail — nested LIST
+body ends now clamp to the enclosing `hdrl` extent per the RIFF
+chunk-nesting rule), and the `avih`-derived
+`total_frames × micro_sec_per_frame` duration product overflowed
+`i64` on a hostile header pair (now saturating). Both inputs are
+pinned as `regression_*` corpus seeds. The `mux_roundtrip` identity
+contract held across the entire recipe space — no mux/demux
+asymmetry surfaced.
+
+Run locally with `cargo fuzz run <target> -- -max_total_time=600`
+(nightly toolchain).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
