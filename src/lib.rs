@@ -10,6 +10,7 @@
 pub mod demuxer;
 pub mod muxer;
 pub(crate) mod packaging;
+#[doc(hidden)] // internal RIFF chunk plumbing, not part of the supported API
 pub mod riff;
 pub mod stream_format;
 
