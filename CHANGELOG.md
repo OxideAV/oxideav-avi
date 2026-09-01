@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-avi/compare/v0.0.9...v0.0.10) - 2026-08-13
+
+### Other
+
+- structure-aware cargo-fuzz harness + 2 hostile-input fixes (round 442)
+- README perf section — round-415 bench suite + before/after table
+- arithmetic position tracking in the OpenDML ix## movi scan (round 415)
+- single-pass idx1 side-band scan + skip empty side-band walks + hoisted tick divisors (round 415)
+- single position query per muxed packet + one-write chunk headers (round 415)
+- lazily-built per-stream seek cache makes seeks O(log n) (round 415)
+- uninit-capacity chunk-body reads + single position query per walked chunk (round 415)
+- pre-sized Fibonacci-hash keyframe map halves demuxer open() cost (round 415)
+- Criterion bench suite for mux/open/walk/seek hot paths + golden-hash mux pins (round 415)
+- correct invented spec/06 §6.1 citations + fix fuzz fixture temp-file race (round 394)
+- black-box ffmpeg/ffprobe validation of round-394 writer shapes
+- index-walker fuzz hardening + bounded chunk-body allocation (round 394)
+- first-class txts text streams (round 394)
+- in-strl standard index (OpenDML compact layout) read + write (round 394)
+- per-stream OpenDML indx super-index + recorded strh patch offsets (round 394)
+- spec-correct OpenDML super-index entry targets (round 394)
+- add CI / crates.io / docs.rs / MIT-license badges
+- neutralise decorative external-tool naming in doc comments
+- README — round-381 BITMAPINFOHEADER + WAVEFORMATEX scalar fields
+- add muxer WAVEFORMATEX nAvgBytesPerSec override (write path)
+- surface raw WAVEFORMATEX nAvgBytesPerSec + wBitsPerSample (read)
+- add muxer BITMAPINFOHEADER scalar-field overrides (write path)
+- surface remaining BITMAPINFOHEADER scalar fields (read path)
+- round 377 — indexed (palettised) video DIB write side
+- round 377 — dmlh declared body size + reserved-bytes read/write symmetry
+- round 377 — top-level CSET character-set chunk read + write symmetry
+- round 373 — AVIF_HASINDEX flag ↔ idx1-presence cross-check
+- round 373 — raw nBlockAlign accessor + VBR/CBR classification
+- round 373 — top-level DISP chunk read + write symmetry
+- round 373 — AVISF_VIDEO_PALCHANGES flag ↔ xxpc-presence cross-check
+- round 373 — multi-RIFF movi segment-boundary + AVIX-count surface
+- round 373 — top-level JUNK padding-chunk read + write symmetry
+- vprp signal-shape round-trip (dwHTotalInT / dwVTotalInLines / active frame) (round 365)
+- typed OpenDML vprp signal-shape scalar accessors (round 365)
+- non-conformant AVIMETAINDEX reserved-field diagnostics (round 361)
+- typed OpenDML AVIMETAINDEX bIndexType code surface (round 361)
+- surface baseline palette + effective-palette resolution from xxpc deltas (round 355)
+- parse baseline DIB color table (RGBQUAD bmiColors[]) for indexed video (round 355)
+- public packet_is_keyframe / keyframe_indexed_packet_count accessors (round 349)
+- OpenDML ix##-sourced keyframe flags across AVIX continuations (round 349)
+- stamp true per-packet keyframe flags from idx1/ix## index (round 349)
+- typed VideoFormatToken / VideoStandard decoders + named-label metadata
+- file-global avih.dwReserved[4] trailing reserved-array accessor (round 330)
+- OpenDML ix## AVISTDINDEX nEntriesInUse declared entry-count accessor + truncation cross-check (round 325)
+- OpenDML ix## AVISTDINDEX dwChunkId FOURCC accessor + cross-wiring divergence metadata (round 322)
+- OpenDML ix## AVISTDINDEX qwBaseOffset accessor + movi-region cross-check (round 317)
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - **hostile-input hardening: nested `LIST` body ends in `hdrl` clamp to the enclosing extent** (round 442 structure-aware fuzz finding): `parse_hdrl` computed a nested LIST's body end from the DECLARED size alone, so the hdrl-nested `LIST INFO` branch sized its read buffer from an attacker-controlled `cb` — a value near `0xFFFFFFFF` committed a ~4 GiB zeroed allocation before the read could hit EOF. Nested body ends now clamp to the `hdrl` extent (itself already clamped to the enclosing RIFF + physical file length by the top-level walk), per the RIFF chunk-nesting rule that a child cannot extend past its parent LIST. Same class as the round-394 `read_body_bounded` hardening; the triggering input is pinned as `fuzz/corpus/demux/regression_hdrl_info_alloc.bin` (round 442)
