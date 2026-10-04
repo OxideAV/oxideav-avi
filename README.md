@@ -212,14 +212,15 @@ spell one of the 17 native FourCCs; otherwise `M8RG` is used.
 ### Demux
 
 ```rust
-use oxideav_container::{ContainerRegistry, ReadSeek};
+use oxideav_core::{ReadSeek, RuntimeContext};
 
-let mut containers = ContainerRegistry::new();
-oxideav_avi::register(&mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_avi::register(&mut ctx);
+// ... plus the codec crates whose FourCCs / wFormatTags you want resolved
 
 let input: Box<dyn ReadSeek> =
     Box::new(std::io::Cursor::new(std::fs::read("capture.avi")?));
-let mut dmx = containers.open_demuxer("avi", input)?;
+let mut dmx = ctx.containers.open_demuxer("avi", input, &ctx.codecs)?;
 
 for s in dmx.streams() {
     eprintln!("stream {}: {} ({:?})", s.index, s.params.codec_id, s.params.media_type);
@@ -229,6 +230,7 @@ loop {
     match dmx.next_packet() {
         Ok(pkt) => {
             // feed into the matching decoder
+            let _ = pkt;
         }
         Err(oxideav_core::Error::Eof) => break,
         Err(e) => return Err(e.into()),
@@ -245,12 +247,11 @@ decode still works.
 ### Mux
 
 ```rust
-use oxideav_container::{ContainerRegistry, WriteSeek};
-use oxideav_core::{CodecId, CodecParameters, MediaType, Packet,
-                   Rational, SampleFormat, StreamInfo, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Rational, RuntimeContext,
+                   SampleFormat, StreamInfo, TimeBase, WriteSeek};
 
-let mut containers = ContainerRegistry::new();
-oxideav_avi::register(&mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_avi::register(&mut ctx);
 
 // One video + one audio stream.
 let mut v = CodecParameters::video(CodecId::new("mjpeg"));
@@ -272,7 +273,7 @@ let streams = [
 
 let out: Box<dyn WriteSeek> =
     Box::new(std::fs::File::create("out.avi")?);
-let mut mux = containers.open_muxer("avi", out, &streams)?;
+let mut mux = ctx.containers.open_muxer("avi", out, &streams)?;
 mux.write_header()?;
 // mux.write_packet(&pkt)? for each encoded packet, interleaved
 mux.write_trailer()?;
