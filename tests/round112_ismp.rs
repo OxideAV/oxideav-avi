@@ -33,7 +33,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -364,7 +364,10 @@ fn ismp_trailing_newline_and_nuls_stripped() {
     body.push(b'\n');
     body.push(0);
     body.push(0);
-    assert!(body.len() % 2 == 0, "test fixture body should be even");
+    assert!(
+        body.len().is_multiple_of(2),
+        "test fixture body should be even"
+    );
 
     let bytes = build_avi_with_raw_ismp(&body);
     let reg = CodecRegistry::new();

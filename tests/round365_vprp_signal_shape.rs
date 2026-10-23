@@ -36,8 +36,8 @@ use oxideav_core::{
     Rational, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::demuxer::{open_avi as demuxer_open_avi, VprpSignalShape};
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig};
+use oxideav_avi::demuxer::{VprpSignalShape, open_avi as demuxer_open_avi};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig, open_with_options};
 
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
@@ -307,7 +307,7 @@ fn signal_shape_bundle_surfaces_zero_refresh_verbatim() {
     vprp.extend_from_slice(&dw(720)); // dwFrameWidthInPixels
     vprp.extend_from_slice(&dw(576)); // dwFrameHeightInLines
     vprp.extend_from_slice(&dw(1)); // nbFieldPerFrame
-                                    // One VIDEO_FIELD_DESC (8 DWORDs).
+    // One VIDEO_FIELD_DESC (8 DWORDs).
     for _ in 0..8 {
         vprp.extend_from_slice(&dw(0));
     }

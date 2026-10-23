@@ -313,10 +313,11 @@ fn strl_std_index_2field_field_index() {
         assert!(f2 > 0, "non-zero qwBaseOffset-relative field-2 offset");
     }
     // 2-field metadata key fires from the in-strl index.
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:ix.0.is_2field" && v == "true"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:ix.0.is_2field" && v == "true")
+    );
 }
 
 #[test]

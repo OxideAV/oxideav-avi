@@ -25,7 +25,7 @@ use oxideav_core::{
     ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_with_options};
 
 // --- raw-AVI builder for the explicit-field parse cases ---------------
 
@@ -164,10 +164,11 @@ fn avg_bytes_zero_folds_to_none() {
     let strf = wfx(0x0001, 1, 8000, 0, 1, 8);
     let dmx = open(build_audio_avi(&strf));
     assert_eq!(dmx.stream_avg_bytes_per_sec(0), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:auds.0.avg_bytes_per_sec"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:auds.0.avg_bytes_per_sec")
+    );
 }
 
 #[test]

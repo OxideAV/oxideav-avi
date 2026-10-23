@@ -29,7 +29,7 @@ use oxideav_core::{
 fn _muxer_trait_in_scope<M: Muxer>() {}
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig, open_with_options};
 
 // ---------------------------------------------------------------------------
 // Test fixtures shared across round-9 cases.

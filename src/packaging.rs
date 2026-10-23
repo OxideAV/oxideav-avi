@@ -20,8 +20,9 @@
 use oxideav_core::{CodecId, CodecParameters, CodecTag, Error, MediaType, Result, SampleFormat};
 
 use crate::stream_format::{
-    write_bitmap_info_header, write_bitmap_info_header_oriented, write_indexed_bitmap_info_header,
-    write_waveformatex, write_waveformatextensible, Guid, RgbQuad, WAVE_FORMAT_EXTENSIBLE,
+    Guid, RgbQuad, WAVE_FORMAT_EXTENSIBLE, write_bitmap_info_header,
+    write_bitmap_info_header_oriented, write_indexed_bitmap_info_header, write_waveformatex,
+    write_waveformatextensible,
 };
 
 /// Result of building a stream-format chunk for the muxer.
@@ -88,10 +89,10 @@ pub(crate) fn build_strf(
             // container-layout fields (`wBitsPerSample`, `nBlockAlign`)
             // stay owned by the PCM/codec packaging since they determine
             // byte-stream framing and the CBR sample-size invariant.
-            if let Some(avg) = avg_bytes_per_sec {
-                if entry.strf.len() >= 12 {
-                    entry.strf[8..12].copy_from_slice(&avg.to_le_bytes());
-                }
+            if let Some(avg) = avg_bytes_per_sec
+                && entry.strf.len() >= 12
+            {
+                entry.strf[8..12].copy_from_slice(&avg.to_le_bytes());
             }
             Ok(entry)
         }

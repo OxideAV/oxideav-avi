@@ -16,7 +16,7 @@
 //! honestly) and assert the demuxer now reflects the true per-chunk
 //! flag.
 
-use oxideav_avi::muxer::{open_with_kind, AviKind, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, RiffSegmentLimit, open_with_kind};
 use oxideav_core::{
     CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Demuxer, MediaType, Packet,
     PixelFormat, Rational, StreamInfo, TimeBase,

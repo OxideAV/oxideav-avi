@@ -62,10 +62,10 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_FORM, LIST, RIFF};
+use crate::riff::{AVI_FORM, LIST, RIFF, read_chunk_header, read_form_type, skip_chunk, skip_pad};
 use crate::stream_format::{
-    parse_bitmap_info_header, parse_waveformatex, parse_waveformatextensible, subformat_codec_hint,
-    ChannelLayout, ChannelMask, Guid, WAVE_FORMAT_EXTENSIBLE,
+    ChannelLayout, ChannelMask, Guid, WAVE_FORMAT_EXTENSIBLE, parse_bitmap_info_header,
+    parse_waveformatex, parse_waveformatextensible, subformat_codec_hint,
 };
 
 /// Cheap deterministic hasher for `u64` file-offset map keys
@@ -1197,10 +1197,10 @@ fn open_avi_inner(
     // surfaced so absence remains observable via the typed
     // [`AviDemuxer::stream_name`] accessor.
     for (i, name_opt) in stream_names.iter().enumerate() {
-        if let Some(name) = name_opt {
-            if !name.is_empty() {
-                metadata.push((format!("avi:strn.{i}"), name.clone()));
-            }
+        if let Some(name) = name_opt
+            && !name.is_empty()
+        {
+            metadata.push((format!("avi:strn.{i}"), name.clone()));
         }
     }
 
@@ -1712,13 +1712,13 @@ fn open_avi_inner(
         let mut per_stream_offsets: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         let mut per_stream_2field: BTreeMap<u32, bool> = BTreeMap::new();
         for ix in &std_indexes {
-            if let Some(stream) = parse_stream_index(&ix.chunk_id) {
-                if ix.b_index_sub_type == AVI_INDEX_SUB_2FIELD {
-                    per_stream_2field.insert(stream, true);
-                    let v = per_stream_offsets.entry(stream).or_default();
-                    for e in &ix.entries {
-                        v.push(e.dw_offset_field2);
-                    }
+            if let Some(stream) = parse_stream_index(&ix.chunk_id)
+                && ix.b_index_sub_type == AVI_INDEX_SUB_2FIELD
+            {
+                per_stream_2field.insert(stream, true);
+                let v = per_stream_offsets.entry(stream).or_default();
+                for e in &ix.entries {
+                    v.push(e.dw_offset_field2);
                 }
             }
         }
@@ -1806,13 +1806,13 @@ fn open_avi_inner(
             // at [0..2] (`00dc` → stream 0). A divergence means the body
             // declares a different stream than the chunk header.
             let own_stream = parse_stream_index(&[ix.own_fourcc[2], ix.own_fourcc[3], 0, 0]);
-            if let Some(os) = own_stream {
-                if os != stream {
-                    metadata.push((
-                        format!("avi:ix.{os}.{segment_index}.chunk_id"),
-                        format_fourcc_or_hex(&ix.chunk_id),
-                    ));
-                }
+            if let Some(os) = own_stream
+                && os != stream
+            {
+                metadata.push((
+                    format!("avi:ix.{os}.{segment_index}.chunk_id"),
+                    format_fourcc_or_hex(&ix.chunk_id),
+                ));
             }
         }
     }
@@ -1991,10 +1991,10 @@ fn open_avi_inner(
             continue;
         }
         let ty = AviIndexType::from_raw(sx.b_index_type);
-        if ty != AviIndexType::OfIndexes {
-            if let Some(label) = ty.label() {
-                metadata.push((format!("avi:indx.{i}.index_type"), label.into()));
-            }
+        if ty != AviIndexType::OfIndexes
+            && let Some(label) = ty.label()
+        {
+            metadata.push((format!("avi:indx.{i}.index_type"), label.into()));
         }
     }
 
@@ -2179,10 +2179,10 @@ fn open_avi_inner(
                 // outside the primary `movi` segment's byte range.
                 // idx1 can't address that data, so the comparison
                 // is meaningless.
-                if let Some((p_start, p_end)) = primary_range {
-                    if ix.qw_base_offset < p_start || ix.qw_base_offset >= p_end {
-                        continue;
-                    }
+                if let Some((p_start, p_end)) = primary_range
+                    && (ix.qw_base_offset < p_start || ix.qw_base_offset >= p_end)
+                {
+                    continue;
                 }
                 for entry in &ix.entries {
                     let header_off = ix
@@ -2263,47 +2263,49 @@ fn open_avi_inner(
     //     video bitrate term — false positives outweigh signal),
     //   - the file has no idx1 (the video bitrate term is 0 and
     //     audio-only pacing is already exact in the populator).
-    if let Some(h) = &avih {
-        if h.max_bytes_per_sec > 0 && duration_micros > 0 && !idx_table.is_empty() {
-            // Audio: pull `avg_bytes_per_sec` per stream off
-            // `params.bit_rate` (which `build_stream` already set
-            // from the parsed WAVEFORMATEX's `nAvgBytesPerSec * 8`).
-            let audio_sum: u64 = streams
-                .iter()
-                .filter(|s| matches!(s.params.media_type, MediaType::Audio))
-                .filter_map(|s| s.params.bit_rate)
-                .map(|br| br / 8)
-                .sum();
-            // Video: sum of idx1 entry sizes for video streams,
-            // converted to bytes/sec via the file duration.
-            let mut video_bytes: u64 = 0;
-            for e in &idx_table {
-                let s = e.stream as usize;
-                if let Some(stream) = streams.get(s) {
-                    if matches!(stream.params.media_type, MediaType::Video) {
-                        video_bytes = video_bytes.saturating_add(e.size as u64);
-                    }
-                }
+    if let Some(h) = &avih
+        && h.max_bytes_per_sec > 0
+        && duration_micros > 0
+        && !idx_table.is_empty()
+    {
+        // Audio: pull `avg_bytes_per_sec` per stream off
+        // `params.bit_rate` (which `build_stream` already set
+        // from the parsed WAVEFORMATEX's `nAvgBytesPerSec * 8`).
+        let audio_sum: u64 = streams
+            .iter()
+            .filter(|s| matches!(s.params.media_type, MediaType::Audio))
+            .filter_map(|s| s.params.bit_rate)
+            .map(|br| br / 8)
+            .sum();
+        // Video: sum of idx1 entry sizes for video streams,
+        // converted to bytes/sec via the file duration.
+        let mut video_bytes: u64 = 0;
+        for e in &idx_table {
+            let s = e.stream as usize;
+            if let Some(stream) = streams.get(s)
+                && matches!(stream.params.media_type, MediaType::Video)
+            {
+                video_bytes = video_bytes.saturating_add(e.size as u64);
             }
-            // bytes_per_sec = video_bytes * 1_000_000 / micros.
-            let video_bps = if duration_micros > 0 {
-                let big = (video_bytes as u128) * 1_000_000u128;
-                let bps = big / (duration_micros as u128);
-                bps.min(u32::MAX as u128) as u64
-            } else {
-                0
-            };
-            let expected = audio_sum.saturating_add(video_bps);
-            if expected > h.max_bytes_per_sec as u64 {
-                metadata.push((
-                    "avi:over_budget".into(),
-                    format!(
-                        "expected_max={} stamped={}",
-                        expected.min(u32::MAX as u64),
-                        h.max_bytes_per_sec
-                    ),
-                ));
-            }
+        }
+        // bytes_per_sec = video_bytes * 1_000_000 / micros.
+        let video_bps = if duration_micros > 0 {
+            let big = (video_bytes as u128) * 1_000_000u128;
+            let bps = big / (duration_micros as u128);
+            bps.min(u32::MAX as u128) as u64
+        } else {
+            0
+        };
+        let expected = audio_sum.saturating_add(video_bps);
+        if expected > h.max_bytes_per_sec as u64 {
+            metadata.push((
+                "avi:over_budget".into(),
+                format!(
+                    "expected_max={} stamped={}",
+                    expected.min(u32::MAX as u64),
+                    h.max_bytes_per_sec
+                ),
+            ));
         }
     }
 
@@ -6912,11 +6914,11 @@ impl PaletteChange {
         let num_entries = body[1];
         let flags = u16::from_le_bytes([body[2], body[3]]);
         let tail = &body[4..];
-        if tail.len() % 4 != 0 {
+        if !tail.len().is_multiple_of(4) {
             return None;
         }
         let mut entries = Vec::with_capacity(tail.len() / 4);
-        for chunk in tail.chunks_exact(4) {
+        for chunk in tail.as_chunks::<4>().0 {
             entries.push(PaletteEntry {
                 red: chunk[0],
                 green: chunk[1],
@@ -7711,7 +7713,7 @@ impl Demuxer for AviDemuxer {
             // cluster chunks this way. Recurse by entering the list body.
             if hdr.id == LIST {
                 let _form = read_form_type(&mut *self.input)?; // likely "rec "
-                                                               // Continue: next iteration will consume its nested chunks.
+                // Continue: next iteration will consume its nested chunks.
                 continue;
             }
             // End of movi guard in case sizes disagree.
@@ -8033,15 +8035,15 @@ impl AviDemuxer {
             ))
         };
         for (k, v) in &self.metadata {
-            if let Some(canon) = canonical {
-                if k == canon {
-                    return Some(v.as_str());
-                }
+            if let Some(canon) = canonical
+                && k == canon
+            {
+                return Some(v.as_str());
             }
-            if let Some(ns) = avi_namespaced.as_deref() {
-                if k == ns {
-                    return Some(v.as_str());
-                }
+            if let Some(ns) = avi_namespaced.as_deref()
+                && k == ns
+            {
+                return Some(v.as_str());
             }
         }
         None
@@ -11589,10 +11591,10 @@ fn build_seek_cache(
         if (e.flags & AVIIF_KEYFRAME) == 0 {
             continue;
         }
-        if let Some(&(prev_pts, _)) = idx1_keyframes[s].last() {
-            if e.pts < prev_pts {
-                idx1_kf_monotonic[s] = false;
-            }
+        if let Some(&(prev_pts, _)) = idx1_keyframes[s].last()
+            && e.pts < prev_pts
+        {
+            idx1_kf_monotonic[s] = false;
         }
         idx1_keyframes[s].push((e.pts, e.offset));
     }
@@ -11623,17 +11625,17 @@ fn build_seek_cache(
             // (just past the 8-byte header). Our `next_packet`
             // expects to land on the chunk header, so back off 8.
             let header_off = abs_off.saturating_sub(8);
-            if let Some(&(prev_off, _)) = std_entries[s].last() {
-                if header_off < prev_off {
-                    std_off_monotonic[s] = false;
-                }
+            if let Some(&(prev_off, _)) = std_entries[s].last()
+                && header_off < prev_off
+            {
+                std_off_monotonic[s] = false;
             }
             std_entries[s].push((header_off, running_unsigned[s]));
             if e.is_keyframe {
-                if let Some(&(prev_pts, _)) = std_keyframes[s].last() {
-                    if running_signed[s] < prev_pts {
-                        std_kf_monotonic[s] = false;
-                    }
+                if let Some(&(prev_pts, _)) = std_keyframes[s].last()
+                    && running_signed[s] < prev_pts
+                {
+                    std_kf_monotonic[s] = false;
                 }
                 std_keyframes[s].push((running_signed[s], header_off));
             }
@@ -11778,10 +11780,10 @@ mod tests {
         body.extend_from_slice(b"00dc"); // dwChunkId
         body.extend_from_slice(&0x1000u64.to_le_bytes()); // qwBaseOffset
         body.extend_from_slice(&0u32.to_le_bytes()); // dwReserved3
-                                                     // Entry 0: keyframe.
+        // Entry 0: keyframe.
         body.extend_from_slice(&0x100u32.to_le_bytes()); // dwOffset
         body.extend_from_slice(&512u32.to_le_bytes()); // dwSize (high bit clear → kf)
-                                                       // Entry 1: delta frame.
+        // Entry 1: delta frame.
         body.extend_from_slice(&0x300u32.to_le_bytes());
         body.extend_from_slice(&((512u32) | 0x8000_0000).to_le_bytes());
 
@@ -11813,7 +11815,7 @@ mod tests {
         body.extend_from_slice(b"00dc");
         body.extend_from_slice(&0x2000u64.to_le_bytes()); // qwBaseOffset
         body.extend_from_slice(&0u32.to_le_bytes()); // dwReserved3
-                                                     // Entry 0: 2-field interlaced video; field-2 offset follows.
+        // Entry 0: 2-field interlaced video; field-2 offset follows.
         body.extend_from_slice(&0x40u32.to_le_bytes()); // dwOffset (field 1)
         body.extend_from_slice(&1024u32.to_le_bytes()); // dwSize (whole frame)
         body.extend_from_slice(&0x80u32.to_le_bytes()); // dwOffsetField2
@@ -11931,7 +11933,7 @@ mod tests {
         body.extend_from_slice(&720u32.to_le_bytes()); // dwFrameWidthInPixels
         body.extend_from_slice(&576u32.to_le_bytes()); // dwFrameHeightInLines
         body.extend_from_slice(&2u32.to_le_bytes()); // nbFieldPerFrame = 2
-                                                     // Field 0 (top).
+        // Field 0 (top).
         body.extend_from_slice(&288u32.to_le_bytes()); // CompressedBMHeight
         body.extend_from_slice(&720u32.to_le_bytes()); // CompressedBMWidth
         body.extend_from_slice(&288u32.to_le_bytes()); // ValidBMHeight
@@ -11940,7 +11942,7 @@ mod tests {
         body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMYOffset
         body.extend_from_slice(&0u32.to_le_bytes()); // VideoXOffsetInT
         body.extend_from_slice(&23u32.to_le_bytes()); // VideoYValidStartLine (top)
-                                                      // Field 1 (bottom).
+        // Field 1 (bottom).
         body.extend_from_slice(&288u32.to_le_bytes());
         body.extend_from_slice(&720u32.to_le_bytes());
         body.extend_from_slice(&288u32.to_le_bytes());
@@ -11974,7 +11976,7 @@ mod tests {
         body.extend_from_slice(&720u32.to_le_bytes());
         body.extend_from_slice(&576u32.to_le_bytes());
         body.extend_from_slice(&2u32.to_le_bytes()); // nbFieldPerFrame = 2 …
-                                                     // … but only one rect follows.
+        // … but only one rect follows.
         body.extend_from_slice(&288u32.to_le_bytes());
         body.extend_from_slice(&720u32.to_le_bytes());
         body.extend_from_slice(&288u32.to_le_bytes());

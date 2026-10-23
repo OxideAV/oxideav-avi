@@ -18,9 +18,9 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::{
-    open_avi as demuxer_open_avi, open_avi_lenient, PaletteChange, PaletteEntry,
+    PaletteChange, PaletteEntry, open_avi as demuxer_open_avi, open_avi_lenient,
 };
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Test fixtures (self-contained per the workspace per-round-test convention).

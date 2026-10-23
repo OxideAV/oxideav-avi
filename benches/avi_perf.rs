@@ -21,7 +21,7 @@ use std::hint::black_box;
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_core::{
     CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Demuxer as _, MediaType, Packet,
@@ -29,7 +29,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::AviDemuxer;
-use oxideav_avi::muxer::{open_with_kind, AviKind, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, RiffSegmentLimit, open_with_kind};
 
 /// Frames per fixture. 1500 video + 1500 audio packets = 3000 packet
 /// chunks per file — enough for index-build and walk costs to dominate

@@ -392,20 +392,17 @@ impl MuxPlan {
                     pkt.flags.keyframe = true;
                 }
                 mux.write_packet(&pkt).expect("valid plan: write_packet");
-                if s == 0 && self.is_video[0] {
-                    if let Some(every) = self.sideband_every {
-                        if (next[s] as u32).is_multiple_of(every) {
-                            // Minimal well-formed AVIPALCHANGE: first
-                            // entry 0, 2 entries, flags 0, 2x4 bytes.
-                            mux.write_palette_change(
-                                0,
-                                &[0, 2, 0, 0, 10, 20, 30, 0, 40, 50, 60, 0],
-                            )
-                            .expect("valid plan: write_palette_change");
-                            mux.write_text_chunk(0, b"fuzz overlay")
-                                .expect("valid plan: write_text_chunk");
-                        }
-                    }
+                if s == 0
+                    && self.is_video[0]
+                    && let Some(every) = self.sideband_every
+                    && (next[s] as u32).is_multiple_of(every)
+                {
+                    // Minimal well-formed AVIPALCHANGE: first
+                    // entry 0, 2 entries, flags 0, 2x4 bytes.
+                    mux.write_palette_change(0, &[0, 2, 0, 0, 10, 20, 30, 0, 40, 50, 60, 0])
+                        .expect("valid plan: write_palette_change");
+                    mux.write_text_chunk(0, b"fuzz overlay")
+                        .expect("valid plan: write_text_chunk");
                 }
                 next[s] += 1;
                 wrote = true;

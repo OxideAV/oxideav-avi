@@ -66,7 +66,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -486,7 +486,7 @@ fn build_hand_rolled_avi(handler_raw: [u8; 4]) -> Vec<u8> {
     strh.extend_from_slice(&0u32.to_le_bytes()); // dwSuggestedBufferSize
     strh.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // dwQuality (-1)
     strh.extend_from_slice(&0u32.to_le_bytes()); // dwSampleSize
-                                                 // rcFrame (left, top, right, bottom) = (0,0,64,48)
+    // rcFrame (left, top, right, bottom) = (0,0,64,48)
     strh.extend_from_slice(&0i16.to_le_bytes());
     strh.extend_from_slice(&0i16.to_le_bytes());
     strh.extend_from_slice(&64i16.to_le_bytes());

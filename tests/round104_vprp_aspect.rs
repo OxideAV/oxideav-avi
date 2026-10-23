@@ -21,7 +21,7 @@ use oxideav_core::{
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
 use oxideav_avi::muxer::{
-    open_avi, open_with_options, AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig,
+    AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig, open_avi, open_with_options,
 };
 
 fn registry_with_magicyuv() -> CodecRegistry {

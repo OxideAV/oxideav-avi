@@ -22,8 +22,8 @@ use oxideav_core::{
     Rational, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::demuxer::{open_avi, Idx1Flags, AVIIF_LIST};
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions, RiffSegmentLimit};
+use oxideav_avi::demuxer::{AVIIF_LIST, Idx1Flags, open_avi};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, open_with_options};
 
 /// Synthetic registry entry for the FOURCC ↔ codec_id mapping the
 /// tests below need. Avoids a producer-crate dev-dep — real MagicYUV

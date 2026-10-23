@@ -64,7 +64,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -440,7 +440,7 @@ fn hand_rolled_avi_with_video_length(length: u32) -> Vec<u8> {
     strf[8..12].copy_from_slice(&48i32.to_le_bytes()); // biHeight
     strf[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
     strf[14..16].copy_from_slice(&24u16.to_le_bytes()); // biBitCount
-                                                        // biCompression at 16: BI_RGB = 0 (already zero).
+    // biCompression at 16: BI_RGB = 0 (already zero).
 
     // avih body (56 B).
     let mut avih = vec![0u8; 56];

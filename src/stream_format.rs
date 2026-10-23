@@ -205,7 +205,7 @@ pub fn parse_color_table(bit_count: u16, clr_used: u32, extradata: &[u8]) -> Opt
         return None;
     }
     let mut table = Vec::with_capacity(count as usize);
-    for quad in extradata.chunks_exact(4).take(count as usize) {
+    for quad in extradata.as_chunks::<4>().0.iter().take(count as usize) {
         table.push(RgbQuad {
             blue: quad[0],
             green: quad[1],

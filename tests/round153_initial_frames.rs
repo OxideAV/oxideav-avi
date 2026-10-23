@@ -49,7 +49,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -155,10 +155,11 @@ fn default_no_override_reads_as_none() {
 
     assert_eq!(dmx.stream_initial_frames(0), None);
     assert_eq!(dmx.stream_initial_frames(1), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k.starts_with("avi:strh.") && k.ends_with(".initial_frames")));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k.starts_with("avi:strh.") && k.ends_with(".initial_frames"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -178,14 +179,16 @@ fn initial_frames_video_override_roundtrip() {
     assert_eq!(dmx.stream_initial_frames(0), Some(5));
     // Audio stream 1 stays at the default (no metadata key emitted).
     assert_eq!(dmx.stream_initial_frames(1), None);
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.initial_frames" && v == "5"));
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.1.initial_frames"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.initial_frames" && v == "5")
+    );
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.1.initial_frames")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -229,10 +232,11 @@ fn explicit_zero_override_reads_as_none() {
         None,
         "an all-zero dwInitialFrames must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.initial_frames"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.initial_frames")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -256,12 +260,14 @@ fn distinct_per_stream_skews_roundtrip_independently() {
     assert_eq!(dmx.stream_initial_frames(1), Some(21));
 
     let md = dmx.metadata();
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.initial_frames" && v == "3"));
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.initial_frames" && v == "21"));
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:strh.0.initial_frames" && v == "3")
+    );
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:strh.1.initial_frames" && v == "21")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -298,10 +304,11 @@ fn all_bits_set_initial_frames_roundtrip() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_initial_frames(0), Some(0xFFFF_FFFF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.initial_frames" && v == "4294967295"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.initial_frames" && v == "4294967295")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -428,10 +435,11 @@ fn handrolled_explicit_nonzero_initial_frames_decodes() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.stream_initial_frames(0), Some(0xCAFE_BABE));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.initial_frames" && v == "3405691582"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.initial_frames" && v == "3405691582")
+    );
 }
 
 #[test]
@@ -441,8 +449,9 @@ fn handrolled_zero_initial_frames_parses_as_none() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.stream_initial_frames(0), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.initial_frames"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.initial_frames")
+    );
 }

@@ -29,8 +29,8 @@ use oxideav_core::{
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
 use oxideav_avi::muxer::{
-    open_avi, AviKind, AviMuxOptions, RiffSegmentLimit, AVIIF_FIRSTPART, AVIIF_KEYFRAME,
-    AVIIF_LASTPART, OPENDML_SUPER_INDEX_DEFAULT_CAPACITY,
+    AVIIF_FIRSTPART, AVIIF_KEYFRAME, AVIIF_LASTPART, AviKind, AviMuxOptions,
+    OPENDML_SUPER_INDEX_DEFAULT_CAPACITY, RiffSegmentLimit, open_avi,
 };
 
 fn registry_with_magicyuv() -> CodecRegistry {

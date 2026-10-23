@@ -23,9 +23,9 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 use oxideav_avi::stream_format::{
-    parse_bitfields_masks, write_bitmap_info_header_oriented, BI_BITFIELDS,
+    BI_BITFIELDS, parse_bitfields_masks, write_bitmap_info_header_oriented,
 };
 
 // ---------------------------------------------------------------------------

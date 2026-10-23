@@ -22,8 +22,8 @@ use oxideav_core::{
     Rational, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::demuxer::{open_avi, CsetChunk};
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions};
+use oxideav_avi::demuxer::{CsetChunk, open_avi};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_with_options};
 
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();

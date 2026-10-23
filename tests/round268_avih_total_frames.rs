@@ -57,7 +57,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -311,10 +311,11 @@ fn handrolled_explicit_nonzero_avih_total_frames_decodes() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.avih_total_frames(), Some(0xDEAD_BEEF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:total_frames" && v == "3735928559"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:total_frames" && v == "3735928559")
+    );
 }
 
 #[test]
@@ -348,9 +349,10 @@ fn avih_total_frames_independent_of_dmlh_total_frames() {
     assert_eq!(dmx.dmlh_total_frames(), Some(99));
     let md = dmx.metadata();
     assert!(md.iter().any(|(k, v)| k == "avi:total_frames" && v == "5"));
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:total_frames_all_segments" && v == "99"));
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:total_frames_all_segments" && v == "99")
+    );
 }
 
 // ---------------------------------------------------------------------------

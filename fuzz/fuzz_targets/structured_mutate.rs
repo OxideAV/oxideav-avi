@@ -31,7 +31,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use oxideav_avi_fuzz::{open_all_and_exercise, MuxPlan, Recipe};
+use oxideav_avi_fuzz::{MuxPlan, Recipe, open_all_and_exercise};
 
 fuzz_target!(|data: &[u8]| {
     let mut r = Recipe::new(data);

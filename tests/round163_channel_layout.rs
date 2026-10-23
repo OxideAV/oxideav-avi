@@ -28,11 +28,11 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 use oxideav_avi::stream_format::{
-    ChannelLayout, Speaker, KSDATAFORMAT_SUBTYPE_PCM, SPEAKER_BACK_LEFT, SPEAKER_BACK_RIGHT,
+    ChannelLayout, KSDATAFORMAT_SUBTYPE_PCM, SPEAKER_BACK_LEFT, SPEAKER_BACK_RIGHT,
     SPEAKER_FRONT_CENTER, SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT, SPEAKER_LOW_FREQUENCY,
-    SPEAKER_SIDE_LEFT, SPEAKER_SIDE_RIGHT,
+    SPEAKER_SIDE_LEFT, SPEAKER_SIDE_RIGHT, Speaker,
 };
 
 fn surround_pcm_stream(codec_id: &str, channels: u16) -> StreamInfo {

@@ -24,7 +24,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Test fixtures shared across round-8 cases.
@@ -350,12 +350,12 @@ fn craft_avi_with_palette_changes(pc_count: usize, data_count: usize) -> Vec<u8>
     let mut strh = [0u8; 56];
     strh[0..4].copy_from_slice(b"vids"); // fccType
     strh[4..8].copy_from_slice(b"\0\0\0\0"); // fccHandler — RGB raw
-                                             // dwFlags = 0; wPriority = 0; wLanguage = 0; dwInitialFrames = 0.
+    // dwFlags = 0; wPriority = 0; wLanguage = 0; dwInitialFrames = 0.
     strh[20..24].copy_from_slice(&1u32.to_le_bytes()); // dwScale
     strh[24..28].copy_from_slice(&25u32.to_le_bytes()); // dwRate (25 fps)
-                                                        // dwStart = 0.
+    // dwStart = 0.
     strh[32..36].copy_from_slice(&(data_count as u32).to_le_bytes()); // dwLength
-                                                                      // dwSuggestedBufferSize = 0; dwQuality = -1 (default = 0); dwSampleSize = 0.
+    // dwSuggestedBufferSize = 0; dwQuality = -1 (default = 0); dwSampleSize = 0.
 
     // BITMAPINFOHEADER strf (40 bytes) + 256-entry palette (256 * 4 = 1024 B).
     let mut strf = Vec::with_capacity(40 + 256 * 4);
@@ -370,7 +370,7 @@ fn craft_avi_with_palette_changes(pc_count: usize, data_count: usize) -> Vec<u8>
     strf.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
     strf.extend_from_slice(&256u32.to_le_bytes()); // biClrUsed
     strf.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
-                                                 // 256 palette entries, each B G R 0.
+    // 256 palette entries, each B G R 0.
     for i in 0..256u32 {
         strf.push(i as u8); // B
         strf.push((i >> 1) as u8); // G

@@ -34,9 +34,9 @@ use oxideav_core::{Error, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 pub use crate::packaging::BmihOverrides;
-use crate::packaging::{build_strf, StrfEntry};
+use crate::packaging::{StrfEntry, build_strf};
 use crate::riff::{
-    begin_list, finish_chunk, write_chunk, write_chunk_header, AVI_FORM, LIST, RIFF,
+    AVI_FORM, LIST, RIFF, begin_list, finish_chunk, write_chunk, write_chunk_header,
 };
 
 /// `AVIIF_KEYFRAME` per vfw.h — set on idx1 entries that point at a
@@ -3653,58 +3653,58 @@ impl Muxer for AviMuxer {
             let qw_base = self.movi_start_off + 4;
             // chunk-data offset = chunk_header + 8.
             let data_off = chunk_off + 8;
-            if let Some(d) = data_off.checked_sub(qw_base) {
-                if d <= u32::MAX as u64 {
-                    let dw_size_with_flag = if packet.flags.keyframe {
-                        size
-                    } else {
-                        size | 0x8000_0000
-                    };
-                    // dwOffsetField2 is qwBaseOffset-relative (per
-                    // OpenDML 2.0 §3.0); the caller's value is
-                    // payload-relative. Convert by adding `d`.
-                    let dw_offset_field2 = if stream_is_2field {
-                        match pending_field2 {
-                            Some(payload_off) => {
-                                let abs = d + payload_off as u64;
-                                if abs <= u32::MAX as u64 {
-                                    abs as u32
-                                } else {
-                                    0
-                                }
+            if let Some(d) = data_off.checked_sub(qw_base)
+                && d <= u32::MAX as u64
+            {
+                let dw_size_with_flag = if packet.flags.keyframe {
+                    size
+                } else {
+                    size | 0x8000_0000
+                };
+                // dwOffsetField2 is qwBaseOffset-relative (per
+                // OpenDML 2.0 §3.0); the caller's value is
+                // payload-relative. Convert by adding `d`.
+                let dw_offset_field2 = if stream_is_2field {
+                    match pending_field2 {
+                        Some(payload_off) => {
+                            let abs = d + payload_off as u64;
+                            if abs <= u32::MAX as u64 {
+                                abs as u32
+                            } else {
+                                0
                             }
-                            None => 0,
                         }
-                    } else {
-                        0
-                    };
-                    let ix_entry = IxStdEntry {
-                        dw_offset: d as u32,
-                        dw_size_with_flag,
-                        dw_offset_field2,
-                    };
-                    self.tracks[idx].ix_entries.push(ix_entry);
-                    self.check_strl_std_overflow(idx);
-                    // Round-16 C1: snapshot every primary-segment ix##
-                    // record so `serialize_idx1_from_ix` can rebuild
-                    // idx1 from the standard-index view. We only pay
-                    // the per-packet snapshot when the option is on,
-                    // and continuation segments (idx1 is 32-bit and
-                    // primary-only) are skipped.
-                    if self.options.synthesise_idx1_from_ix && self.segments.is_empty() {
-                        // ix##.dw_offset is from qwBaseOffset =
-                        // movi_start_off + 4 to chunk DATA, while
-                        // idx1 wants the offset to the chunk HEADER
-                        // from movi_start_off. So idx1.offset =
-                        // ix##.dw_offset - 4.
-                        let idx1_offset = (d as u32).saturating_sub(4);
-                        self.primary_ix_snapshot.push(PrimaryIxSnapshot {
-                            ckid: fourcc,
-                            flags,
-                            offset: idx1_offset,
-                            size,
-                        });
+                        None => 0,
                     }
+                } else {
+                    0
+                };
+                let ix_entry = IxStdEntry {
+                    dw_offset: d as u32,
+                    dw_size_with_flag,
+                    dw_offset_field2,
+                };
+                self.tracks[idx].ix_entries.push(ix_entry);
+                self.check_strl_std_overflow(idx);
+                // Round-16 C1: snapshot every primary-segment ix##
+                // record so `serialize_idx1_from_ix` can rebuild
+                // idx1 from the standard-index view. We only pay
+                // the per-packet snapshot when the option is on,
+                // and continuation segments (idx1 is 32-bit and
+                // primary-only) are skipped.
+                if self.options.synthesise_idx1_from_ix && self.segments.is_empty() {
+                    // ix##.dw_offset is from qwBaseOffset =
+                    // movi_start_off + 4 to chunk DATA, while
+                    // idx1 wants the offset to the chunk HEADER
+                    // from movi_start_off. So idx1.offset =
+                    // ix##.dw_offset - 4.
+                    let idx1_offset = (d as u32).saturating_sub(4);
+                    self.primary_ix_snapshot.push(PrimaryIxSnapshot {
+                        ckid: fourcc,
+                        flags,
+                        offset: idx1_offset,
+                        size,
+                    });
                 }
             }
         }
@@ -3748,17 +3748,16 @@ impl Muxer for AviMuxer {
         // primary `movi` LIST, so chunks in `RIFF AVIX` continuations
         // can't be indexed by idx1). For Avi10 mode we always record.
         let in_primary_segment = self.segments.is_empty();
-        if in_primary_segment {
-            if let Some(rel_off) = rel_off_opt {
-                if rel_off <= u32::MAX as u64 {
-                    self.index.push(IndexEntry {
-                        ckid: fourcc,
-                        flags,
-                        offset: rel_off as u32,
-                        size,
-                    });
-                }
-            }
+        if in_primary_segment
+            && let Some(rel_off) = rel_off_opt
+            && rel_off <= u32::MAX as u64
+        {
+            self.index.push(IndexEntry {
+                ckid: fourcc,
+                flags,
+                offset: rel_off as u32,
+                size,
+            });
         }
 
         // Round-7 candidate 1: mid-`movi` `ix##` periodic flush. When
@@ -3781,20 +3780,21 @@ impl Muxer for AviMuxer {
                 .iter()
                 .find(|(i, _)| *i == idx as u32)
                 .map(|(_, n)| *n);
-            if let Some(n) = cadence {
-                if n > 0 && self.tracks[idx].ix_entries.len() as u32 >= n {
-                    // If a `LIST rec ` cluster is open, close it first
-                    // so the `ix##` chunk lands at the `movi` body
-                    // level rather than nested inside the cluster.
-                    // The next `write_packet` will open a fresh
-                    // cluster on demand (the existing
-                    // `rec_open_size_off.is_none()` check fires
-                    // naturally).
-                    if self.rec_open_size_off.is_some() {
-                        self.close_rec_cluster()?;
-                    }
-                    self.flush_ix_for_track(idx)?;
+            if let Some(n) = cadence
+                && n > 0
+                && self.tracks[idx].ix_entries.len() as u32 >= n
+            {
+                // If a `LIST rec ` cluster is open, close it first
+                // so the `ix##` chunk lands at the `movi` body
+                // level rather than nested inside the cluster.
+                // The next `write_packet` will open a fresh
+                // cluster on demand (the existing
+                // `rec_open_size_off.is_none()` check fires
+                // naturally).
+                if self.rec_open_size_off.is_some() {
+                    self.close_rec_cluster()?;
                 }
+                self.flush_ix_for_track(idx)?;
             }
         }
 
@@ -3912,13 +3912,13 @@ impl Muxer for AviMuxer {
         // error can still inspect the full set).
         if !self.options.per_stream_max_bytes_per_sec.is_empty() {
             self.compute_per_stream_budget_breaches();
-            if self.options.strict_per_stream_budget {
-                if let Some(&(idx, observed, cap)) = self.over_budget_streams.first() {
-                    return Err(Error::invalid(format!(
-                        "AVI: stream {idx} exceeded per-stream dwMaxBytesPerSec cap: \
+            if self.options.strict_per_stream_budget
+                && let Some(&(idx, observed, cap)) = self.over_budget_streams.first()
+            {
+                return Err(Error::invalid(format!(
+                    "AVI: stream {idx} exceeded per-stream dwMaxBytesPerSec cap: \
                          observed={observed} cap={cap}"
-                    )));
-                }
+                )));
             }
         }
 
@@ -4394,18 +4394,17 @@ impl AviMuxer {
         // append their own entries) keeps idx1 in file order. Primary
         // segment only: idx1 never spans `RIFF AVIX` continuations.
         self.rec_open_idx1_slot = None;
-        if self.segments.is_empty() {
-            if let Some(rel) = list_hdr_off.checked_sub(self.movi_start_off) {
-                if rel <= u32::MAX as u64 {
-                    self.rec_open_idx1_slot = Some(self.index.len());
-                    self.index.push(IndexEntry {
-                        ckid: *b"rec ",
-                        flags: crate::demuxer::AVIIF_LIST,
-                        offset: rel as u32,
-                        size: 0,
-                    });
-                }
-            }
+        if self.segments.is_empty()
+            && let Some(rel) = list_hdr_off.checked_sub(self.movi_start_off)
+            && rel <= u32::MAX as u64
+        {
+            self.rec_open_idx1_slot = Some(self.index.len());
+            self.index.push(IndexEntry {
+                ckid: *b"rec ",
+                flags: crate::demuxer::AVIIF_LIST,
+                offset: rel as u32,
+                size: 0,
+            });
         }
         Ok(())
     }
@@ -4421,10 +4420,10 @@ impl AviMuxer {
             // append a pad byte, which the size field excludes).
             let body_size = self.output.stream_position()?.saturating_sub(off + 4);
             finish_chunk(self.output.as_mut(), off)?;
-            if let Some(slot) = self.rec_open_idx1_slot.take() {
-                if body_size <= u32::MAX as u64 {
-                    self.index[slot].size = body_size as u32;
-                }
+            if let Some(slot) = self.rec_open_idx1_slot.take()
+                && body_size <= u32::MAX as u64
+            {
+                self.index[slot].size = body_size as u32;
             }
             self.rec_packets_in_cluster = 0;
             self.rec_bytes_in_cluster = 0;
@@ -4678,30 +4677,30 @@ impl AviMuxer {
         if matches!(self.kind, AviKind::OpenDml(_)) {
             let qw_base = self.movi_start_off + 4;
             let data_off = chunk_off + 8;
-            if let Some(d) = data_off.checked_sub(qw_base) {
-                if d <= u32::MAX as u64 {
-                    let dw_size_with_flag = size | 0x8000_0000;
-                    let ix_entry = IxStdEntry {
-                        dw_offset: d as u32,
-                        dw_size_with_flag,
-                        dw_offset_field2: 0,
-                    };
-                    self.tracks[idx].ix_entries.push(ix_entry);
-                    self.check_strl_std_overflow(idx);
-                    if self.options.synthesise_idx1_from_ix && self.segments.is_empty() {
-                        // Side-band chunks (xxtx / xxpc) carry no
-                        // AVIIF_KEYFRAME bit so the demuxer's
-                        // suffix-scanner attributes them to the
-                        // per-stream side-band counter (mirror of the
-                        // `flags = 0` rule below).
-                        let idx1_offset = (d as u32).saturating_sub(4);
-                        self.primary_ix_snapshot.push(PrimaryIxSnapshot {
-                            ckid: fourcc,
-                            flags: 0,
-                            offset: idx1_offset,
-                            size,
-                        });
-                    }
+            if let Some(d) = data_off.checked_sub(qw_base)
+                && d <= u32::MAX as u64
+            {
+                let dw_size_with_flag = size | 0x8000_0000;
+                let ix_entry = IxStdEntry {
+                    dw_offset: d as u32,
+                    dw_size_with_flag,
+                    dw_offset_field2: 0,
+                };
+                self.tracks[idx].ix_entries.push(ix_entry);
+                self.check_strl_std_overflow(idx);
+                if self.options.synthesise_idx1_from_ix && self.segments.is_empty() {
+                    // Side-band chunks (xxtx / xxpc) carry no
+                    // AVIIF_KEYFRAME bit so the demuxer's
+                    // suffix-scanner attributes them to the
+                    // per-stream side-band counter (mirror of the
+                    // `flags = 0` rule below).
+                    let idx1_offset = (d as u32).saturating_sub(4);
+                    self.primary_ix_snapshot.push(PrimaryIxSnapshot {
+                        ckid: fourcc,
+                        flags: 0,
+                        offset: idx1_offset,
+                        size,
+                    });
                 }
             }
         }
@@ -4719,17 +4718,16 @@ impl AviMuxer {
         // under the per-stream side-band counter (the scanner only
         // matches on the chunk-id suffix; flags don't gate it).
         let in_primary_segment = self.segments.is_empty();
-        if in_primary_segment {
-            if let Some(rel_off) = rel_off_opt {
-                if rel_off <= u32::MAX as u64 {
-                    self.index.push(IndexEntry {
-                        ckid: fourcc,
-                        flags: 0,
-                        offset: rel_off as u32,
-                        size,
-                    });
-                }
-            }
+        if in_primary_segment
+            && let Some(rel_off) = rel_off_opt
+            && rel_off <= u32::MAX as u64
+        {
+            self.index.push(IndexEntry {
+                ckid: fourcc,
+                flags: 0,
+                offset: rel_off as u32,
+                size,
+            });
         }
         Ok(())
     }
@@ -5178,21 +5176,21 @@ fn write_strl<W: Write + Seek + ?Sized>(
     // `{auds, mids, txts, vids}` set are not validated.
     let fcc_type_bytes = fcc_type_override.unwrap_or(t.entry.strh_type);
     strh.extend_from_slice(&fcc_type_bytes); // fccType
-                                             // fccHandler (round-210): an `AviMuxOptions::with_stream_handler`
-                                             // override (when present) stamps the per-stream preferred-driver
-                                             // FourCC at byte offset 4 per AVI 1.0 §"AVISTREAMHEADER"
-                                             // (`fccHandler` row in
-                                             // `docs/container/riff/avi-riff-file-reference.md`, Appendix B
-                                             // line 236: *"An optional FOURCC that identifies a specific data
-                                             // handler. The data handler is the preferred handler for the
-                                             // stream. For audio and video streams, this specifies the codec
-                                             // for decoding the stream."*); otherwise the legacy default is
-                                             // the packaging-derived `t.entry.handler_fourcc` (for video
-                                             // streams: the per-codec FourCC, mirroring
-                                             // `BITMAPINFOHEADER.biCompression`; for audio streams: the
-                                             // all-zero `\0\0\0\0` "no preferred handler" default the
-                                             // demuxer maps back to `None`). The 4 bytes are written
-                                             // verbatim; printability is not validated.
+    // fccHandler (round-210): an `AviMuxOptions::with_stream_handler`
+    // override (when present) stamps the per-stream preferred-driver
+    // FourCC at byte offset 4 per AVI 1.0 §"AVISTREAMHEADER"
+    // (`fccHandler` row in
+    // `docs/container/riff/avi-riff-file-reference.md`, Appendix B
+    // line 236: *"An optional FOURCC that identifies a specific data
+    // handler. The data handler is the preferred handler for the
+    // stream. For audio and video streams, this specifies the codec
+    // for decoding the stream."*); otherwise the legacy default is
+    // the packaging-derived `t.entry.handler_fourcc` (for video
+    // streams: the per-codec FourCC, mirroring
+    // `BITMAPINFOHEADER.biCompression`; for audio streams: the
+    // all-zero `\0\0\0\0` "no preferred handler" default the
+    // demuxer maps back to `None`). The 4 bytes are written
+    // verbatim; printability is not validated.
     let handler_bytes = handler_override.unwrap_or(t.entry.handler_fourcc);
     strh.extend_from_slice(&handler_bytes);
     // dwFlags (round-247): an `AviMuxOptions::with_stream_flags`
@@ -5207,16 +5205,16 @@ fn write_strl<W: Write + Seek + ?Sized>(
     // documented bits so callers may stamp vendor / driver-private
     // bits in the upper half-DWORD for round-trippability.
     strh.extend_from_slice(&flags_override.unwrap_or(0).to_le_bytes()); // flags
-                                                                        // wPriority (round-182): an `AviMuxOptions::with_stream_priority`
-                                                                        // override (when present) stamps the per-stream selection hint at
-                                                                        // byte offset 12 per AVI 1.0 §"AVISTREAMHEADER" (`wPriority` row in
-                                                                        // `docs/container/riff/avi-riff-file-reference.md` Appendix B line
-                                                                        // 238: *"Priority of a stream type. For example, in a file with
-                                                                        // multiple audio streams, the one with the highest priority might
-                                                                        // be the default stream."*); otherwise the legacy default is `0`
-                                                                        // (the muxer's own default since round-3, which the demuxer maps
-                                                                        // back to `None`). The 16-bit value is written verbatim; the spec
-                                                                        // does not normatively pin a value range or a tie-break rule.
+    // wPriority (round-182): an `AviMuxOptions::with_stream_priority`
+    // override (when present) stamps the per-stream selection hint at
+    // byte offset 12 per AVI 1.0 §"AVISTREAMHEADER" (`wPriority` row in
+    // `docs/container/riff/avi-riff-file-reference.md` Appendix B line
+    // 238: *"Priority of a stream type. For example, in a file with
+    // multiple audio streams, the one with the highest priority might
+    // be the default stream."*); otherwise the legacy default is `0`
+    // (the muxer's own default since round-3, which the demuxer maps
+    // back to `None`). The 16-bit value is written verbatim; the spec
+    // does not normatively pin a value range or a tie-break rule.
     strh.extend_from_slice(&priority_override.unwrap_or(0).to_le_bytes()); // priority
 
     // wLanguage (round-119): an `AviMuxOptions::with_stream_language`
@@ -5235,26 +5233,26 @@ fn write_strl<W: Write + Seek + ?Sized>(
     // 32-bit value is written verbatim; no validation against the
     // per-stream `dwLength`.
     strh.extend_from_slice(&initial_frames_override.unwrap_or(0).to_le_bytes()); // initial_frames
-                                                                                 // dwScale + dwRate (round-249): an
-                                                                                 // `AviMuxOptions::with_stream_timebase` override (when present)
-                                                                                 // stamps the per-stream `(scale, rate)` pair at byte offsets 20
-                                                                                 // and 24 per AVI 1.0 §"AVISTREAMHEADER" (`dwScale` row in
-                                                                                 // `docs/container/riff/avi-riff-file-reference.md` line 241 +
-                                                                                 // the `dwRate` row line 242: *"Used with dwRate to specify the
-                                                                                 // time scale that this stream will use. Dividing dwRate by
-                                                                                 // dwScale gives the number of samples per second."*); otherwise
-                                                                                 // the packaging-derived `t.entry.scale` / `t.entry.rate` defaults
-                                                                                 // stand (video: per-stream `frame_rate`, audio: `sample_rate / 1`).
-                                                                                 // The two 32-bit values are written verbatim; the override does
-                                                                                 // NOT alter the muxer's `(scale, rate)`-derived `dwLength`
-                                                                                 // computation for audio streams (which still uses
-                                                                                 // `t.entry.{scale,rate}` to convert running samples into
-                                                                                 // `dwLength` units), does NOT touch `avih.dwMicroSecPerFrame`
-                                                                                 // (independently derived from the first video stream's
-                                                                                 // packaging pair), and does NOT cross-validate against the
-                                                                                 // per-stream `dwLength` or `dwStart`. A `0` in either DWORD
-                                                                                 // stamps the writer-skips-it / mathematically-undefined
-                                                                                 // sentinel the demuxer maps back to `None`.
+    // dwScale + dwRate (round-249): an
+    // `AviMuxOptions::with_stream_timebase` override (when present)
+    // stamps the per-stream `(scale, rate)` pair at byte offsets 20
+    // and 24 per AVI 1.0 §"AVISTREAMHEADER" (`dwScale` row in
+    // `docs/container/riff/avi-riff-file-reference.md` line 241 +
+    // the `dwRate` row line 242: *"Used with dwRate to specify the
+    // time scale that this stream will use. Dividing dwRate by
+    // dwScale gives the number of samples per second."*); otherwise
+    // the packaging-derived `t.entry.scale` / `t.entry.rate` defaults
+    // stand (video: per-stream `frame_rate`, audio: `sample_rate / 1`).
+    // The two 32-bit values are written verbatim; the override does
+    // NOT alter the muxer's `(scale, rate)`-derived `dwLength`
+    // computation for audio streams (which still uses
+    // `t.entry.{scale,rate}` to convert running samples into
+    // `dwLength` units), does NOT touch `avih.dwMicroSecPerFrame`
+    // (independently derived from the first video stream's
+    // packaging pair), and does NOT cross-validate against the
+    // per-stream `dwLength` or `dwStart`. A `0` in either DWORD
+    // stamps the writer-skips-it / mathematically-undefined
+    // sentinel the demuxer maps back to `None`.
     let (scale_bytes, rate_bytes) = timebase_override.unwrap_or((t.entry.scale, t.entry.rate));
     strh.extend_from_slice(&scale_bytes.to_le_bytes());
     strh.extend_from_slice(&rate_bytes.to_le_bytes());
@@ -5272,15 +5270,15 @@ fn write_strl<W: Write + Seek + ?Sized>(
     strh.extend_from_slice(&start_override.unwrap_or(0).to_le_bytes()); // start
     strh.extend_from_slice(&0u32.to_le_bytes()); // length (patched)
     strh.extend_from_slice(&0u32.to_le_bytes()); // suggested_buffer_size (patched)
-                                                 // dwQuality (round-176): an `AviMuxOptions::with_stream_quality`
-                                                 // override (when present) stamps the per-stream quality indicator at
-                                                 // byte offset 40 per AVI 1.0 §"AVISTREAMHEADER" (`dwQuality` row in
-                                                 // `docs/container/riff/avi-riff-file-reference.md` line 246);
-                                                 // otherwise the legacy default is `0xFFFF_FFFF` (= `-1` as i32, the
-                                                 // documented "use default driver quality" sentinel — *"If set to -1,
-                                                 // drivers use the default quality value."* — which the demuxer maps
-                                                 // back to `None`). The 32-bit value is written verbatim; no clamp to
-                                                 // the documented `[0, 10_000]` range.
+    // dwQuality (round-176): an `AviMuxOptions::with_stream_quality`
+    // override (when present) stamps the per-stream quality indicator at
+    // byte offset 40 per AVI 1.0 §"AVISTREAMHEADER" (`dwQuality` row in
+    // `docs/container/riff/avi-riff-file-reference.md` line 246);
+    // otherwise the legacy default is `0xFFFF_FFFF` (= `-1` as i32, the
+    // documented "use default driver quality" sentinel — *"If set to -1,
+    // drivers use the default quality value."* — which the demuxer maps
+    // back to `None`). The 32-bit value is written verbatim; no clamp to
+    // the documented `[0, 10_000]` range.
     strh.extend_from_slice(&quality_override.unwrap_or(0xFFFF_FFFFu32).to_le_bytes());
     // dwSampleSize (round-222): an `AviMuxOptions::with_stream_sample_size`
     // override (when present) stamps the per-stream sample-size indicator
@@ -5367,7 +5365,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
             buf[2] = 0x01; // AVI_INDEX_SUB_2FIELD
         }
         buf[3] = 0x01; // AVI_INDEX_OF_CHUNKS
-                       // nEntriesInUse / qwBaseOffset: zero, back-patched.
+        // nEntriesInUse / qwBaseOffset: zero, back-patched.
         buf[8..12].copy_from_slice(&chunk_id);
         w.write_all(&buf)?;
         if payload_len & 1 == 1 {
@@ -5648,11 +5646,7 @@ fn audio_strf_avg_bytes_per_sec(strf: &[u8]) -> Option<u32> {
         return None;
     }
     let bps = u32::from_le_bytes([strf[8], strf[9], strf[10], strf[11]]);
-    if bps == 0 {
-        None
-    } else {
-        Some(bps)
-    }
+    if bps == 0 { None } else { Some(bps) }
 }
 
 fn sample_count_of_packet(
@@ -5669,10 +5663,10 @@ fn sample_count_of_packet(
         // the caller bothered to set it. The AVI strh.dwLength is in
         // the stream's ticks (= samples_per_sec for PCM-like audio),
         // so a positive `Packet.duration` lands directly here.
-        if let Some(d) = duration {
-            if d > 0 {
-                return d as u64;
-            }
+        if let Some(d) = duration
+            && d > 0
+        {
+            return d as u64;
         }
     }
     let _ = stream;

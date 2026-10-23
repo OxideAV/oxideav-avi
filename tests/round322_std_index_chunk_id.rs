@@ -26,7 +26,7 @@ use oxideav_core::{
     Packet, Rational, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, open_avi};
 
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();

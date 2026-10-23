@@ -78,8 +78,8 @@ use oxideav_core::{
     ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::demuxer::{open_avi as demuxer_open_avi, AVISF_DISABLED, AVISF_VIDEO_PALCHANGES};
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::demuxer::{AVISF_DISABLED, AVISF_VIDEO_PALCHANGES, open_avi as demuxer_open_avi};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.

@@ -24,7 +24,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, open_avi};
 
 /// Synthesise a CodecRegistry with `magicyuv` (video) + `pcm_s16le`
 /// (audio) entries so the AVI demuxer resolves both sides of the

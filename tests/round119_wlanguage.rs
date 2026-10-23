@@ -42,7 +42,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -143,10 +143,11 @@ fn default_no_override_reads_as_none() {
 
     assert_eq!(dmx.stream_language(0), None);
     assert_eq!(dmx.stream_language(1), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k.starts_with("avi:strh.") && k.ends_with(".language")));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k.starts_with("avi:strh.") && k.ends_with(".language"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -170,14 +171,16 @@ fn wlanguage_audio_override_roundtrip() {
     assert_eq!(dmx.stream_language(1), Some(0x0411));
     // Video stream 0 stays at the default (no metadata key emitted).
     assert_eq!(dmx.stream_language(0), None);
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.language" && v == "1041"));
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.language"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.1.language" && v == "1041")
+    );
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.language")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -221,10 +224,11 @@ fn explicit_zero_override_reads_as_none() {
         None,
         "an all-zero wLanguage must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.language"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.language")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -248,12 +252,14 @@ fn distinct_per_stream_langids_roundtrip_independently() {
     assert_eq!(dmx.stream_language(1), Some(0x0411));
 
     let md = dmx.metadata();
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.language" && v == "1033"));
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.language" && v == "1041"));
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:strh.0.language" && v == "1033")
+    );
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:strh.1.language" && v == "1041")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -391,10 +397,11 @@ fn handrolled_nonzero_wlanguage_decodes() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_language(0), Some(0x040C));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.language" && v == "1036"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.language" && v == "1036")
+    );
 }
 
 #[test]
@@ -405,10 +412,11 @@ fn handrolled_zero_wlanguage_parses_as_none() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_language(0), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.language"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.language")
+    );
 }
 
 #[test]
@@ -423,10 +431,11 @@ fn handrolled_all_bits_set_wlanguage_roundtrips() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_language(0), Some(0xFFFF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.language" && v == "65535"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.language" && v == "65535")
+    );
 }
 
 #[test]

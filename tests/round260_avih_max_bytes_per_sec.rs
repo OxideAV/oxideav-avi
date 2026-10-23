@@ -55,7 +55,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -208,10 +208,11 @@ fn explicit_zero_override_reads_as_none() {
         None,
         "an all-zero avih.dwMaxBytesPerSec must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:max_bytes_per_sec"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:max_bytes_per_sec")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -229,10 +230,11 @@ fn all_bits_set_avih_max_bytes_per_sec_roundtrip() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.max_bytes_per_sec(), Some(0xFFFF_FFFF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:max_bytes_per_sec" && v == "4294967295"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:max_bytes_per_sec" && v == "4294967295")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -388,10 +390,11 @@ fn handrolled_explicit_nonzero_avih_max_bytes_per_sec_decodes() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.max_bytes_per_sec(), Some(0xDEAD_BEEF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:max_bytes_per_sec" && v == "3735928559"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:max_bytes_per_sec" && v == "3735928559")
+    );
 }
 
 #[test]
@@ -401,8 +404,9 @@ fn handrolled_zero_avih_max_bytes_per_sec_parses_as_none() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.max_bytes_per_sec(), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:max_bytes_per_sec"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:max_bytes_per_sec")
+    );
 }

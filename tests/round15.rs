@@ -20,8 +20,8 @@ use oxideav_core::{
     ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::demuxer::{open_avi as demuxer_open_avi, TextChunk};
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::demuxer::{TextChunk, open_avi as demuxer_open_avi};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Test fixtures.

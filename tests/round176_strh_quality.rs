@@ -50,7 +50,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -157,10 +157,11 @@ fn default_no_override_reads_as_none() {
 
     assert_eq!(dmx.stream_quality(0), None);
     assert_eq!(dmx.stream_quality(1), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k.starts_with("avi:strh.") && k.ends_with(".quality")));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k.starts_with("avi:strh.") && k.ends_with(".quality"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -177,14 +178,16 @@ fn with_stream_quality_last_call_wins_per_index() {
         .with_stream_quality(1, 2000)
         .with_stream_quality(0, 9999);
     assert_eq!(opts.stream_qualities.len(), 2);
-    assert!(opts
-        .stream_qualities
-        .iter()
-        .any(|(idx, q)| *idx == 0 && *q == 9999));
-    assert!(opts
-        .stream_qualities
-        .iter()
-        .any(|(idx, q)| *idx == 1 && *q == 2000));
+    assert!(
+        opts.stream_qualities
+            .iter()
+            .any(|(idx, q)| *idx == 0 && *q == 9999)
+    );
+    assert!(
+        opts.stream_qualities
+            .iter()
+            .any(|(idx, q)| *idx == 1 && *q == 2000)
+    );
     // Older 1000 has been retained out.
     assert!(!opts.stream_qualities.iter().any(|(_, q)| *q == 1000));
 }
@@ -208,10 +211,11 @@ fn explicit_minus_one_override_reads_as_none() {
         None,
         "the documented `-1` (`0xFFFF_FFFF`) sentinel must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.quality"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.quality")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -230,10 +234,12 @@ fn documented_range_endpoints_roundtrip() {
     let rs_lo: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp_lo).unwrap());
     let dmx_lo = demuxer_open_avi(rs_lo, &reg).unwrap();
     assert_eq!(dmx_lo.stream_quality(0), Some(0));
-    assert!(dmx_lo
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.quality" && v == "0"));
+    assert!(
+        dmx_lo
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.quality" && v == "0")
+    );
 
     // High end: documented maximum 10_000 round-trips intact.
     let tmp_hi = std::env::temp_dir().join("oxideav-avi-r176-strh-q-10000.avi");
@@ -243,10 +249,12 @@ fn documented_range_endpoints_roundtrip() {
     let rs_hi: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp_hi).unwrap());
     let dmx_hi = demuxer_open_avi(rs_hi, &reg).unwrap();
     assert_eq!(dmx_hi.stream_quality(1), Some(10_000));
-    assert!(dmx_hi
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.quality" && v == "10000"));
+    assert!(
+        dmx_hi
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.1.quality" && v == "10000")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -273,10 +281,11 @@ fn out_of_spec_values_roundtrip_verbatim() {
         Some(0x0001_0000),
         "out-of-range values must round-trip verbatim with no clamp"
     );
-    assert!(dmx1
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.quality" && v == "65536"));
+    assert!(
+        dmx1.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.quality" && v == "65536")
+    );
 
     // Just below the sentinel — every bit except the `-1` marker is
     // legal data per spec.
@@ -287,10 +296,11 @@ fn out_of_spec_values_roundtrip_verbatim() {
     let rs2: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp2).unwrap());
     let dmx2 = demuxer_open_avi(rs2, &reg).unwrap();
     assert_eq!(dmx2.stream_quality(1), Some(0x7FFF_FFFE));
-    assert!(dmx2
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.quality" && v == "2147483646"));
+    assert!(
+        dmx2.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.1.quality" && v == "2147483646")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -312,12 +322,14 @@ fn per_stream_qualities_are_independent() {
     assert_eq!(dmx.stream_quality(0), Some(8000));
     assert_eq!(dmx.stream_quality(1), Some(2500));
     let md = dmx.metadata();
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.quality" && v == "8000"));
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.quality" && v == "2500"));
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:strh.0.quality" && v == "8000")
+    );
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:strh.1.quality" && v == "2500")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -496,10 +508,11 @@ fn handrolled_explicit_quality_decodes() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.stream_quality(0), Some(0xDEAD_BEEF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.quality" && v == "3735928559"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.quality" && v == "3735928559")
+    );
 }
 
 #[test]
@@ -513,8 +526,9 @@ fn handrolled_minus_one_quality_parses_as_none() {
         None,
         "hand-rolled 0xFFFF_FFFF (`-1` sentinel) must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.quality"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.quality")
+    );
 }

@@ -50,7 +50,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -158,10 +158,11 @@ fn default_no_override_reads_as_none() {
 
     assert_eq!(dmx.stream_priority(0), None);
     assert_eq!(dmx.stream_priority(1), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k.starts_with("avi:strh.") && k.ends_with(".priority")));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k.starts_with("avi:strh.") && k.ends_with(".priority"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -178,14 +179,16 @@ fn with_stream_priority_last_call_wins_per_index() {
         .with_stream_priority(1, 20)
         .with_stream_priority(0, 99);
     assert_eq!(opts.stream_priorities.len(), 2);
-    assert!(opts
-        .stream_priorities
-        .iter()
-        .any(|(idx, p)| *idx == 0 && *p == 99));
-    assert!(opts
-        .stream_priorities
-        .iter()
-        .any(|(idx, p)| *idx == 1 && *p == 20));
+    assert!(
+        opts.stream_priorities
+            .iter()
+            .any(|(idx, p)| *idx == 0 && *p == 99)
+    );
+    assert!(
+        opts.stream_priorities
+            .iter()
+            .any(|(idx, p)| *idx == 1 && *p == 20)
+    );
     // Older 10 has been retained out.
     assert!(!opts.stream_priorities.iter().any(|(_, p)| *p == 10));
 }
@@ -209,10 +212,11 @@ fn explicit_zero_override_reads_as_none() {
         None,
         "the legacy `0` writer default must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.priority"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.priority")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -233,10 +237,12 @@ fn boundary_values_roundtrip_verbatim() {
     let rs_lo: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp_lo).unwrap());
     let dmx_lo = demuxer_open_avi(rs_lo, &reg).unwrap();
     assert_eq!(dmx_lo.stream_priority(0), Some(1));
-    assert!(dmx_lo
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.priority" && v == "1"));
+    assert!(
+        dmx_lo
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.priority" && v == "1")
+    );
 
     // Largest representable: u16::MAX round-trips intact — the
     // demuxer does not clamp or normalise.
@@ -247,10 +253,12 @@ fn boundary_values_roundtrip_verbatim() {
     let rs_hi: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp_hi).unwrap());
     let dmx_hi = demuxer_open_avi(rs_hi, &reg).unwrap();
     assert_eq!(dmx_hi.stream_priority(1), Some(u16::MAX));
-    assert!(dmx_hi
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.priority" && v == "65535"));
+    assert!(
+        dmx_hi
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.1.priority" && v == "65535")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -272,12 +280,14 @@ fn per_stream_priorities_are_independent() {
     assert_eq!(dmx.stream_priority(0), Some(7));
     assert_eq!(dmx.stream_priority(1), Some(3));
     let md = dmx.metadata();
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.priority" && v == "7"));
-    assert!(md
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.priority" && v == "3"));
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:strh.0.priority" && v == "7")
+    );
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "avi:strh.1.priority" && v == "3")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -460,10 +470,11 @@ fn handrolled_explicit_priority_decodes() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.stream_priority(0), Some(0x1234));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.priority" && v == "4660"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.priority" && v == "4660")
+    );
 }
 
 #[test]
@@ -477,8 +488,9 @@ fn handrolled_zero_priority_parses_as_none() {
         None,
         "hand-rolled `0` (legacy default) must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.priority"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.priority")
+    );
 }

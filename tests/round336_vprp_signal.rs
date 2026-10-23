@@ -28,8 +28,8 @@ use oxideav_core::{
     ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::demuxer::{open_avi as demuxer_open_avi, VprpVideoFormat, VprpVideoStandard};
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig};
+use oxideav_avi::demuxer::{VprpVideoFormat, VprpVideoStandard, open_avi as demuxer_open_avi};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig, open_with_options};
 use oxideav_core::MediaType;
 
 fn registry_with_magicyuv() -> CodecRegistry {

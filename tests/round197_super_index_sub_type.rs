@@ -39,7 +39,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open as demuxer_open;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, open_avi};
 
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();

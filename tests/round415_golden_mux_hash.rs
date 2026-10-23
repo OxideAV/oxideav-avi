@@ -19,7 +19,7 @@ use oxideav_core::{
     StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::muxer::{open_with_kind, AviKind, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, RiffSegmentLimit, open_with_kind};
 
 /// FNV-1a 64-bit over the whole file image.
 fn fnv1a64(bytes: &[u8]) -> u64 {

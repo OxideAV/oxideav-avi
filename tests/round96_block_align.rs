@@ -27,7 +27,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, open_avi};
 
 /// Registry resolving the video FourCC + PCM and MP3 wave-format tags
 /// so the demuxer routes both audio carriages. No real codec crates

@@ -17,7 +17,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::muxer::{
-    open_avi, open_with_options, AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig,
+    AviKind, AviMuxOptions, RiffSegmentLimit, VprpConfig, open_avi, open_with_options,
 };
 
 /// Synthetic registry entry for the FOURCC ↔ codec_id mapping the

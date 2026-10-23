@@ -52,7 +52,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -301,10 +301,11 @@ fn handrolled_declared_matches_actual_no_mismatch() {
     assert_eq!(dmx.avih_declared_stream_count(), Some(2));
     assert_eq!(dmx.streams().len(), 2);
     assert_eq!(dmx.declared_vs_actual_stream_count_mismatch(), None);
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:streams" && v == "2"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:streams" && v == "2")
+    );
 }
 
 #[test]
@@ -355,10 +356,11 @@ fn handrolled_overdeclared_streams_surfaces_mismatch() {
         "over-declared dwStreams must surface as (declared, actual)"
     );
     // The raw declared count still round-trips through the metadata key.
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:streams" && v == "3"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:streams" && v == "3")
+    );
 }
 
 #[test]

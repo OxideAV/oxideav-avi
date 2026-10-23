@@ -21,11 +21,11 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::{
-    open_avi as demuxer_open_avi, open_avi_lenient, WAVE_FORMAT_AAC_ADTS, WAVE_FORMAT_AC3,
-    WAVE_FORMAT_DTS, WAVE_FORMAT_OPUS, WAVE_FORMAT_WMA1, WAVE_FORMAT_WMA2,
-    WAVE_FORMAT_WMA_LOSSLESS, WAVE_FORMAT_WMA_PRO,
+    WAVE_FORMAT_AAC_ADTS, WAVE_FORMAT_AC3, WAVE_FORMAT_DTS, WAVE_FORMAT_OPUS,
+    WAVE_FORMAT_WMA_LOSSLESS, WAVE_FORMAT_WMA_PRO, WAVE_FORMAT_WMA1, WAVE_FORMAT_WMA2,
+    open_avi as demuxer_open_avi, open_avi_lenient,
 };
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, open_avi};
 
 // ---------------------------------------------------------------------------
 // Test fixtures.

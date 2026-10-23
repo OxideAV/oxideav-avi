@@ -46,7 +46,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -148,10 +148,11 @@ fn default_no_override_reads_as_none() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.initial_frames(), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:initial_frames"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:initial_frames")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -185,10 +186,11 @@ fn explicit_zero_override_reads_as_none() {
         None,
         "an all-zero avih.dwInitialFrames must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:initial_frames"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:initial_frames")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -206,10 +208,11 @@ fn all_bits_set_avih_initial_frames_roundtrip() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.initial_frames(), Some(0xFFFF_FFFF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:initial_frames" && v == "4294967295"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:initial_frames" && v == "4294967295")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -377,10 +380,11 @@ fn handrolled_explicit_nonzero_avih_initial_frames_decodes() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.initial_frames(), Some(0xDEAD_BEEF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:initial_frames" && v == "3735928559"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:initial_frames" && v == "3735928559")
+    );
 }
 
 #[test]
@@ -390,8 +394,9 @@ fn handrolled_zero_avih_initial_frames_parses_as_none() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.initial_frames(), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:initial_frames"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:initial_frames")
+    );
 }

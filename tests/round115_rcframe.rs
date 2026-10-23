@@ -45,7 +45,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -147,17 +147,19 @@ fn default_video_rect_surfaces_audio_rect_is_none() {
 
     // Video stream 0: default rect is 0,0,width,height = 0,0,64,48.
     assert_eq!(dmx.stream_frame_rect(0), Some((0, 0, 64, 48)));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.frame_rect" && v == "0,0,64,48"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.frame_rect" && v == "0,0,64,48")
+    );
 
     // Audio stream 1: default rect is all-zero ⇒ None, no metadata key.
     assert_eq!(dmx.stream_frame_rect(1), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.1.frame_rect"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.1.frame_rect")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -175,10 +177,11 @@ fn rcframe_audio_override_roundtrip() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_frame_rect(1), Some((1, 2, 3, 4)));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.1.frame_rect" && v == "1,2,3,4"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.1.frame_rect" && v == "1,2,3,4")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -223,10 +226,11 @@ fn explicit_zero_override_reads_as_none() {
         None,
         "an all-zero rcFrame must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.frame_rect"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.frame_rect")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -244,10 +248,11 @@ fn negative_coordinates_roundtrip() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_frame_rect(0), Some((-10, -20, 30, 40)));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.frame_rect" && v == "-10,-20,30,40"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.frame_rect" && v == "-10,-20,30,40")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -377,10 +382,11 @@ fn handrolled_nonzero_rcframe_decodes() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_frame_rect(0), Some((100, 200, 300, 400)));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:strh.0.frame_rect" && v == "100,200,300,400"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:strh.0.frame_rect" && v == "100,200,300,400")
+    );
 }
 
 #[test]
@@ -391,10 +397,11 @@ fn handrolled_zero_rcframe_parses_as_none() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_frame_rect(0), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.frame_rect"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.frame_rect")
+    );
 }
 
 #[test]
@@ -408,10 +415,11 @@ fn handrolled_short_48byte_strh_has_no_rcframe() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.stream_frame_rect(0), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:strh.0.frame_rect"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:strh.0.frame_rect")
+    );
 }
 
 // ---------------------------------------------------------------------------

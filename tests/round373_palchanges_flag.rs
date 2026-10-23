@@ -17,8 +17,8 @@ use oxideav_core::{
     Rational, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::demuxer::{open_avi as demuxer_open_avi, AVISF_VIDEO_PALCHANGES};
-use oxideav_avi::muxer::{open_avi as muxer_open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::demuxer::{AVISF_VIDEO_PALCHANGES, open_avi as demuxer_open_avi};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi as muxer_open_avi};
 
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();

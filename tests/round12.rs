@@ -25,10 +25,10 @@ use oxideav_core::{
 fn _muxer_trait_in_scope<M: Muxer>() {}
 
 use oxideav_avi::demuxer::{
-    open_avi as demuxer_open_avi, AVIF_COPYRIGHTED, AVIF_HASINDEX, AVIF_MUSTUSEINDEX,
-    AVIF_TRUSTCKTYPE, AVIF_WASCAPTUREFILE,
+    AVIF_COPYRIGHTED, AVIF_HASINDEX, AVIF_MUSTUSEINDEX, AVIF_TRUSTCKTYPE, AVIF_WASCAPTUREFILE,
+    open_avi as demuxer_open_avi,
 };
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit, DEFAULT_AVIH_FLAGS};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, DEFAULT_AVIH_FLAGS, RiffSegmentLimit, open_avi};
 
 // ---------------------------------------------------------------------------
 // Test fixtures (independent of round-11.rs to avoid cross-file fixture
@@ -474,6 +474,6 @@ fn all_info_for_returns_empty_on_non_4_char_key() {
     assert!(dmx.all_info_for("INA").is_empty()); // 3 chars
     assert!(dmx.all_info_for("INAMX").is_empty()); // 5 chars
     assert!(dmx.all_info_for("").is_empty()); // empty
-                                              // The valid 4-char key still works.
+    // The valid 4-char key still works.
     assert_eq!(dmx.all_info_for("INAM"), vec!["Title"]);
 }

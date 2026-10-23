@@ -40,7 +40,7 @@
 use libfuzzer_sys::fuzz_target;
 use std::io::Cursor;
 
-use oxideav_avi_fuzz::{registry, MuxPlan, Recipe};
+use oxideav_avi_fuzz::{MuxPlan, Recipe, registry};
 use oxideav_core::{Demuxer as _, Error, ReadSeek};
 
 fuzz_target!(|data: &[u8]| {

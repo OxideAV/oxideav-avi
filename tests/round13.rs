@@ -18,10 +18,10 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::{
-    open_avi as demuxer_open_avi, PaletteChange, PaletteEntry, AVIF_COPYRIGHTED, AVIF_HASINDEX,
-    AVIF_ISINTERLEAVED, AVIF_MUSTUSEINDEX, AVIF_TRUSTCKTYPE, AVIF_WASCAPTUREFILE,
+    AVIF_COPYRIGHTED, AVIF_HASINDEX, AVIF_ISINTERLEAVED, AVIF_MUSTUSEINDEX, AVIF_TRUSTCKTYPE,
+    AVIF_WASCAPTUREFILE, PaletteChange, PaletteEntry, open_avi as demuxer_open_avi,
 };
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, DEFAULT_AVIH_FLAGS};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, DEFAULT_AVIH_FLAGS, open_avi};
 
 // ---------------------------------------------------------------------------
 // Test fixtures (self-contained per the workspace per-round-test convention).

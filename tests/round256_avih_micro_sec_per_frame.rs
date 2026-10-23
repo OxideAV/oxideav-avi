@@ -57,7 +57,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_avi};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -177,10 +177,11 @@ fn default_no_override_reads_as_computed_frame_period() {
 
     // 25fps video → 1_000_000 / 25 = 40000 microseconds per frame.
     assert_eq!(dmx.micro_sec_per_frame(), Some(40000));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:micro_sec_per_frame" && v == "40000"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:micro_sec_per_frame" && v == "40000")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -203,10 +204,11 @@ fn audio_only_no_override_reads_as_none() {
         None,
         "audio-only file should default to dwMicroSecPerFrame = 0 → None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:micro_sec_per_frame"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:micro_sec_per_frame")
+    );
 }
 
 #[test]
@@ -224,10 +226,11 @@ fn audio_only_with_override_stamps_nominal_period() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.micro_sec_per_frame(), Some(1000));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:micro_sec_per_frame" && v == "1000"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:micro_sec_per_frame" && v == "1000")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -261,10 +264,11 @@ fn explicit_zero_override_reads_as_none() {
         None,
         "an all-zero avih.dwMicroSecPerFrame must read back as None"
     );
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:micro_sec_per_frame"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:micro_sec_per_frame")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -282,10 +286,11 @@ fn all_bits_set_avih_micro_sec_per_frame_roundtrip() {
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
     assert_eq!(dmx.micro_sec_per_frame(), Some(0xFFFF_FFFF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:micro_sec_per_frame" && v == "4294967295"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:micro_sec_per_frame" && v == "4294967295")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -440,10 +445,11 @@ fn handrolled_explicit_nonzero_avih_micro_sec_per_frame_decodes() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.micro_sec_per_frame(), Some(0xDEAD_BEEF));
-    assert!(dmx
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "avi:micro_sec_per_frame" && v == "3735928559"));
+    assert!(
+        dmx.metadata()
+            .iter()
+            .any(|(k, v)| k == "avi:micro_sec_per_frame" && v == "3735928559")
+    );
 }
 
 #[test]
@@ -453,8 +459,9 @@ fn handrolled_zero_avih_micro_sec_per_frame_parses_as_none() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(buf));
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
     assert_eq!(dmx.micro_sec_per_frame(), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:micro_sec_per_frame"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:micro_sec_per_frame")
+    );
 }

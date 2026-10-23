@@ -16,7 +16,7 @@ use oxideav_core::{
     ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 
-use oxideav_avi::muxer::{open_with_kind, AviKind, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, RiffSegmentLimit, open_with_kind};
 
 /// Build a CodecRegistry with a synthetic `M8RG` ↔ `"magicyuv"` tag
 /// claim so the demuxer's forward `resolve_tag` direction surfaces

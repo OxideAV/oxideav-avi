@@ -18,7 +18,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi as demuxer_open_avi;
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_with_options};
 use oxideav_avi::stream_format::RgbQuad;
 
 fn registry() -> CodecRegistry {

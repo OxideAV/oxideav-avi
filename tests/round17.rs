@@ -16,10 +16,10 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::{
-    open_avi as demuxer_open_avi, Idx1Flags, AVIIF_COMPRESSOR, AVIIF_FIRSTPART, AVIIF_KEYFRAME,
-    AVIIF_LASTPART, AVIIF_LIST, AVIIF_NO_TIME,
+    AVIIF_COMPRESSOR, AVIIF_FIRSTPART, AVIIF_KEYFRAME, AVIIF_LASTPART, AVIIF_LIST, AVIIF_NO_TIME,
+    Idx1Flags, open_avi as demuxer_open_avi,
 };
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, open_avi};
 
 // ---------------------------------------------------------------------------
 // Test fixtures.

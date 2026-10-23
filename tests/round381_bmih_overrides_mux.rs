@@ -21,7 +21,7 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::open_avi;
-use oxideav_avi::muxer::{open_with_options, AviKind, AviMuxOptions};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, open_with_options};
 
 fn registry_with_magicyuv() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
@@ -104,10 +104,11 @@ fn default_size_image_is_zero_and_absent() {
     // No override ⇒ muxer default 0 ⇒ demuxer folds to None, no key.
     let dmx = build_and_open(AviMuxOptions::new(), "size-default");
     assert_eq!(dmx.stream_size_image(0), None);
-    assert!(!dmx
-        .metadata()
-        .iter()
-        .any(|(k, _)| k == "avi:vids.0.size_image"));
+    assert!(
+        !dmx.metadata()
+            .iter()
+            .any(|(k, _)| k == "avi:vids.0.size_image")
+    );
 }
 
 #[test]

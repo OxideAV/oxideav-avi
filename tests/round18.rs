@@ -17,9 +17,9 @@ use oxideav_core::{
 };
 
 use oxideav_avi::demuxer::{
-    open_avi as demuxer_open_avi, open_avi_strict, AVIIF_KEYFRAME, AVIIF_NO_TIME,
+    AVIIF_KEYFRAME, AVIIF_NO_TIME, open_avi as demuxer_open_avi, open_avi_strict,
 };
-use oxideav_avi::muxer::{open_avi, AviKind, AviMuxOptions, RiffSegmentLimit};
+use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit, open_avi};
 
 // ---------------------------------------------------------------------------
 // Test fixtures.
