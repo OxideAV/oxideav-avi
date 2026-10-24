@@ -43,6 +43,10 @@ pub(crate) struct StrfEntry {
     /// per second). For video we use frame_rate; for audio sample_rate/1.
     pub scale: u32,
     pub rate: u32,
+    /// `rawvideo` streams whose on-wire rows differ from the packed
+    /// top-down packet layout (DWORD row padding): each packet is
+    /// re-laid-out before it is written.
+    pub raw_layout: Option<crate::raw_dib::RawLayout>,
 }
 
 /// Build the `strf` chunk + `strh` metadata for the given stream.
@@ -113,6 +117,7 @@ pub(crate) fn build_strf(
             let (scale, rate) = (time_base.0.max(1), time_base.1.max(1));
             Ok(StrfEntry {
                 chunk_suffix: *b"tx",
+                raw_layout: None,
                 handler_fourcc: [0u8; 4],
                 strf: params.extradata.clone(),
                 strh_type: *b"txts",
@@ -280,6 +285,37 @@ fn build_video_strf(
     let height = params
         .height
         .ok_or_else(|| Error::invalid("avi muxer: video stream missing height"))?;
+    // `rawvideo`: the pixel format picks the DIB (`BI_RGB` /
+    // `BI_BITFIELDS` + masks) or raw-FourCC header; packets are packed
+    // top-down rows, so a DIB is written top-down (negative
+    // `biHeight`) and rows are padded to the DWORD stride when needed.
+    if params.codec_id.as_str() == "rawvideo" {
+        let fmt = params
+            .pixel_format
+            .ok_or_else(|| Error::invalid("avi muxer: rawvideo stream missing pixel_format"))?;
+        let (compression, bit_count, masks, rule) =
+            crate::raw_dib::header_for(fmt).ok_or_else(|| {
+                Error::unsupported(format!(
+                    "avi muxer: rawvideo pixel format {fmt:?} has no AVI DIB / FourCC layout"
+                ))
+            })?;
+        let dib = rule == crate::raw_dib::RowRule::Dib;
+        let strf =
+            write_bitmap_info_header_oriented(width, height, compression, bit_count, &masks, dib);
+        let raw_layout = crate::raw_dib::RawLayout::new(fmt, rule, width, height, true)
+            .filter(|l| !l.is_identity());
+        let (scale, rate) = video_scale_rate(params);
+        return Ok(StrfEntry {
+            chunk_suffix: if dib { *b"db" } else { *b"dc" },
+            raw_layout,
+            handler_fourcc: compression,
+            strf,
+            strh_type: *b"vids",
+            sample_size: 0,
+            scale,
+            rate,
+        });
+    }
     let fourcc = video_fourcc(params)?;
     // Round-377: an indexed (palettised) BI_RGB DIB override. When the
     // caller registered the stream via `with_indexed_video`, emit a
@@ -293,6 +329,7 @@ fn build_video_strf(
         let (scale, rate) = video_scale_rate(params);
         return Ok(StrfEntry {
             chunk_suffix: *b"db",
+            raw_layout: None,
             handler_fourcc: [0, 0, 0, 0],
             strf,
             strh_type: *b"vids",
@@ -324,6 +361,7 @@ fn build_video_strf(
     };
     Ok(StrfEntry {
         chunk_suffix,
+        raw_layout: None,
         handler_fourcc: fourcc,
         strf,
         strh_type: *b"vids",
@@ -385,6 +423,7 @@ fn build_audio_strf(
         };
         return Ok(StrfEntry {
             chunk_suffix: *b"wb",
+            raw_layout: None,
             handler_fourcc: *b"\0\0\0\0",
             strf,
             strh_type: *b"auds",
@@ -423,6 +462,7 @@ fn build_audio_strf(
         );
         return Ok(StrfEntry {
             chunk_suffix: *b"wb",
+            raw_layout: None,
             handler_fourcc: *b"\0\0\0\0",
             strf,
             strh_type: *b"auds",
@@ -447,6 +487,7 @@ fn build_audio_strf(
         );
         return Ok(StrfEntry {
             chunk_suffix: *b"wb",
+            raw_layout: None,
             handler_fourcc: *b"\0\0\0\0",
             strf,
             strh_type: *b"auds",
@@ -471,6 +512,7 @@ fn build_audio_strf(
     );
     Ok(StrfEntry {
         chunk_suffix: *b"wb",
+        raw_layout: None,
         handler_fourcc: *b"\0\0\0\0",
         strf,
         strh_type: *b"auds",

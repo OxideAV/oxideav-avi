@@ -2396,10 +2396,36 @@ fn open_avi_inner(
         })
         .collect();
 
+    // `rawvideo` streams: how each on-wire frame maps onto the packed
+    // top-down packet layout the `rawvideo` decoder takes.
+    let raw_layouts: Vec<Option<crate::raw_dib::RawLayout>> = streams
+        .iter()
+        .enumerate()
+        .map(|(i, st)| {
+            let p = &st.params;
+            if p.codec_id.as_str() != "rawvideo" {
+                return None;
+            }
+            let rule = match p.tag {
+                Some(CodecTag::Fourcc(f)) if f == [0; 4] || f == [3, 0, 0, 0] => {
+                    crate::raw_dib::RowRule::Dib
+                }
+                _ => crate::raw_dib::RowRule::PackedTopDown,
+            };
+            let top_down = video_strfs
+                .get(i)
+                .and_then(|v| v.as_ref())
+                .is_some_and(|v| v.top_down);
+            crate::raw_dib::RawLayout::new(p.pixel_format?, rule, p.width?, p.height?, top_down)
+                .filter(|l| !l.is_identity())
+        })
+        .collect();
+
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
     Ok(AviDemuxer {
+        raw_layouts,
         input,
         streams,
         packet_chunk_suffix,
@@ -4707,10 +4733,29 @@ fn build_stream(
             if let Some(b) = &bmih {
                 ctx = ctx.width(b.width).height(b.height);
             }
-            let codec_id = codecs
-                .resolve_tag(&ctx)
-                .unwrap_or_else(|| video_codec_id_fallback(&compression));
+            // Uncompressed DIB / raw-FourCC layouts are fully defined
+            // by the header (VfW `BITMAPINFOHEADER` §biCompression /
+            // §biBitCount): surface them as the fleet's `rawvideo`
+            // codec + an explicit pixel format, ahead of any tag claim.
+            let raw = bmih.as_ref().and_then(|b| {
+                let masks = if b.compression == crate::stream_format::BI_BITFIELDS {
+                    crate::stream_format::parse_bitfields_masks(&b.extradata)
+                } else {
+                    None
+                };
+                crate::raw_dib::pixel_format_for(b.compression, b.bit_count, masks)
+            });
+            let codec_id = if raw.is_some() {
+                CodecId::new("rawvideo")
+            } else {
+                codecs
+                    .resolve_tag(&ctx)
+                    .unwrap_or_else(|| video_codec_id_fallback(&compression))
+            };
             let mut p = CodecParameters::video(codec_id.clone());
+            if let Some((fmt, _)) = raw {
+                p.pixel_format = Some(fmt);
+            }
             // Stamp the on-wire FourCC straight onto the params so a
             // muxer re-emitting this stream round-trips byte-for-byte
             // (no walking the registry's first-declared tag).
@@ -4758,7 +4803,7 @@ fn build_stream(
             // Frame rate from scale/rate (rate/scale = fps).
             p.frame_rate = Some(Rational::new(rate as i64, scale as i64));
             // MJPEG packets from AVI should be flagged as standalone JPEGs.
-            let suffix = if codec_id.as_str() == "rgb24" {
+            let suffix = if matches!(codec_id.as_str(), "rgb24" | "rawvideo") {
                 *b"db"
             } else {
                 *b"dc"
@@ -5881,6 +5926,10 @@ pub struct AviDemuxer {
     /// by stream number; `None` for non-video streams or video streams
     /// whose `strf` payload was empty / shorter than 40 bytes.
     video_strf: Vec<Option<VideoStrfInfo>>,
+    /// Per-stream on-wire → `rawvideo` packet row conversion; `Some`
+    /// only for `rawvideo` streams whose frames are bottom-up or
+    /// stride-padded (others pass through untouched).
+    raw_layouts: Vec<Option<crate::raw_dib::RawLayout>>,
     /// Per-audio-stream WAVEFORMATEX(TENSIBLE)-derived side-info
     /// (channel mask, valid bits per sample, SubFormat GUID) — round-75
     /// per Microsoft `mmreg.h` §"WAVEFORMATEXTENSIBLE" and
@@ -7821,6 +7870,10 @@ impl Demuxer for AviDemuxer {
                             Err(e) => return Err(e),
                         };
                         skip_pad(&mut *self.input, hdr.size)?;
+                        let data = match self.raw_layouts.get(idx as usize) {
+                            Some(Some(l)) => l.unpack(data),
+                            _ => data,
+                        };
                         let stream = &self.streams[idx as usize];
                         let counter = self.per_stream_counter[idx as usize];
                         // PTS: for video the counter is a frame index in the

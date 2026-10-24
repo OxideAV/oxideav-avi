@@ -157,12 +157,34 @@ decoder.
 | `indeo3`/`indeo4`/`indeo5` | `IV31`/`IV32`, `IV41`/`IV42`, `IV50`                                                  |
 | `svq1` / `svq3`| `SVQ1`, `SVQ3`                                                                                  |
 | `flv1`         | `FLV1`                                                                                          |
-| `rgb24`        | `BI_RGB` (all-zero FourCC), `DIB `, `RGB `, `RAW `                                              |
+| `rgb24`        | `DIB `, `RGB `, `RAW ` (resolver claims; header-defined DIBs map to `rawvideo`, below)           |
 | `yuyv422` / `uyvy422` | `YUY2`/`YUYV`/`V422`/`YUNV`, `UYVY`/`Y422`/`UYNV`                                        |
 | `nv12` / `nv21`| `NV12`, `NV21`                                                                                  |
 | `yuv420p`      | `I420`, `IYUV`, `YV12`                                                                          |
 | `yuv411p`      | `Y41P`                                                                                          |
 | `yuv444p10le` / `v210` / `r210` | `V410`, `V210`, `R210`/`R10K`                                                  |
+
+### Uncompressed video → `rawvideo`
+
+Header-defined uncompressed layouts bypass the tag resolver and surface
+as codec id `rawvideo` with `CodecParameters::pixel_format` set; packets
+are re-laid-out to the packed top-down rows the `rawvideo` decoder
+takes (bottom-up DIBs — positive `biHeight` — are flipped, DWORD row
+padding is dropped; already-packed top-down frames pass through as-is):
+
+| `biCompression` / `biBitCount` | pixel format |
+|--------------------------------|--------------|
+| `BI_RGB` 16 | `Rgb555Le` |
+| `BI_RGB` 24 | `Bgr24` |
+| `BI_RGB` 32 | `Bgrx` (high byte unused) |
+| `BI_BITFIELDS` 16, masks 7C00/03E0/001F · F800/07E0/001F · 001F/03E0/7C00 · 001F/07E0/F800 | `Rgb555Le` · `Rgb565Le` · `Bgr555Le` · `Bgr565Le` |
+| `BI_BITFIELDS` 32, masks FF0000/FF00/FF · FF/FF00/FF0000 · FF00/FF0000/FF000000 · FF000000/FF0000/FF00 | `Bgrx` · `Rgbx` · `Xrgb` · `Xbgr` |
+| `RGBA` 32 | `Rgba` (packed, top-down) |
+
+The muxer writes `rawvideo` streams of those pixel formats back as a
+top-down DIB (negative `biHeight`, rows padded to the DWORD stride) or
+the `RGBA` FourCC; other pixel formats are refused at `open`. Palettised
+(1/4/8 bpp) DIBs keep the legacy path.
 
 ### Audio wFormatTag to codec id
 
@@ -195,7 +217,7 @@ decoder.
 
 Muxer-side packaging (`strf` + `strh`) is implemented for a subset of
 the above: `mjpeg`, `ffv1`, `mpeg1video`, `mpeg2video`, `mpeg4video`,
-`h263`, `h264`, `h265`, `vp8`, `vp9`, `av1`, `magicyuv`, `rgb24`, all
+`h263`, `h264`, `h265`, `vp8`, `vp9`, `av1`, `magicyuv`, `rgb24`, `rawvideo`, all
 six raw PCM variants (`pcm_u8`/`s16le`/`s24le`/`s32le`/`f32le`/`f64le`),
 `pcm_alaw`, `pcm_mulaw`, `mp2`, `mp3`, `aac`, `ac3`, `eac3`, `flac`.
 Other codec ids return `Error::Unsupported` at `open()`.

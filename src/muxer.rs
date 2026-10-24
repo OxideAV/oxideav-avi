@@ -3514,6 +3514,20 @@ impl Muxer for AviMuxer {
         if packet.data.len() > u32::MAX as usize {
             return Err(Error::invalid("avi muxer: packet larger than 4 GiB"));
         }
+        // `rawvideo` rows padded out to the on-wire DIB stride.
+        let relaid;
+        let packet = match self.tracks[idx].entry.raw_layout.as_ref() {
+            Some(l) if !packet.flags.header => match l.pack(&packet.data) {
+                Some(data) => {
+                    let mut p = packet.clone();
+                    p.data = data;
+                    relaid = p;
+                    &relaid
+                }
+                None => packet,
+            },
+            _ => packet,
+        };
 
         // Position of the upcoming packet chunk header, queried at
         // most once (round-415 perf): the OpenDML segment-roll

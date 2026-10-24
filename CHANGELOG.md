@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Uncompressed video (`BI_RGB` 16/24/32 bpp, `BI_BITFIELDS` 16/32 bpp
+  with the standard masks, the `RGBA` FourCC) surfaces as the fleet's
+  `rawvideo` codec with an explicit pixel format (`Rgb555Le` / `Bgr24` /
+  `Bgrx` / `Rgb565Le` / … / `Rgba`) instead of `rgb24` / `avi:RGBA`, so
+  it decodes. Packets are re-laid-out to packed top-down rows: bottom-up
+  DIBs (positive `biHeight`) are flipped and DWORD row padding dropped.
+- The muxer packages `rawvideo` streams of those pixel formats as a
+  top-down DIB (negative `biHeight`, `BI_BITFIELDS` masks where needed,
+  rows padded to the DWORD stride) or the `RGBA` FourCC.
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
