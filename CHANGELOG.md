@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **H.264 / H.265 / VP9 / AV1 streams report their decoded pixel
+  format.** The `BITMAPINFOHEADER` does not state it for compressed
+  video, so the demuxer reads the codec's parameter sets — a
+  configuration record (`avcC` / `hvcC` / `av1C`) or Annex B NAL units
+  after the header when the writer put them there, else the stream's
+  first frame in `movi` (H.264 / H.265 SPS, VP9 key-frame header, AV1
+  Sequence Header OBU), found by a bounded chunk walk at open. The SPS
+  cropping window also gives `width` / `height` when the header
+  declares the coded size. Motion JPEG stays `None`: nothing in the
+  header or the `MJPG` FourCC states its sampling. Verified against
+  ffprobe on ffmpeg-made fixtures in `tests/stream_parameters.rs`.
+
 ### Fixed
+
+- `frame_rate` is `dwRate / dwScale` reduced, and `None` when either is
+  zero (was the unreduced pair, with a zero clamped to 1).
 
 - Uncompressed video (`BI_RGB` 16/24/32 bpp, `BI_BITFIELDS` 16/32 bpp
   with the standard masks, the `RGBA` FourCC) surfaces as the fleet's

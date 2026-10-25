@@ -2396,6 +2396,11 @@ fn open_avi_inner(
         })
         .collect();
 
+    // Compressed video: the decoded layout (and, for H.264 / H.265, the
+    // cropped output size) the codec's parameter sets state — after
+    // the BITMAPINFOHEADER, or in-band in the stream's first frame.
+    fill_layouts_from_parameter_sets(&mut *input, &mut streams, &movi_segments);
+
     // `rawvideo` streams: how each on-wire frame maps onto the packed
     // top-down packet layout the `rawvideo` decoder takes.
     let raw_layouts: Vec<Option<crate::raw_dib::RawLayout>> = streams
@@ -4801,7 +4806,7 @@ fn build_stream(
                 });
             }
             // Frame rate from scale/rate (rate/scale = fps).
-            p.frame_rate = Some(Rational::new(rate as i64, scale as i64));
+            p.frame_rate = frame_rate_from_strh(rate_raw, scale_raw);
             // MJPEG packets from AVI should be flagged as standalone JPEGs.
             let suffix = if matches!(codec_id.as_str(), "rgb24" | "rawvideo") {
                 *b"db"
@@ -5037,6 +5042,119 @@ fn build_stream(
 /// uses for unknown-FourCC palette / text / data side-band keys
 /// (see the `key` branch in [`scan_idx1_for_sideband_summary`] and
 /// the `avi_namespaced` branches around line 4935).
+/// `strh` `dwRate / dwScale` as a reduced frame rate (VfW: "Dividing
+/// dwRate by dwScale gives the number of samples per second"); `None`
+/// when either is zero.
+fn frame_rate_from_strh(rate: u32, scale: u32) -> Option<Rational> {
+    if rate == 0 || scale == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (rate, scale);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    Some(Rational::new(i64::from(rate / a), i64::from(scale / a)))
+}
+
+/// How far into `movi` [`fill_layouts_from_parameter_sets`] reads
+/// before giving up on a stream's first frame.
+const FIRST_FRAME_PEEK_BYTES: u64 = 4 << 20;
+
+/// Fill `pixel_format` (and correct `width` / `height` to the cropped
+/// output size) for every H.264 / H.265 / VP9 / AV1 video stream from
+/// what its parameter sets state (see [`crate::video_config`]): the
+/// configuration bytes after the `BITMAPINFOHEADER` first, then the
+/// stream's first non-empty chunk in `movi`, found by a plain chunk
+/// walk (`LIST 'rec '` entered) over at most
+/// [`FIRST_FRAME_PEEK_BYTES`]. The caller repositions the reader.
+fn fill_layouts_from_parameter_sets<R: ReadSeek + ?Sized>(
+    input: &mut R,
+    streams: &mut [StreamInfo],
+    movi_segments: &[(u64, u64)],
+) {
+    use crate::video_config::{Family, Layout, layout_of};
+    let mut pending: Vec<(usize, Family, Layout)> = Vec::new();
+    for (i, st) in streams.iter_mut().enumerate() {
+        let p = &mut st.params;
+        if p.media_type != MediaType::Video || p.pixel_format.is_some() {
+            continue;
+        }
+        let fourcc = match p.tag {
+            Some(CodecTag::Fourcc(f)) => f,
+            _ => [0; 4],
+        };
+        let Some(family) = Family::of(p.codec_id.as_str(), fourcc) else {
+            continue;
+        };
+        let layout = layout_of(family, &p.extradata);
+        if layout.is_complete(family) {
+            apply_layout(p, layout);
+        } else {
+            pending.push((i, family, layout));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let Some(&(start, end)) = movi_segments.first() else {
+        return;
+    };
+    let limit = end.min(start.saturating_add(FIRST_FRAME_PEEK_BYTES));
+    let mut pos = start;
+    while !pending.is_empty() && pos.saturating_add(8) <= limit {
+        let mut hdr = [0u8; 12];
+        if input.seek(SeekFrom::Start(pos)).is_err() || input.read_exact(&mut hdr[..8]).is_err() {
+            break;
+        }
+        let id = [hdr[0], hdr[1], hdr[2], hdr[3]];
+        let size = u64::from(u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]));
+        if &id == b"LIST" {
+            if input.read_exact(&mut hdr[8..]).is_err() {
+                break;
+            }
+            if &hdr[8..12] == b"rec " {
+                pos += 12;
+                continue;
+            }
+        } else if size > 0
+            && let (Some(a), Some(b)) = ((id[0] as char).to_digit(10), (id[1] as char).to_digit(10))
+            && let Some(k) = pending.iter().position(|e| e.0 == (a * 10 + b) as usize)
+        {
+            let mut head = vec![0u8; size.min(64 << 10) as usize];
+            if input.read_exact(&mut head).is_err() {
+                break;
+            }
+            let (idx, family, from_header) = pending.swap_remove(k);
+            let from_frame = layout_of(family, &head);
+            apply_layout(
+                &mut streams[idx].params,
+                Layout {
+                    pixel_format: from_header.pixel_format.or(from_frame.pixel_format),
+                    size: from_header.size.or(from_frame.size),
+                },
+            );
+        }
+        // RIFF chunks are WORD-aligned.
+        pos = pos
+            .saturating_add(8)
+            .saturating_add(size)
+            .saturating_add(size & 1);
+    }
+    for (idx, _, layout) in pending {
+        apply_layout(&mut streams[idx].params, layout);
+    }
+}
+
+fn apply_layout(p: &mut CodecParameters, layout: crate::video_config::Layout) {
+    if p.pixel_format.is_none() {
+        p.pixel_format = layout.pixel_format;
+    }
+    if let Some((w, h)) = layout.size {
+        p.width = Some(w);
+        p.height = Some(h);
+    }
+}
+
 fn format_fourcc_or_hex(fourcc: &[u8; 4]) -> String {
     let printable = fourcc.iter().all(|&b| (0x20..=0x7e).contains(&b));
     if printable {
