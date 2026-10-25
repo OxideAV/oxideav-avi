@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-avi/compare/v0.0.10...v0.0.11) - 2026-10-25
+
+### Other
+
+- decoded pixel format for H.264 / H.265 / VP9 / AV1 from their parameter sets; reduced frame_rate
+- uncompressed DIB / RGBA video is rawvideo + an explicit pixel format
+- edition 2024, MSRV 1.95
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- README examples use the current registry API
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Added
 
 - **H.264 / H.265 / VP9 / AV1 streams report their decoded pixel
