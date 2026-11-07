@@ -65,6 +65,7 @@ pub const AVIIF_LASTPART: u32 = 0x0000_0040;
 /// per-RIFF accounting. Tests use `Bytes(small_value)` to force
 /// segmentation on tiny fixtures.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum RiffSegmentLimit {
     /// 1 GiB per RIFF (the AVI 1.0 / OpenDML 2.0 convention).
     OneGiB,
@@ -117,6 +118,7 @@ pub enum AviKind {
 /// All fields default to off / disabled so existing callers (which
 /// pass nothing) get the same byte output they did pre-round-3.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct AviMuxOptions {
     /// When `Some(n)`, group every `n` consecutive packet chunks into
     /// a `LIST rec ` cluster inside `movi`. Per AVI 1.0 §"AVI RIFF
@@ -1088,6 +1090,7 @@ pub struct AviMuxOptions {
 /// the muxer synthesises the rect array from `nbFieldPerFrame` /
 /// frame dimensions exactly like round-9 (back-compat).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct VprpConfig {
     /// `VideoFormatToken` per OpenDML §5.0 enum. 0 = FORMAT_UNKNOWN.
     pub video_format_token: u32,

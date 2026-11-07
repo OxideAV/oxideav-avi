@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- All-field `new(..)` constructors for the demuxer's validator and
+  index records (`BlockAlignViolation`, `PaletteChangeFlagViolation`,
+  `SuperIndexDurationViolation`, `StdIndexBaseOffsetViolation`,
+  `StdIndexEntryCountViolation`, `SuperIndexEntryInfo`,
+  `SuperIndexTargetViolation`, `KeyframeSeekResult`) and `with_*`
+  setters for every field of `AudioStrfInfo` / `VideoStrfInfo`.
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on the `muxer::RiffSegmentLimit` enum
+  and on the records `muxer::AviMuxOptions`, `muxer::VprpConfig` (build
+  them with `Default` + their `with_*` builders), `demuxer::AudioStrfInfo`,
+  `demuxer::VideoStrfInfo`, the eight validator / index records above and
+  `demuxer::KeyframeSeekResult`. Fixed-layout wire records (chunk bodies,
+  flag views, `BITMAPINFOHEADER` / `WAVEFORMATEX(TENSIBLE)`, palette
+  entries, `VIDEO_FIELD_DESC`) and `AviKind` (the two envelope forms)
+  stay exhaustive.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-avi/compare/v0.0.10...v0.0.11) - 2026-11-07
 
 ### Other

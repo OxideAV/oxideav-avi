@@ -4012,6 +4012,7 @@ pub(crate) struct AudioStrhInfo {
 /// shape doesn't carry channel mask / SubFormat GUID); only the
 /// `wFormatTag` field is always populated.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct AudioStrfInfo {
     /// On-wire `wFormatTag` value. Always set; equal to
     /// [`crate::stream_format::WAVE_FORMAT_EXTENSIBLE`] (`0xFFFE`)
@@ -4058,6 +4059,50 @@ pub struct AudioStrfInfo {
     pub bits_per_sample: u16,
 }
 
+impl AudioStrfInfo {
+    /// Set [`AudioStrfInfo::format_tag`].
+    #[must_use]
+    pub fn with_format_tag(mut self, v: u16) -> Self {
+        self.format_tag = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::valid_bits_per_sample`].
+    #[must_use]
+    pub fn with_valid_bits_per_sample(mut self, v: Option<u16>) -> Self {
+        self.valid_bits_per_sample = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::channel_mask`].
+    #[must_use]
+    pub fn with_channel_mask(mut self, v: Option<u32>) -> Self {
+        self.channel_mask = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::subformat`].
+    #[must_use]
+    pub fn with_subformat(mut self, v: Option<Guid>) -> Self {
+        self.subformat = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::avg_bytes_per_sec`].
+    #[must_use]
+    pub fn with_avg_bytes_per_sec(mut self, v: u32) -> Self {
+        self.avg_bytes_per_sec = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::bits_per_sample`].
+    #[must_use]
+    pub fn with_bits_per_sample(mut self, v: u16) -> Self {
+        self.bits_per_sample = v;
+        self
+    }
+}
+
 /// One CBR-audio `ix##` standard-index entry whose `dwSize` is not a
 /// whole multiple of the stream's `WAVEFORMATEX.nBlockAlign`
 /// (round-96).
@@ -4078,6 +4123,7 @@ pub struct AudioStrfInfo {
 /// gross VBR/CBR mismatch; this is a finer, index-level check callers
 /// opt into).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BlockAlignViolation {
     /// Stream number (from the two ASCII digits of the `ix##` chunk's
     /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
@@ -4092,6 +4138,18 @@ pub struct BlockAlignViolation {
     /// The stream's `WAVEFORMATEX.nBlockAlign` the size was checked
     /// against.
     pub block_align: u16,
+}
+
+impl BlockAlignViolation {
+    /// Build a [`BlockAlignViolation`] from all of its fields.
+    pub fn new(stream_index: u32, entry_index: usize, dw_size: u32, block_align: u16) -> Self {
+        Self {
+            stream_index,
+            entry_index,
+            dw_size,
+            block_align,
+        }
+    }
 }
 
 /// One video stream whose `AVISF_VIDEO_PALCHANGES` strh flag disagrees
@@ -4119,6 +4177,7 @@ pub struct BlockAlignViolation {
 /// Scoped to video streams, since the flag + chunk family are
 /// video-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PaletteChangeFlagViolation {
     /// Stream number whose `AVISF_VIDEO_PALCHANGES` flag was checked.
     pub stream_index: u32,
@@ -4131,6 +4190,17 @@ pub struct PaletteChangeFlagViolation {
     /// when this is `> 0` but `flag_set` is `false`, or when this is
     /// `0` but `flag_set` is `true`.
     pub palette_change_chunks: u32,
+}
+
+impl PaletteChangeFlagViolation {
+    /// Build a [`PaletteChangeFlagViolation`] from all of its fields.
+    pub fn new(stream_index: u32, flag_set: bool, palette_change_chunks: u32) -> Self {
+        Self {
+            stream_index,
+            flag_set,
+            palette_change_chunks,
+        }
+    }
 }
 
 /// One super-index whose per-segment `dwDuration` total disagrees with
@@ -4158,6 +4228,7 @@ pub struct PaletteChangeFlagViolation {
 /// and a `dmlh` extended header (the only configuration where the two
 /// counts are independently recorded and therefore comparable).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SuperIndexDurationViolation {
     /// Stream number whose `indx` super-index was checked.
     pub stream_index: u32,
@@ -4166,6 +4237,17 @@ pub struct SuperIndexDurationViolation {
     pub super_index_duration_total: u64,
     /// The file's `dmlh.dwTotalFrames` the total was compared against.
     pub dmlh_total_frames: u64,
+}
+
+impl SuperIndexDurationViolation {
+    /// Build a [`SuperIndexDurationViolation`] from all of its fields.
+    pub fn new(stream_index: u32, super_index_duration_total: u64, dmlh_total_frames: u64) -> Self {
+        Self {
+            stream_index,
+            super_index_duration_total,
+            dmlh_total_frames,
+        }
+    }
 }
 
 /// One `ix##` standard-index whose `qwBaseOffset` does not anchor
@@ -4192,6 +4274,7 @@ pub struct SuperIndexDurationViolation {
 /// the per-segment `dwChunkId` / `dwDuration` surfaces with a
 /// position-level sanity check between the index and the `movi` body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StdIndexBaseOffsetViolation {
     /// Stream number (from the two ASCII digits of the `ix##` chunk's
     /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
@@ -4204,6 +4287,17 @@ pub struct StdIndexBaseOffsetViolation {
     /// The chunk's verbatim `qwBaseOffset` that landed outside every
     /// `movi` LIST region.
     pub qw_base_offset: u64,
+}
+
+impl StdIndexBaseOffsetViolation {
+    /// Build a [`StdIndexBaseOffsetViolation`] from all of its fields.
+    pub fn new(stream_index: u32, segment_index: usize, qw_base_offset: u64) -> Self {
+        Self {
+            stream_index,
+            segment_index,
+            qw_base_offset,
+        }
+    }
 }
 
 /// One truncated `ix##` standard-index chunk surfaced by
@@ -4221,6 +4315,7 @@ pub struct StdIndexBaseOffsetViolation {
 /// the loss. Informational only — never fails `open()`, and the OpenDML
 /// seek path uses just the entries it actually parsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StdIndexEntryCountViolation {
     /// Stream number (from the two ASCII digits of the `ix##` chunk's
     /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
@@ -4238,6 +4333,23 @@ pub struct StdIndexEntryCountViolation {
     pub parsed_entries: u32,
 }
 
+impl StdIndexEntryCountViolation {
+    /// Build a [`StdIndexEntryCountViolation`] from all of its fields.
+    pub fn new(
+        stream_index: u32,
+        segment_index: usize,
+        declared_entries: u32,
+        parsed_entries: u32,
+    ) -> Self {
+        Self {
+            stream_index,
+            segment_index,
+            declared_entries,
+            parsed_entries,
+        }
+    }
+}
+
 /// One `(qwOffset, dwSize, dwDuration)` triple from a stream's `indx`
 /// super-index, surfaced verbatim by
 /// [`AviDemuxer::super_index_entries`] (round 394).
@@ -4251,6 +4363,7 @@ pub struct StdIndexEntryCountViolation {
 /// `dwDuration` the *"time span in stream ticks"* of the chunks that
 /// standard index covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SuperIndexEntryInfo {
     /// File-absolute offset of the pointed-to `ix##` chunk header.
     pub qw_offset: u64,
@@ -4258,6 +4371,17 @@ pub struct SuperIndexEntryInfo {
     pub dw_size: u32,
     /// Stream-tick span of the chunks indexed by that `ix##`.
     pub dw_duration: u32,
+}
+
+impl SuperIndexEntryInfo {
+    /// Build a [`SuperIndexEntryInfo`] from all of its fields.
+    pub fn new(qw_offset: u64, dw_size: u32, dw_duration: u32) -> Self {
+        Self {
+            qw_offset,
+            dw_size,
+            dw_duration,
+        }
+    }
 }
 
 /// One `indx` super-index entry whose `qwOffset` does not land on any
@@ -4284,6 +4408,7 @@ pub struct SuperIndexEntryInfo {
 /// without breaking playback. Same family as
 /// [`StdIndexBaseOffsetViolation`] / [`StdIndexEntryCountViolation`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SuperIndexTargetViolation {
     /// Stream whose `indx` super-index carries the stale entry.
     pub stream_index: u32,
@@ -4293,6 +4418,17 @@ pub struct SuperIndexTargetViolation {
     /// The entry's verbatim `qwOffset` that matched no `ix##` chunk
     /// header position.
     pub qw_offset: u64,
+}
+
+impl SuperIndexTargetViolation {
+    /// Build a [`SuperIndexTargetViolation`] from all of its fields.
+    pub fn new(stream_index: u32, entry_index: usize, qw_offset: u64) -> Self {
+        Self {
+            stream_index,
+            entry_index,
+            qw_offset,
+        }
+    }
 }
 
 /// Round-394 helper shared by [`AviDemuxer::super_index_target_violations`]
@@ -5664,6 +5800,7 @@ fn probe_offset_has_ckid<R: ReadSeek + ?Sized>(
 /// One entry per video stream (parallel to [`AviDemuxer::streams`]
 /// for `media_type == Video`); audio / data streams have `None`.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct VideoStrfInfo {
     /// `true` when the on-wire `biHeight` was negative ⇒ top-down
     /// DIB (origin upper-left) per VfW §"biHeight sign rules". Only
@@ -5728,6 +5865,71 @@ pub struct VideoStrfInfo {
     /// forensic / repair caller can observe a non-conformant writer that
     /// stamped a value other than 1, via [`AviDemuxer::stream_planes`].
     pub planes: u16,
+}
+
+impl VideoStrfInfo {
+    /// Set [`VideoStrfInfo::top_down`].
+    #[must_use]
+    pub fn with_top_down(mut self, v: bool) -> Self {
+        self.top_down = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::bitfields_masks`].
+    #[must_use]
+    pub fn with_bitfields_masks(mut self, v: Option<(u32, u32, u32)>) -> Self {
+        self.bitfields_masks = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::palette`].
+    #[must_use]
+    pub fn with_palette(mut self, v: Option<Vec<crate::stream_format::RgbQuad>>) -> Self {
+        self.palette = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::size_image`].
+    #[must_use]
+    pub fn with_size_image(mut self, v: u32) -> Self {
+        self.size_image = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::x_pels_per_meter`].
+    #[must_use]
+    pub fn with_x_pels_per_meter(mut self, v: i32) -> Self {
+        self.x_pels_per_meter = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::y_pels_per_meter`].
+    #[must_use]
+    pub fn with_y_pels_per_meter(mut self, v: i32) -> Self {
+        self.y_pels_per_meter = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::clr_used`].
+    #[must_use]
+    pub fn with_clr_used(mut self, v: u32) -> Self {
+        self.clr_used = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::clr_important`].
+    #[must_use]
+    pub fn with_clr_important(mut self, v: u32) -> Self {
+        self.clr_important = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::planes`].
+    #[must_use]
+    pub fn with_planes(mut self, v: u16) -> Self {
+        self.planes = v;
+        self
+    }
 }
 
 /// Concrete AVI demuxer. Returned by [`open_avi`] for callers that
@@ -6498,6 +6700,7 @@ struct SeekCache {
 /// caller must decode-and-discard `gop_distance` ticks worth of
 /// frames before reaching the wanted PTS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyframeSeekResult {
     /// The PTS the caller asked for.
     pub target_pts: i64,
@@ -6509,6 +6712,17 @@ pub struct KeyframeSeekResult {
     /// stream ticks worth of frames a caller must walk past after the
     /// seek to reach the originally-requested PTS.
     pub gop_distance: i64,
+}
+
+impl KeyframeSeekResult {
+    /// Build a [`KeyframeSeekResult`] from all of its fields.
+    pub fn new(target_pts: i64, landed_pts: i64, gop_distance: i64) -> Self {
+        Self {
+            target_pts,
+            landed_pts,
+            gop_distance,
+        }
+    }
 }
 
 /// `AVIF_HASINDEX` per Microsoft's `vfw.h` — the file has an `idx1`.
