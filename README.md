@@ -233,6 +233,12 @@ codec id:
 | `pcm_*` | `0x0001` / `0x0003` by depth | `pcm_alaw` / `pcm_mulaw` | `0x0006` / `0x0007` |
 | `mp1` / `mp2` | `0x0050` | `mp3` | `0x0055` |
 
+Compressed audio is one codec frame per chunk: the muxer stamps
+`dwScale / dwRate` = the frame duration (from the first packet's
+`duration`, else its `pts` step) so readers that count chunks get the
+right clock, and `dwLength` counts frames. `tests/codec_matrix.rs`
+round-trips every id above through both AVI 1.0 and OpenDML.
+
 Other untagged codec ids return `Error::Unsupported` at `open()`; set
 `params.tag` for them, or for a multi-FourCC codec such as `magicyuv`
 (or spell the FourCC in the leading 4 bytes of `extradata`). An `MJPG`

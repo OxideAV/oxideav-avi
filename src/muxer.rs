@@ -2668,6 +2668,20 @@ struct TrackState {
     /// for this track. The delta at the next flush is that chunk's
     /// super-index `dwDuration` ("time span in stream ticks").
     ticks_at_last_ix_flush: u64,
+    /// Compressed (`dwSampleSize` 0) audio: the samples one chunk —
+    /// one codec frame — spans, from the first packet's `duration`
+    /// (else the first two packets' `pts` step). With `dwSampleSize`
+    /// 0 "each sample of data … must be in a separate chunk" (AVI 1.0
+    /// §AVISTREAMHEADER), so one chunk is one tick of
+    /// `dwScale / dwRate`; `write_trailer` stamps `dwScale` = this,
+    /// `dwRate` = the sample rate.
+    vbr_chunk_samples: Option<u64>,
+    /// First packet `pts` (sample units) of a compressed audio track,
+    /// for the `pts`-step fallback of [`Self::vbr_chunk_samples`].
+    vbr_first_pts: Option<i64>,
+    /// Size of the track's first data chunk — the block size of a
+    /// block-coded audio stream (see `write_trailer`).
+    first_chunk_size: Option<u32>,
     /// File offset of this track's 56-byte `strh` chunk **body**,
     /// recorded when `write_header` lays the `strl` down (round 394).
     /// `write_trailer` patches `dwLength` / `dwSuggestedBufferSize`
@@ -2905,6 +2919,9 @@ pub fn open_avi(
             ix_entries: Vec::new(),
             ix_chunk_records: Vec::new(),
             ticks_at_last_ix_flush: 0,
+            vbr_chunk_samples: None,
+            vbr_first_pts: None,
+            first_chunk_size: None,
             strh_body_off: 0,
             indx_count_off: None,
             indx_entries_off: None,
@@ -3754,7 +3771,31 @@ impl Muxer for AviMuxer {
         // be reconstructed from a fixed block_align. Falls back to one
         // sample per packet (the round-3 behaviour) when neither is
         // available.
-        t.sample_count += sample_count_of_packet(&t.stream, &t.entry, size, packet.duration);
+        t.sample_count += sample_count_of_packet(&t.entry, size);
+        if t.first_chunk_size.is_none() && size > 0 {
+            t.first_chunk_size = Some(size);
+        }
+        if &t.entry.strh_type == b"auds"
+            && t.entry.sample_size == 0
+            && t.vbr_chunk_samples.is_none()
+        {
+            let sample_tb = TimeBase::new(1, i64::from(t.entry.rate.max(1)));
+            let in_samples = |ts: i64| packet.time_base.rescale_checked(ts, sample_tb);
+            let from_duration = packet
+                .duration
+                .filter(|&d| d > 0)
+                .and_then(in_samples)
+                .filter(|&d| d > 0);
+            let from_pts_step = match (t.vbr_first_pts, packet.pts.and_then(in_samples)) {
+                (Some(first), Some(now)) => Some(now - first).filter(|&d| d > 0),
+                (None, now) => {
+                    t.vbr_first_pts = now;
+                    None
+                }
+                _ => None,
+            };
+            t.vbr_chunk_samples = from_duration.or(from_pts_step).map(|d| d as u64);
+        }
 
         self.current_segment_packets += 1;
         // Track the indexed stream's per-segment frame count separately
@@ -4160,9 +4201,9 @@ impl AviMuxer {
                 .map(|(_, n)| *n);
             let length = length_override.unwrap_or_else(|| {
                 if &t.entry.strh_type == b"auds" {
-                    // For PCM we store sample_count (frames). For VBR we'd
-                    // normally use packet count, but we don't support VBR audio
-                    // in the mux yet.
+                    // PCM: sample frames; compressed audio: chunks (one
+                    // codec frame each, in the `dwScale / dwRate` tick
+                    // stamped below).
                     t.sample_count as u32
                 } else {
                     t.packet_count
@@ -4170,6 +4211,49 @@ impl AviMuxer {
             });
             self.output.seek(SeekFrom::Start(strh_body_off + 32))?;
             self.output.write_all(&length.to_le_bytes())?;
+
+            // Compressed audio: `dwScale / dwRate` = one chunk's
+            // duration (one codec frame), reduced — unless the caller
+            // stamped its own pair via `with_stream_timebase`.
+            let timebase_overridden = self
+                .options
+                .stream_timebases
+                .iter()
+                .any(|(idx, _, _)| *idx == i as u32);
+            if let Some(spf) = t.vbr_chunk_samples
+                && !timebase_overridden
+                && let (Ok(spf), rate) = (u32::try_from(spf), t.entry.rate.max(1))
+            {
+                let g = gcd_u32(spf, rate).max(1);
+                self.output.seek(SeekFrom::Start(strh_body_off + 20))?;
+                self.output.write_all(&(spf / g).to_le_bytes())?;
+                self.output.write_all(&(rate / g).to_le_bytes())?;
+            }
+            // Block-coded audio (`WAVE_FORMAT_DVI_ADPCM`, RFC 2361 A.10):
+            // every chunk is a whole number of fixed-size blocks, so the
+            // stream is CBR — `dwSampleSize` and `nBlockAlign` are the
+            // block size (AVI 1.0 §AVISTREAMHEADER: for audio
+            // `dwSampleSize` "should be the same as the nBlockAlign
+            // member"), taken from the first chunk. The strf body
+            // follows the 56-byte strh body and the strf chunk header.
+            let sample_size_overridden = self
+                .options
+                .stream_sample_sizes
+                .iter()
+                .any(|(idx, _)| *idx == i as u32);
+            if &t.entry.strh_type == b"auds"
+                && t.entry.sample_size == 0
+                && !sample_size_overridden
+                && t.entry.strf.get(0..2) == Some(&0x0011u16.to_le_bytes()[..])
+                && let Some(block) = t.first_chunk_size
+                && let Ok(block16) = u16::try_from(block)
+            {
+                self.output.seek(SeekFrom::Start(strh_body_off + 44))?;
+                self.output.write_all(&block.to_le_bytes())?;
+                self.output
+                    .seek(SeekFrom::Start(strh_body_off + 56 + 8 + 12))?;
+                self.output.write_all(&block16.to_le_bytes())?;
+            }
 
             // Also patch strh.dwSuggestedBufferSize at body offset 36.
             // Round-217: an `AviMuxOptions::with_stream_suggested_buffer_size`
@@ -5690,14 +5774,10 @@ fn build_vprp_body(t: &TrackState, override_cfg: Option<VprpConfig>) -> Vec<u8> 
 /// number of audio frames — exactly what the AVI 1.0 spec
 /// (`AVISTREAMHEADER.dwLength`) wants for fixed block_align streams.
 ///
-/// VBR audio (`sample_size == 0`) is the round-5 candidate 3
-/// addition: when the encoder supplies `Packet.duration` (in stream
-/// ticks; for audio that's `samples_per_second` time-base ticks per
-/// the [`Demuxer::time_base`] convention), we accumulate that into
-/// `sample_count` so `dwLength` ends up as the real frame count.
-/// Without `duration` we fall back to the round-3 "1 per packet"
-/// behaviour, which is at least monotonic — it just can't be
-/// converted back to a wall-clock duration.
+/// VBR audio (`sample_size == 0`) counts one per chunk: with
+/// `dwSampleSize` 0 each chunk is one sample, and `write_trailer` sets
+/// `dwScale / dwRate` to one codec frame's duration (see
+/// `TrackState::vbr_chunk_samples`), so `dwLength` is the frame count.
 ///
 /// Non-audio streams always get 1 per packet (frame count).
 /// Pull `nAvgBytesPerSec` (the third u32, byte offset 8..12) out of a
@@ -5714,27 +5794,18 @@ fn audio_strf_avg_bytes_per_sec(strf: &[u8]) -> Option<u32> {
     if bps == 0 { None } else { Some(bps) }
 }
 
-fn sample_count_of_packet(
-    stream: &StreamInfo,
-    entry: &StrfEntry,
-    size: u32,
-    duration: Option<i64>,
-) -> u64 {
-    if &entry.strh_type == b"auds" {
-        if entry.sample_size > 0 {
-            return (size as u64) / (entry.sample_size as u64);
-        }
-        // VBR (e.g. MP3, AC3, AAC): prefer the packet's duration when
-        // the caller bothered to set it. The AVI strh.dwLength is in
-        // the stream's ticks (= samples_per_sec for PCM-like audio),
-        // so a positive `Packet.duration` lands directly here.
-        if let Some(d) = duration
-            && d > 0
-        {
-            return d as u64;
-        }
+fn gcd_u32(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd_u32(b, a % b) }
+}
+
+fn sample_count_of_packet(entry: &StrfEntry, size: u32) -> u64 {
+    // CBR audio: `size / dwSampleSize` sample frames. Everything else —
+    // video, and VBR audio (MP3, AC-3, AAC, …) whose chunk is one sample
+    // of the stream, one tick of the `dwScale / dwRate` `write_trailer`
+    // sets to the codec frame's duration — counts one per chunk.
+    if &entry.strh_type == b"auds" && entry.sample_size > 0 {
+        return (size as u64) / (entry.sample_size as u64);
     }
-    let _ = stream;
     1
 }
 

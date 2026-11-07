@@ -723,6 +723,13 @@ fn open_avi_inner(
         .iter()
         .map(|ai| ai.and_then(|info| classify_audio_sample_size(info.format_tag)))
         .collect();
+    // How many stream ticks each data chunk spans (see
+    // [`chunk_tick_divisor`]), parallel to `streams`.
+    let chunk_divisors: Vec<Option<usize>> = streams
+        .iter()
+        .zip(audio_infos.iter())
+        .map(|(st, ai)| chunk_tick_divisor(st, ai.as_ref()))
+        .collect();
 
     if movi_segments.is_empty() {
         return Err(Error::invalid("AVI: missing movi list"));
@@ -1626,7 +1633,7 @@ fn open_avi_inner(
                 }
             }
         }
-        let (table, recs) = build_idx_table(&mut *input, &raw, movi_start, &streams)?;
+        let (table, recs) = build_idx_table(&mut *input, &raw, movi_start, &chunk_divisors)?;
         idx1_rec_entries = recs;
         table
     } else {
@@ -2451,6 +2458,7 @@ fn open_avi_inner(
         audio_cbr_block_aligns,
         audio_block_aligns,
         audio_vbr_flags,
+        chunk_divisors,
         idx1_flags_per_stream,
         palette_change_counts,
         text_chunk_counts,
@@ -5497,7 +5505,7 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
     r: &mut R,
     raw: &[u8],
     movi_start: u64,
-    streams: &[StreamInfo],
+    divisors: &[Option<usize>],
 ) -> Result<(Vec<IdxEntry>, Vec<Idx1RecEntry>)> {
     if raw.len() < 16 {
         return Ok((Vec::new(), Vec::new()));
@@ -5594,7 +5602,7 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
                 continue;
             }
         };
-        if (stream as usize) >= streams.len() {
+        if (stream as usize) >= divisors.len() {
             continue;
         }
         let abs = base_off.saturating_add(raw_off as u64);
@@ -5610,9 +5618,8 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
     // Second pass: assign per-stream pts by walking each stream's entries
     // in idx1 order, mirroring the pts-bump logic in `next_packet`.
     // The per-stream block-align divisor is hoisted out of the loop
-    // (round-415 perf — `packet_time_delta` re-derived it per entry).
-    let divisors = time_delta_divisors(streams);
-    let mut per_stream_pts: Vec<i64> = vec![0; streams.len()];
+    // (round-415 perf — the divisor was re-derived per entry).
+    let mut per_stream_pts: Vec<i64> = vec![0; divisors.len()];
     for e in entries.iter_mut() {
         let s = e.stream as usize;
         e.pts = per_stream_pts[s];
@@ -5800,6 +5807,9 @@ pub struct AviDemuxer {
     /// 1.0 sample-size invariant doesn't constrain. Surfaced via
     /// [`AviDemuxer::audio_is_vbr`].
     audio_vbr_flags: Vec<Option<bool>>,
+    /// Per-stream [`chunk_tick_divisor`]: `Some(n)` ⇒ a data chunk spans
+    /// `len / n` ticks, `None` ⇒ one tick per chunk.
+    chunk_divisors: Vec<Option<usize>>,
     /// Per-stream idx1-flags lookup table (round-8 candidate 1).
     ///
     /// Built once at `open()` from `idx_table`: outer index is
@@ -7997,7 +8007,7 @@ impl Demuxer for AviDemuxer {
                         // the gap in `pts` says the previous picture
                         // stays on screen.
                         let s = idx as usize;
-                        let bump = packet_time_delta(&self.streams[s], 0);
+                        let bump = time_delta_with_divisor(self.chunk_divisors[s], 0);
                         self.per_stream_counter[s] =
                             self.per_stream_counter[s].saturating_add(bump);
                         continue;
@@ -8048,7 +8058,10 @@ impl Demuxer for AviDemuxer {
                             .unwrap_or(true)
                             || is_all_key_stream(stream);
                         // Bump counter.
-                        let bump = packet_time_delta(stream, pkt.data.len());
+                        let bump = time_delta_with_divisor(
+                            self.chunk_divisors[idx as usize],
+                            pkt.data.len(),
+                        );
                         self.per_stream_counter[idx as usize] = counter + bump;
                         return Ok(pkt);
                     } else {
@@ -11677,7 +11690,7 @@ impl AviDemuxer {
     /// running pts is ≤ `target_pts`. Each entry's pts is synthesised
     /// the same way `build_idx_table` does it for `idx1`: walk the
     /// per-stream entries in file order, advancing per-stream pts by
-    /// `packet_time_delta(stream, size)` per chunk.
+    /// the stream's chunk tick divisor per chunk.
     ///
     /// Per-stream PTS counters are reset to the landed entry's value so
     /// `next_packet` resumes synthesising correct PTS post-seek.
@@ -11766,6 +11779,7 @@ impl AviDemuxer {
                 &self.idx_table,
                 &self.std_indexes,
                 &self.streams,
+                &self.chunk_divisors,
             ));
         }
     }
@@ -11779,6 +11793,7 @@ fn build_seek_cache(
     idx_table: &[IdxEntry],
     std_indexes: &[StdIndex],
     streams: &[StreamInfo],
+    divisors: &[Option<usize>],
 ) -> SeekCache {
     let n = streams.len();
     let all_key: Vec<bool> = streams.iter().map(is_all_key_stream).collect();
@@ -11819,7 +11834,6 @@ fn build_seek_cache(
     // counter reset historically used.
     let mut running_signed = vec![0i64; n];
     let mut running_unsigned = vec![0u64; n];
-    let divisors = time_delta_divisors(streams);
     for ix in std_indexes {
         let stream = match parse_stream_index(&ix.chunk_id) {
             Some(s) => s,
@@ -11928,41 +11942,47 @@ fn is_all_key_stream(stream: &StreamInfo) -> bool {
     stream.params.tag == Some(CodecTag::Fourcc(*b"MJPG"))
 }
 
-fn packet_time_delta(stream: &StreamInfo, payload_len: usize) -> u64 {
-    time_delta_with_divisor(time_delta_divisor(stream), payload_len)
-}
-
-/// The per-stream state behind [`packet_time_delta`], factored out so
-/// batch walks (idx1 pts assignment, seek-cache build) can derive it
-/// once per stream instead of once per entry (round-415 perf).
-/// `Some(block_align)` ⇒ the stream ticks `payload / block_align` per
-/// packet (CBR audio); `None` ⇒ one tick per packet (video, data,
-/// audio with no usable block align).
-fn time_delta_divisor(stream: &StreamInfo) -> Option<usize> {
-    match stream.params.media_type {
-        MediaType::Audio => {
-            // PCM: duration = frames = payload / block_align. Non-PCM: one
-            // tick per packet is a reasonable fallback.
-            stream
-                .params
-                .channels
-                .zip(stream.params.sample_format)
-                .map(|(c, f)| (c as usize) * f.bytes_per_sample())
-                .filter(|&v| v > 0)
+/// How many stream ticks one data chunk spans, as a byte divisor:
+/// `Some(n)` ⇒ `len / n` ticks, `None` ⇒ one tick per chunk.
+///
+/// AVI 1.0 §AVISTREAMHEADER `dwSampleSize`: *"If this number is
+/// nonzero, then multiple samples of data can be grouped into a single
+/// chunk within the file. If it is zero, each sample of data (such as a
+/// video frame) must be in a separate chunk."* — so a nonzero
+/// `dwSampleSize` divides the chunk, and a zero one makes every chunk a
+/// single tick of `dwScale / dwRate` (a video frame, a compressed-audio
+/// frame). The one exception is PCM-family audio whose writer left
+/// `dwSampleSize` at 0: its chunks still hold whole sample blocks, so it
+/// divides by `nBlockAlign` (or `nChannels ×` the on-wire sample width
+/// when that is 0 too).
+fn chunk_tick_divisor(stream: &StreamInfo, audio: Option<&AudioStrhInfo>) -> Option<usize> {
+    if stream.params.media_type != MediaType::Audio {
+        return None;
+    }
+    if let Some(info) = audio
+        && info.sample_size > 0
+    {
+        return Some(info.sample_size as usize);
+    }
+    let p = &stream.params;
+    let wire_bytes = match p.codec_id.as_str() {
+        "pcm_alaw" | "pcm_mulaw" => 1,
+        "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" | "pcm_f64le" => {
+            p.sample_format?.bytes_per_sample()
         }
-        _ => None,
+        _ => return None,
+    };
+    match audio.map(|i| i.block_align) {
+        Some(align) if align > 0 => Some(align as usize),
+        _ => p
+            .channels
+            .map(|c| c as usize * wire_bytes)
+            .filter(|&v| v > 0),
     }
 }
 
-/// Per-stream divisors for a whole stream table (see
-/// [`time_delta_divisor`]).
-fn time_delta_divisors(streams: &[StreamInfo]) -> Vec<Option<usize>> {
-    streams.iter().map(time_delta_divisor).collect()
-}
-
-/// Apply a precomputed [`time_delta_divisor`] to one packet's payload
-/// length. Matches [`packet_time_delta`] exactly, including the
-/// integer division yielding 0 ticks for a sub-block-align payload.
+/// Apply a precomputed [`chunk_tick_divisor`] to one chunk's payload
+/// length (integer division: a sub-block payload spans 0 ticks).
 #[inline]
 fn time_delta_with_divisor(divisor: Option<usize>, payload_len: usize) -> u64 {
     match divisor {

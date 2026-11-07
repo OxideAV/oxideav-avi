@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frame slot is preceded by one zero-length chunk per skipped slot.
   Checked against ffprobe on ffmpeg-made MJPEG and MPEG-4 + PCM
   fixtures with dropped frames.
+- `tests/codec_matrix.rs`: every codec id the muxer accepts — 22
+  untagged video ids, 4 tag-only video ids, 5 `rawvideo` pixel formats,
+  6 PCM depths, 5 untagged + 4 tag-only compressed audio ids, and an
+  interleaved MJPEG + MP3 + PCM file — goes mux → demux in AVI 1.0 and
+  OpenDML and comes back with the same codec id, tag, shape, packet
+  bytes, key-frame flags and (exact-rational) timestamps.
 - Compressed-FourCC video states `biSizeImage` as the decoded image
   size (`biWidth × biHeight × biBitCount / 8`) instead of `0`, which the
   `BITMAPINFOHEADER` allows only for uncompressed RGB.
@@ -49,6 +55,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ffprobe on ffmpeg-made fixtures in `tests/stream_parameters.rs`.
 
 ### Fixed
+
+- **Compressed-audio timing.** With `dwSampleSize` 0 "each sample of
+  data … must be in a separate chunk" (AVI 1.0 §AVISTREAMHEADER), so a
+  chunk is one tick of `dwScale / dwRate`. The muxer wrote
+  `1 / sample_rate` with `dwLength` in samples, so a reader counting
+  chunks put every MP3 / MP2 / AC-3 / AAC frame one sample after the
+  last. It now stamps `dwScale / dwRate` = one codec frame (from the
+  first packet's `duration`, else its `pts` step; reduced — `mp2` at
+  44.1 kHz is `32 / 1225`, as ffprobe reads it) and `dwLength` counts
+  frames. IMA ADPCM (`0x0011`) is written CBR (`dwSampleSize` =
+  `nBlockAlign` = the block size), which the strict demuxer requires
+  and used to refuse in the muxer's own output.
+- The demuxer derives each chunk's tick span from `dwSampleSize` (a
+  nonzero one divides the chunk, AVI 1.0 §AVISTREAMHEADER), falling back
+  to `nBlockAlign` / the on-wire sample width only for PCM-family
+  streams whose writer left it 0. A-law / µ-law used to be divided by
+  the decoded S16 width, halving every timestamp, and compressed audio
+  with a 16-bit `wBitsPerSample` was divided as if it were PCM.
 
 - `seek_to` in a multi-segment OpenDML file used the `idx1` keyframe
   table, which covers the primary `RIFF AVI ` only, and so landed before

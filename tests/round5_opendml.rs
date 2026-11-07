@@ -252,7 +252,9 @@ fn idx1_2field_hint_absent_for_progressive_streams() {
 }
 
 // ---------------------------------------------------------------------------
-// C3: VBR audio uses Packet.duration to drive strh.dwLength.
+// C3: VBR audio — Packet.duration sets the chunk tick (dwScale / dwRate);
+// dwLength counts chunks (round 483: one chunk is one sample when
+// dwSampleSize is 0, AVI 1.0 §AVISTREAMHEADER).
 // ---------------------------------------------------------------------------
 
 fn vbr_audio_stream() -> StreamInfo {
@@ -274,9 +276,10 @@ fn vbr_audio_stream() -> StreamInfo {
 
 #[test]
 fn vbr_audio_duration_drives_strh_dwlength() {
-    // With per-packet `duration` set, the muxer accumulates the
-    // duration values into strh.dwLength rather than the round-3
-    // "1 per packet" fallback. Round-5 C3.
+    // With per-packet `duration` set, one chunk spans one tick of
+    // `dwScale / dwRate` = 1152 / 48000 (reduced: 3 / 125) and
+    // strh.dwLength is the chunk count — the same 3456 samples of
+    // stream duration the round-5 sum expressed in 1/48000 ticks.
     let stream = vbr_audio_stream();
     // 3 packets at 1152 samples (MP3 nominal frame size).
     let durations: [i64; 3] = [1152, 1152, 1152];
@@ -321,10 +324,18 @@ fn vbr_audio_duration_drives_strh_dwlength() {
         bytes[dw_length_off + 2],
         bytes[dw_length_off + 3],
     ]);
-    let expected = durations.iter().sum::<i64>() as u32;
+    assert_eq!(dw_length, 3, "strh.dwLength counts VBR audio chunks");
+    let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+    let (scale, rate) = (u32_at(strh_body_off + 20), u32_at(strh_body_off + 24));
     assert_eq!(
-        dw_length, expected,
-        "strh.dwLength must be the sum of Packet.duration values for VBR audio"
+        (scale, rate),
+        (3, 125),
+        "dwScale / dwRate = one 1152-sample frame"
+    );
+    let total = durations.iter().sum::<i64>() as u64;
+    assert_eq!(
+        u64::from(dw_length) * u64::from(scale) * 48_000,
+        total * u64::from(rate)
     );
 }
 
