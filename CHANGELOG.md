@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-avi/compare/v0.0.11...v0.0.12) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] growable types, #[doc(hidden)] internals
+
 ### Added
 
 - All-field `new(..)` constructors for the demuxer's validator and
