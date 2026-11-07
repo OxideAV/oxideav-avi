@@ -2368,22 +2368,26 @@ fn open_avi_inner(
     // by a forward scan over every segment), and fall back to `idx1`
     // (also file-ordered) only for streams with no `ix##`. Empty for a
     // stream with neither — the accessor then returns `None`.
+    //
+    // Zero-length chunks are left out (they never become packets, see
+    // `next_packet`), and an all-key stream (`MJPG`) reads key throughout.
+    let all_key: Vec<bool> = streams.iter().map(is_all_key_stream).collect();
     let mut ix_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
     for ix in &std_indexes {
         if let Some(s) = parse_stream_index(&ix.chunk_id) {
             let s = s as usize;
             if s < ix_per_stream.len() {
-                for e in &ix.entries {
-                    ix_per_stream[s].push(e.is_keyframe);
+                for e in ix.entries.iter().filter(|e| e.dw_size != 0) {
+                    ix_per_stream[s].push(e.is_keyframe || all_key[s]);
                 }
             }
         }
     }
     let mut idx1_kf_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
-    for e in &idx_table {
+    for e in idx_table.iter().filter(|e| e.size != 0) {
         let s = e.stream as usize;
         if s < idx1_kf_per_stream.len() {
-            idx1_kf_per_stream[s].push((e.flags & AVIIF_KEYFRAME) != 0);
+            idx1_kf_per_stream[s].push((e.flags & AVIIF_KEYFRAME) != 0 || all_key[s]);
         }
     }
     let keyframe_per_stream: Vec<Vec<bool>> = (0..streams.len())
@@ -7978,6 +7982,26 @@ impl Demuxer for AviDemuxer {
                         || suffix == *b"dc"
                         || suffix == *b"db"
                         || suffix == *b"wb";
+                    if accept && hdr.size == 0 {
+                        // A zero-length data chunk holds no frame — the
+                        // dropped / repeated-frame placeholder capture
+                        // and transcoding writers leave. It still takes
+                        // its time slot: with `dwSampleSize` 0 "each
+                        // sample of data (such as a video frame) must be
+                        // in a separate chunk" and only an
+                        // `AVIIF_NO_TIME` chunk "does not affect timing"
+                        // (AVI 1.0 §AVISTREAMHEADER, §AVIOLDINDEX). So it
+                        // is not surfaced as a packet (there is nothing
+                        // to decode); the stream clock advances past it
+                        // and the next real packet keeps its timestamp —
+                        // the gap in `pts` says the previous picture
+                        // stays on screen.
+                        let s = idx as usize;
+                        let bump = packet_time_delta(&self.streams[s], 0);
+                        self.per_stream_counter[s] =
+                            self.per_stream_counter[s].saturating_add(bump);
+                        continue;
+                    }
                     if accept {
                         let data = match read_body_bounded(&mut *self.input, hdr.size) {
                             Ok(d) => d,
@@ -8022,7 +8046,7 @@ impl Demuxer for AviDemuxer {
                             .get(&chunk_header_off)
                             .copied()
                             .unwrap_or(true)
-                            || stream.params.tag == Some(CodecTag::Fourcc(*b"MJPG"));
+                            || is_all_key_stream(stream);
                         // Bump counter.
                         let bump = packet_time_delta(stream, pkt.data.len());
                         self.per_stream_counter[idx as usize] = counter + bump;
@@ -8051,6 +8075,14 @@ impl Demuxer for AviDemuxer {
         // still seek by walking the std-index entries for the matching
         // stream. The std-indexes index every chunk across every RIFF
         // segment, so they're the canonical OpenDML-only seek path.
+        //
+        // The same path wins in a multi-segment file even when `idx1` is
+        // present: `idx1` covers the primary `RIFF AVI ` only, so its
+        // keyframe table would miss every key frame in a `RIFF AVIX`
+        // continuation and land the seek too early.
+        if !self.std_indexes.is_empty() && self.movi_segments.len() > 1 {
+            return self.seek_via_std_indexes(stream_index, pts);
+        }
         if self.idx_table.is_empty() {
             if !self.std_indexes.is_empty() {
                 return self.seek_via_std_indexes(stream_index, pts);
@@ -11749,6 +11781,7 @@ fn build_seek_cache(
     streams: &[StreamInfo],
 ) -> SeekCache {
     let n = streams.len();
+    let all_key: Vec<bool> = streams.iter().map(is_all_key_stream).collect();
     let mut idx1_keyframes: Vec<Vec<(i64, u64)>> = vec![Vec::new(); n];
     let mut idx1_kf_monotonic = vec![true; n];
     let mut idx1_entries: Vec<Vec<(u64, i64)>> = vec![Vec::new(); n];
@@ -11764,7 +11797,8 @@ fn build_seek_cache(
             continue;
         }
         idx1_entries[s].push((e.offset, e.pts));
-        if (e.flags & AVIIF_KEYFRAME) == 0 {
+        // A zero-length chunk is never a packet, so never a landing point.
+        if e.size == 0 || ((e.flags & AVIIF_KEYFRAME) == 0 && !all_key[s]) {
             continue;
         }
         if let Some(&(prev_pts, _)) = idx1_keyframes[s].last()
@@ -11807,7 +11841,7 @@ fn build_seek_cache(
                 std_off_monotonic[s] = false;
             }
             std_entries[s].push((header_off, running_unsigned[s]));
-            if e.is_keyframe {
+            if e.dw_size != 0 && (e.is_keyframe || all_key[s]) {
                 if let Some(&(prev_pts, _)) = std_keyframes[s].last()
                     && running_signed[s] < prev_pts
                 {
@@ -11885,6 +11919,13 @@ fn ascii_hex(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Whether every frame of the stream is a key frame whatever its index
+/// says: `MJPG` — OpenDML AVI File Format Extensions §7.0, "In an AVI
+/// sequence all JPEG frames will be key frames".
+fn is_all_key_stream(stream: &StreamInfo) -> bool {
+    stream.params.tag == Some(CodecTag::Fourcc(*b"MJPG"))
 }
 
 fn packet_time_delta(stream: &StreamInfo, payload_len: usize) -> u64 {

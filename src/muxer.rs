@@ -30,7 +30,7 @@
 
 use std::io::{Seek, SeekFrom, Write};
 
-use oxideav_core::{Error, Packet, Result, StreamInfo};
+use oxideav_core::{Error, Packet, Result, StreamInfo, TimeBase};
 use oxideav_core::{Muxer, WriteSeek};
 
 pub use crate::packaging::BmihOverrides;
@@ -2782,6 +2782,10 @@ type StrlStdIndexPatch = (u64, usize, [u8; 4], bool, Vec<IxStdEntry>);
 /// `Error::Unsupported` from `open()`.
 ///
 /// To select the OpenDML 2.0 envelope, use [`open_with_kind`].
+/// The largest decode-timestamp gap (in frames) the muxer fills with
+/// zero-length chunks; a larger jump is written without filler.
+const MAX_SKIPPED_FRAME_SLOTS: u64 = 1 << 16;
+
 pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
     open_with_kind(output, streams, AviKind::Avi10)
 }
@@ -3516,6 +3520,20 @@ impl Muxer for AviMuxer {
         if packet.data.len() > u32::MAX as usize {
             return Err(Error::invalid("avi muxer: packet larger than 4 GiB"));
         }
+        // A video packet whose decode timestamp lies past the stream's
+        // next frame slot: write a zero-length chunk per skipped slot, so
+        // the frame lands at its own time (with `dwSampleSize` 0 each
+        // chunk is one frame-time — AVI 1.0 §AVISTREAMHEADER). The reader
+        // side treats such chunks as no-frame time slots.
+        let skipped = self.skipped_frame_slots(idx, packet);
+        if skipped > 0 {
+            let field2 = self.pending_field2_offset.take();
+            let empty = Packet::new(packet.stream_index, packet.time_base, Vec::new());
+            for _ in 0..skipped {
+                self.write_packet(&empty)?;
+            }
+            self.pending_field2_offset = field2;
+        }
         // `rawvideo` rows padded out to the on-wire DIB stride.
         let relaid;
         let packet = match self.tracks[idx].entry.raw_layout.as_ref() {
@@ -3941,6 +3959,41 @@ impl Muxer for AviMuxer {
 }
 
 impl AviMuxer {
+    /// Frame slots between the video track's next chunk and the slot
+    /// `packet.dts` names (in the `strh` `dwScale / dwRate` tick), i.e.
+    /// how many zero-length chunks go before this packet. Zero for
+    /// non-video tracks, header packets, a packet without `dts` (a
+    /// presentation timestamp alone says nothing about chunk order once
+    /// frames are reordered), a timestamp at or behind the next slot,
+    /// and a jump past [`MAX_SKIPPED_FRAME_SLOTS`] (taken as a
+    /// discontinuity rather than written out as empty chunks).
+    fn skipped_frame_slots(&self, idx: usize, packet: &Packet) -> u64 {
+        let t = &self.tracks[idx];
+        if t.entry.strh_type != *b"vids" || packet.flags.header {
+            return 0;
+        }
+        let Some(dts) = packet.dts else {
+            return 0;
+        };
+        // The tick the reader counts chunks in: the `strh` pair as
+        // written (a `with_stream_timebase` override wins).
+        let (scale, rate) = self
+            .options
+            .stream_timebases
+            .iter()
+            .find(|(i, s, r)| *i as usize == idx && *s > 0 && *r > 0)
+            .map(|(_, s, r)| (*s, *r))
+            .unwrap_or((t.entry.scale.max(1), t.entry.rate.max(1)));
+        let tick = TimeBase::new(i64::from(scale), i64::from(rate));
+        let Some(slot) = packet.time_base.rescale_checked(dts, tick) else {
+            return 0;
+        };
+        let next = i64::from(t.packet_count);
+        match slot.checked_sub(next) {
+            Some(gap) if gap > 0 && gap as u64 <= MAX_SKIPPED_FRAME_SLOTS => gap as u64,
+            _ => 0,
+        }
+    }
     /// Patch avih/strh length fields after the trailer is written. We know
     /// the exact offsets because we laid out the header deterministically.
     fn patch_post_counts(&mut self) -> Result<()> {

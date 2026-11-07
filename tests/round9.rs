@@ -375,8 +375,9 @@ fn seek_to_keyframe_strict_reports_non_zero_gap_inside_gop() {
     // an idx1 where only a couple frames have AVIIF_KEYFRAME set.
     // Build a normal AVI then patch the idx1 entries' flag bytes so
     // only entries 0 and 5 are keyframes; ask for pts=8 → should
-    // land on pts=5, gop_distance=3.
-    let stream = mjpeg_stream(64, 64);
+    // land on pts=5, gop_distance=3. A delta-capable FourCC: an `MJPG`
+    // stream is all-key whatever its index says (OpenDML §7.0).
+    let stream = magicyuv_stream(64, 64);
     let frames: Vec<Vec<u8>> = (0..10u32)
         .map(|i| {
             let mut v = vec![0xFFu8, 0xD8];
@@ -385,7 +386,7 @@ fn seek_to_keyframe_strict_reports_non_zero_gap_inside_gop() {
             v
         })
         .collect();
-    let reg = registry_with_mjpeg();
+    let reg = registry_with_magicyuv();
 
     let tmp = std::env::temp_dir().join("oxideav-avi-r9-seek-strict-gop.avi");
     {

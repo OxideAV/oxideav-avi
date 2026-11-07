@@ -239,6 +239,20 @@ Other untagged codec ids return `Error::Unsupported` at `open()`; set
 stream is indexed and read back all-key ("all JPEG frames will be key
 frames", OpenDML §7.0).
 
+## Dropped frames (zero-length chunks)
+
+Capture and transcoding writers mark a dropped / repeated frame with a
+zero-length `##dc` chunk. With `dwSampleSize` 0 every chunk is one
+frame-time slot (AVI 1.0 §AVISTREAMHEADER), so the demuxer does not
+return such a chunk as a packet — there is nothing to decode — but
+advances the stream clock past it: the next real packet keeps its own
+timestamp and the `pts` gap says the previous picture stays up. Seeks
+never land on a placeholder, and `packet_is_keyframe` counts the same
+packets `next_packet` returns. The muxer writes the placeholders back:
+a video packet whose `dts` lies past the next frame slot gets one
+zero-length chunk per skipped slot first (no filler for packets without
+`dts`, or for a jump of more than 65 536 frames).
+
 ## Quick use
 
 ### Demux

@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mp3` (RFC 2361). `params.tag` still wins when set. Every `MJPG` chunk
   is indexed as a key frame and read back as one ("all JPEG frames will
   be key frames", OpenDML §7.0).
+- **Zero-length data chunks are frame-time slots, not packets.** The
+  dropped / repeated-frame placeholders capture and transcoding writers
+  leave (an empty `00dc`) used to reach the decoder as empty packets
+  (an MJPEG decoder failed on them with "missing SOI"). The demuxer now
+  skips them for every codec while the stream clock still counts them
+  (`dwSampleSize` 0: one chunk per frame; only `AVIIF_NO_TIME` chunks do
+  not affect timing), so the next frame keeps its timestamp; they are
+  never seek landing points and `packet_is_keyframe` /
+  `keyframe_indexed_packet_count` follow the packets actually returned.
+  The muxer writes them: a video packet whose `dts` lies past the next
+  frame slot is preceded by one zero-length chunk per skipped slot.
+  Checked against ffprobe on ffmpeg-made MJPEG and MPEG-4 + PCM
+  fixtures with dropped frames.
 - Compressed-FourCC video states `biSizeImage` as the decoded image
   size (`biWidth × biHeight × biBitCount / 8`) instead of `0`, which the
   `BITMAPINFOHEADER` allows only for uncompressed RGB.
@@ -36,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ffprobe on ffmpeg-made fixtures in `tests/stream_parameters.rs`.
 
 ### Fixed
+
+- `seek_to` in a multi-segment OpenDML file used the `idx1` keyframe
+  table, which covers the primary `RIFF AVI ` only, and so landed before
+  any key frame in a `RIFF AVIX` continuation; it now walks the `ix##`
+  standard indexes whenever the file has more than one segment.
 
 - `frame_rate` is `dwRate / dwScale` reduced, and `None` when either is
   zero (was the unreduced pair, with a zero clamped to 1).
