@@ -215,18 +215,29 @@ the `RGBA` FourCC; other pixel formats are refused at `open`. Palettised
 | `vorbis`       | `0x674F`/`0x6750`/`0x6751`/`0x676F`/`0x6770`/`0x6771`          |
 | `flac`         | `0xF1AC`                                                       |
 
-Muxer-side packaging (`strf` + `strh`) is implemented for a subset of
-the above: `mjpeg`, `ffv1`, `mpeg1video`, `mpeg2video`, `mpeg4video`,
-`h263`, `h264`, `h265`, `vp8`, `vp9`, `av1`, `magicyuv`, `rgb24`, `rawvideo`, all
-six raw PCM variants (`pcm_u8`/`s16le`/`s24le`/`s32le`/`f32le`/`f64le`),
-`pcm_alaw`, `pcm_mulaw`, `mp2`, `mp3`, `aac`, `ac3`, `eac3`, `flac`.
-Other codec ids return `Error::Unsupported` at `open()`.
+The muxer writes `CodecParameters::tag` when it is set (the demuxer
+sets it, so a remux keeps the original FourCC / `wFormatTag`). A stream
+with no tag — what an encoder states — gets the canonical one for its
+codec id:
 
-For codec ids that share several FourCCs (e.g. `mpeg4video` →
-`XVID`/`DIVX`/...; `magicyuv` → 17 native FourCCs), the muxer picks a
-default FourCC unless the caller hints otherwise. For `magicyuv`, the
-hint is the leading 4 bytes of `CodecParameters::extradata` if they
-spell one of the 17 native FourCCs; otherwise `M8RG` is used.
+| Codec id | Written as | Codec id | Written as |
+|----------|-----------|----------|-----------|
+| `mjpeg` | `MJPG` | `h264` | `H264` |
+| `cinepak` | `CVID` | `h265` / `hevc` | `HEVC` |
+| `h261` / `h263` | `H261` / `H263` | `vp8` / `vp9` | `VP80` / `VP90` |
+| `indeo3` / `indeo5` | `IV32` / `IV50` | `av1` | `AV01` |
+| `huffyuv` / `lagarith` | `HFYU` / `LAGS` | `ffv1` | `FFV1` |
+| `msmpeg4v1` / `v2` / `v3` | `MPG4` / `MP42` / `MP43` | `mpeg1video` / `mpeg2video` | `MPG1` / `MPG2` |
+| `mpeg4video` | `XVID` | `svq1` | `SVQ1` |
+| `vp6` | `VP62` | `rawvideo` | DIB / `RGBA` from the pixel format |
+| `pcm_*` | `0x0001` / `0x0003` by depth | `pcm_alaw` / `pcm_mulaw` | `0x0006` / `0x0007` |
+| `mp1` / `mp2` | `0x0050` | `mp3` | `0x0055` |
+
+Other untagged codec ids return `Error::Unsupported` at `open()`; set
+`params.tag` for them, or for a multi-FourCC codec such as `magicyuv`
+(or spell the FourCC in the leading 4 bytes of `extradata`). An `MJPG`
+stream is indexed and read back all-key ("all JPEG frames will be key
+frames", OpenDML §7.0).
 
 ## Quick use
 

@@ -1046,8 +1046,9 @@ pub struct AviMuxOptions {
     /// Per-stream `BITMAPINFOHEADER` scalar-field overrides (round-381):
     /// `(stream_index, BmihOverrides)`. Each present field is patched
     /// verbatim into that video stream's 40-byte BMIH fixed header,
-    /// replacing the muxer's writer-default `0` (`biSizeImage`,
-    /// `biX/YPelsPerMeter`, `biClrImportant`) / `1` (`biPlanes`). Default
+    /// replacing the muxer's writer-default (`biSizeImage`: the decoded
+    /// image size for a compressed FourCC, `0` for a DIB; `0` for
+    /// `biX/YPelsPerMeter` / `biClrImportant`; `1` for `biPlanes`). Default
     /// empty. Set via [`Self::with_size_image`] /
     /// [`Self::with_pixels_per_meter`] / [`Self::with_clr_important`] /
     /// [`Self::with_bmih_planes`]; the four builders accumulate into one
@@ -1523,10 +1524,11 @@ impl AviMuxOptions {
     }
 
     /// Builder helper: stamp `biSizeImage` (BITMAPINFOHEADER byte offset
-    /// 20) verbatim for `stream_index`, replacing the muxer's default of
-    /// `0` (which per VfW `wingdi.h` §"BITMAPINFOHEADER" is the legal
-    /// "may be zero for `BI_RGB` bitmaps" value the demuxer folds back to
-    /// `None`). Round-381. Last call per stream wins; only consulted when
+    /// 20) verbatim for `stream_index`, replacing the muxer's default
+    /// (the decoded image size `biWidth × biHeight × biBitCount / 8` for a
+    /// compressed FourCC; `0` — VfW `wingdi.h` §"BITMAPINFOHEADER"'s
+    /// "may be 0 for uncompressed RGB" value the demuxer folds back to
+    /// `None` — for a DIB). Round-381. Last call per stream wins; only consulted when
     /// building a `vids` strf, and never perturbs `biWidth` / `biHeight` /
     /// `biCompression` / the trailing extradata. An explicit `0` restores
     /// the "may be zero" sentinel. Round-trips through the demuxer's
@@ -3646,11 +3648,11 @@ impl Muxer for AviMuxer {
         // entry's flags rather than parsing the OpenDML
         // super-index. The bits are additive with AVIIF_KEYFRAME
         // when the packet is a keyframe.
-        let mut flags = if packet.flags.keyframe {
-            AVIIF_KEYFRAME
-        } else {
-            0
-        };
+        // OpenDML AVI File Format Extensions §7.0: "In an AVI sequence
+        // all JPEG frames will be key frames" — an `MJPG` chunk is always
+        // indexed as one, whatever the packet flag says.
+        let keyframe = packet.flags.keyframe || self.tracks[idx].entry.handler_fourcc == *b"MJPG";
+        let mut flags = if keyframe { AVIIF_KEYFRAME } else { 0 };
         if stream_is_2field {
             flags |= AVIIF_FIRSTPART | AVIIF_LASTPART;
         }
@@ -3670,11 +3672,7 @@ impl Muxer for AviMuxer {
             if let Some(d) = data_off.checked_sub(qw_base)
                 && d <= u32::MAX as u64
             {
-                let dw_size_with_flag = if packet.flags.keyframe {
-                    size
-                } else {
-                    size | 0x8000_0000
-                };
+                let dw_size_with_flag = if keyframe { size } else { size | 0x8000_0000 };
                 // dwOffsetField2 is qwBaseOffset-relative (per
                 // OpenDML 2.0 §3.0); the caller's value is
                 // payload-relative. Convert by adding `d`.

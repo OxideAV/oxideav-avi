@@ -8013,11 +8013,16 @@ impl Demuxer for AviDemuxer {
                         // describe randomly is all-intra / uncompressed
                         // data). For compressed delta-frame streams the
                         // index is present and the flag is exact.
+                        // OpenDML AVI File Format Extensions §7.0: "In an
+                        // AVI sequence all JPEG frames will be key frames"
+                        // — an `MJPG` chunk is one even when an index
+                        // entry left the flag clear.
                         pkt.flags.keyframe = self
                             .keyframe_by_offset
                             .get(&chunk_header_off)
                             .copied()
-                            .unwrap_or(true);
+                            .unwrap_or(true)
+                            || stream.params.tag == Some(CodecTag::Fourcc(*b"MJPG"));
                         // Bump counter.
                         let bump = packet_time_delta(stream, pkt.data.len());
                         self.per_stream_counter[idx as usize] = counter + bump;

@@ -104,9 +104,11 @@ fn payload(seed: u32, len: usize) -> Vec<u8> {
     out
 }
 
-/// Mux 64 interleaved video/audio frame pairs (video keyframe every
-/// 8th; one odd-length video payload to pin pad-byte handling) and
-/// return the finished file bytes.
+/// Mux 64 interleaved video/audio frame pairs (video packets flagged a
+/// keyframe every 8th — the `MJPG` stream is indexed all-key regardless,
+/// per OpenDML §7.0; one odd-length video payload to pin pad-byte
+/// handling) and return the finished file bytes. Re-pinned in round 483
+/// for that all-key indexing and the stated `biSizeImage`.
 fn mux_fixture(kind: AviKind) -> Vec<u8> {
     let streams = fixture_streams();
     let shared = SharedBuf::default();
@@ -137,7 +139,7 @@ fn golden_avi10_mux_bytes_pinned() {
     let bytes = mux_fixture(AviKind::Avi10);
     assert_eq!(
         format!("{:016x}", fnv1a64(&bytes)),
-        "3fcb61241ffea949", // re-pin deliberately, never to paper over drift
+        "b6ee059c54368bd3", // re-pin deliberately, never to paper over drift
         "AVI 1.0 muxer output drifted (len={})",
         bytes.len()
     );
@@ -150,7 +152,7 @@ fn golden_opendml_mux_bytes_pinned() {
     let bytes = mux_fixture(AviKind::OpenDml(RiffSegmentLimit::Bytes(64 * 1024)));
     assert_eq!(
         format!("{:016x}", fnv1a64(&bytes)),
-        "ffbb2711f93620c0", // re-pin deliberately, never to paper over drift
+        "b1ba9de6a90c4b56", // re-pin deliberately, never to paper over drift
         "OpenDML muxer output drifted (len={})",
         bytes.len()
     );

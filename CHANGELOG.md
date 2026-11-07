@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Motion JPEG is written to AVI.** A stream whose parameters carry no
+  container tag — what an encoder states — now gets its canonical
+  FourCC / `wFormatTag` from the codec id: `mjpeg` → `MJPG` (OpenDML
+  §7.0), plus `cinepak` / `h261` / `h263` / `indeo3` / `indeo5` /
+  `huffyuv` / `lagarith` / `msmpeg4v1..3` / `mpeg4video` / `vp6` /
+  `h264` / `h265` / `vp8` / `vp9` / `av1` / `ffv1` / `mpeg1video` /
+  `mpeg2video` / `svq1`, and `pcm_alaw` / `pcm_mulaw` / `mp1` / `mp2` /
+  `mp3` (RFC 2361). `params.tag` still wins when set. Every `MJPG` chunk
+  is indexed as a key frame and read back as one ("all JPEG frames will
+  be key frames", OpenDML §7.0).
+- Compressed-FourCC video states `biSizeImage` as the decoded image
+  size (`biWidth × biHeight × biBitCount / 8`) instead of `0`, which the
+  `BITMAPINFOHEADER` allows only for uncompressed RGB.
+
 - **H.264 / H.265 / VP9 / AV1 streams report their decoded pixel
   format.** The `BITMAPINFOHEADER` does not state it for compressed
   video, so the demuxer reads the codec's parameter sets — a

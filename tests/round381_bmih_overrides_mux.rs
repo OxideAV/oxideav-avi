@@ -5,7 +5,7 @@
 //! `AviMuxOptions::with_size_image` / `with_pixels_per_meter` /
 //! `with_clr_important` / `with_bmih_planes` patch the named BMIH field
 //! verbatim into a video stream's 40-byte fixed header, replacing the
-//! muxer's writer-default `0` (`biSizeImage`, `biX/YPelsPerMeter`,
+//! muxer's writer-default (`biSizeImage` = decoded image size, `biX/YPelsPerMeter`,
 //! `biClrImportant`) / `1` (`biPlanes`) per VfW `wingdi.h`
 //! §"BITMAPINFOHEADER". `biClrUsed` stays owned by `with_indexed_video`
 //! (it is load-bearing for the color-table length) and is intentionally
@@ -100,14 +100,16 @@ fn size_image_override_roundtrips() {
 }
 
 #[test]
-fn default_size_image_is_zero_and_absent() {
-    // No override ⇒ muxer default 0 ⇒ demuxer folds to None, no key.
+fn default_size_image_is_the_decoded_image_size() {
+    // No override on a compressed FourCC ⇒ the muxer states the decoded
+    // image size (`biSizeImage` "may be 0 for uncompressed RGB" only):
+    // 64 × 48 × 24 bpp / 8 = 9216.
     let dmx = build_and_open(AviMuxOptions::new(), "size-default");
-    assert_eq!(dmx.stream_size_image(0), None);
+    assert_eq!(dmx.stream_size_image(0), Some(64 * 48 * 3));
     assert!(
-        !dmx.metadata()
+        dmx.metadata()
             .iter()
-            .any(|(k, _)| k == "avi:vids.0.size_image")
+            .any(|(k, v)| k == "avi:vids.0.size_image" && v == "9216")
     );
 }
 
