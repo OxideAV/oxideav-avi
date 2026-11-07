@@ -206,3 +206,73 @@ fn ffprobe_reads_the_written_mjpeg_avi() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(text.trim(), format!("mjpeg,{W},{H},4"));
 }
+
+/// Split a concatenation of baseline JPEG images at each `EOI SOI`
+/// boundary (entropy-coded data byte-stuffs every `FF`, so `FF D9 FF
+/// D8` only occurs between images).
+fn split_jpegs(raw: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 0..raw.len().saturating_sub(3) {
+        if raw[i..i + 4] == [0xFF, 0xD9, 0xFF, 0xD8] {
+            out.push(raw[start..i + 2].to_vec());
+            start = i + 2;
+        }
+    }
+    out.push(raw[start..].to_vec());
+    out
+}
+
+fn ffmpeg(args: &[&str]) -> Option<Vec<u8>> {
+    let o = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(args)
+        .output()
+        .ok()?;
+    o.status.success().then_some(o.stdout)
+}
+
+/// Black-box: real JPEG frames (from `ffmpeg`'s MJPEG encoder) muxed by
+/// this crate decode in `ffmpeg` to exactly the pictures the raw JPEG
+/// stream decodes to. Skipped when `ffmpeg` is absent.
+#[test]
+fn ffmpeg_decodes_real_jpeg_frames_muxed_here() {
+    let lavfi = format!("testsrc=size={W}x{H}:rate=10:duration=0.6");
+    let Some(raw) = ffmpeg(&[
+        "-f", "lavfi", "-i", &lavfi, "-pix_fmt", "yuvj420p", "-c:v", "mjpeg", "-q:v", "4", "-f",
+        "mjpeg", "-",
+    ]) else {
+        eprintln!("skip: ffmpeg not available");
+        return;
+    };
+    let frames = split_jpegs(&raw);
+    assert_eq!(frames.len(), 6);
+    let avi = write_avi(&mjpeg_stream(), &frames, true);
+    let dir = std::env::temp_dir();
+    let (raw_path, avi_path) = (
+        dir.join("oxideav-avi-real.mjpeg"),
+        dir.join("oxideav-avi-real-mjpeg.avi"),
+    );
+    std::fs::write(&raw_path, &raw).unwrap();
+    std::fs::write(&avi_path, &avi).unwrap();
+    let hashes = |args: &[&str]| -> Vec<String> {
+        let out = ffmpeg(args).expect("ffmpeg decode");
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| l.rsplit(',').next().unwrap().trim().to_string())
+            .collect()
+    };
+    let from_raw = hashes(&[
+        "-f",
+        "mjpeg",
+        "-i",
+        raw_path.to_str().unwrap(),
+        "-f",
+        "framemd5",
+        "-",
+    ]);
+    let from_avi = hashes(&["-i", avi_path.to_str().unwrap(), "-f", "framemd5", "-"]);
+    assert_eq!(from_avi.len(), 6);
+    assert_eq!(from_avi, from_raw);
+}

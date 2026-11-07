@@ -2,10 +2,10 @@
 //!
 //! AVI is Microsoft's legacy RIFF-based container, still ubiquitous for
 //! Motion-JPEG output from security cameras and older capture hardware. This
-//! crate parses and emits AVI 1.0 files. OpenDML extensions (`ix##`,
-//! super-index, files > 2 GiB) are explicitly out of scope — see
-//! `muxer::write_packet` which returns an error if the output approaches
-//! 2 GiB.
+//! crate parses and emits AVI 1.0 files and their OpenDML 2.0 extension
+//! (`indx` / `ix##` indexes, `RIFF AVIX` continuations past 2 GiB —
+//! `muxer::AviKind::OpenDml`); an AVI 1.0 (`AviKind::Avi10`) muxer refuses
+//! to grow past ~2 GiB.
 
 pub mod demuxer;
 pub mod muxer;
