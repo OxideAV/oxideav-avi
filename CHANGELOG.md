@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-avi/compare/v0.0.10...v0.0.11) - 2026-11-07
+
+### Other
+
+- ffmpeg decodes real JPEG frames muxed here to the raw stream's pictures; crate doc states OpenDML support
+- compressed audio is one codec frame per chunk; round-trip matrix for every codec id
+- zero-length data chunks are frame-time slots, not packets
+- untagged streams get their codec's canonical FourCC / wFormatTag — mjpeg writes as MJPG
+- decoded pixel format for H.264 / H.265 / VP9 / AV1 from their parameter sets; reduced frame_rate
+- uncompressed DIB / RGBA video is rawvideo + an explicit pixel format
+- edition 2024, MSRV 1.95
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- README examples use the current registry API
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Added
 
 - **Motion JPEG is written to AVI.** A stream whose parameters carry no
