@@ -461,3 +461,27 @@ fn overlapping_side_band_index_entries_do_not_multiply_memory() {
     let held: usize = dmx.palette_change_data(0).iter().map(Vec::len).sum();
     assert!(held <= file_len);
 }
+
+/// `demux` target, 431 bytes: an uncompressed `BI_RGB` stream whose
+/// `BITMAPINFOHEADER` states `biWidth` 0 and `biHeight` 671 416 320.
+/// The bottom-up row unpacker ran once per stated row — of zero bytes
+/// each — for every packet: 15 s to read two 48-byte chunks. A
+/// picture with no columns has no row layout; the chunks pass through
+/// as stored.
+#[test]
+fn zero_width_raw_video_with_a_huge_height_reads_at_once() {
+    let bytes = include_bytes!("fixtures/fuzz/raw_dib_zero_width_rows.avi");
+    let started = std::time::Instant::now();
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.to_vec()));
+    let mut dmx = open_avi(rs, &CodecRegistry::new()).unwrap();
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "rawvideo");
+    assert_eq!(dmx.streams()[0].params.width, Some(0));
+    let mut sizes = Vec::new();
+    while let Ok(p) = dmx.next_packet() {
+        sizes.push(p.data.len());
+    }
+    // Two `00db` chunks; the third chunk names a stream that is not there.
+    assert_eq!(sizes, [48, 48]);
+    // 15 s before; milliseconds now. The bound is loose on purpose.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}

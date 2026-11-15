@@ -372,10 +372,11 @@ the `tests/round415_golden_mux_hash.rs` FNV pins, and
 output-identical on the demuxer side, gated by the full round-trip
 suite):
 
-- `open()`: the per-chunk keyframe map is pre-sized and keyed through
-  a cheap seeded multiply-fold `u64` hasher (the keys are index
-  offsets, which a crafted file chooses, so every key bit and a
-  per-map seed feed the bucket bits); the idx1 `pc`/`tx` side-band counts collect in
+- `open()`: the per-chunk keyframe map was pre-sized and keyed
+  through a cheap multiplicative `u64` hasher (round 489 replaced the
+  map with a sorted offset table — the keys are index offsets, which
+  a crafted file chooses, and that hash let it choose colliding
+  ones); the idx1 `pc`/`tx` side-band counts collect in
   one pass instead of two, and the eager side-band body walks +
   palette-position pass are skipped when the counts prove them empty;
   the pts-assignment pass hoists the per-stream block-align divisor.
@@ -512,8 +513,11 @@ every read, and an unchecked width × height product in the raw-DIB
 row unpacker. All are fixed and pinned in
 `tests/fuzz_regressions.rs`; the corpus gained seeds with H.264 /
 H.265 / VP9 / AV1 / MPEG-4 / MJPEG / raw-DIB video streams (it had
-none whose first frame the layout readers would parse). ~8 M
-executions across the three targets after the fixes, clean.
+none whose first frame the layout readers would parse) — and the
+raw-DIB seeds paid at once: `demux` found a 431-byte file (`biWidth`
+0, `biHeight` 671 416 320) on which every packet looped over that
+many empty rows for 15 s. ~11 M executions across the three targets
+after the fixes, clean.
 
 Run locally with `cargo fuzz run <target> -- -max_total_time=600`
 (nightly toolchain).

@@ -92,6 +92,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `rawvideo` row unpacking multiplied the header's width × height
     unchecked; a product past the address space now leaves the frame
     as read instead of wrapping.
+  - an uncompressed stream stating `biWidth` 0 and a `biHeight` in the
+    hundreds of millions made the bottom-up row unpacker loop over
+    that many empty rows for every packet (15 s for a 431-byte file;
+    found by the `demux` target once the corpus had raw-DIB seeds). A
+    picture with no columns or rows has no row layout.
 - `palette_change_count` / `text_chunk_count` and the buffered bodies
   no longer double when the packets are read (the `movi` walk re-counted
   what the `idx1` scan had already recorded) nor grow on every re-read

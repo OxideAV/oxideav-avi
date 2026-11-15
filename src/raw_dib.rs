@@ -117,6 +117,13 @@ impl RawLayout {
         height: u32,
         top_down: bool,
     ) -> Option<Self> {
+        // A picture with no columns or no rows has no bytes to lay
+        // out. Without this, a header stating width 0 and a height in
+        // the hundreds of millions made every packet of the stream a
+        // loop over that many empty rows.
+        if width == 0 || height == 0 {
+            return None;
+        }
         let row_bytes = bytes_per_pixel(fmt)?.checked_mul(width as usize)?;
         let (stride, bottom_up) = match rule {
             RowRule::Dib => (row_bytes.checked_add(3)? & !3, !top_down),
@@ -351,6 +358,16 @@ mod tests {
         };
         assert_eq!(l.pack(&vec![0u8; 1 << 12]), None);
         assert_eq!(l.unpack(vec![1u8; 1 << 12]), vec![1u8; 1 << 12]);
+    }
+
+    #[test]
+    fn a_picture_without_columns_or_rows_has_no_layout() {
+        for (w, h) in [(0, 671_416_320), (40, 0), (0, 0)] {
+            assert_eq!(
+                RawLayout::new(PixelFormat::Bgr24, RowRule::Dib, w, h, false),
+                None
+            );
+        }
     }
 
     #[test]
