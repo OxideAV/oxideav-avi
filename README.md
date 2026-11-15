@@ -396,6 +396,57 @@ The mux and walk paths are near memcpy-bound after these passes
 (profiles show `memmove` of packet payloads dominating), so further
 wins there would need API-level zero-copy, not micro-optimization.
 
+### Round 489: block I/O and the keyframe table
+
+Two more bench groups on a file made of index, not payload —
+400 000 chunks of 16–48 bytes (two streams, ~21 MiB): `large_index/…`
+in memory and `file_io/…` through plain `std::fs::File`s in the
+system temp directory, with no buffering on the caller's side.
+
+The in-memory `Cursor` benches above could not show what a chunk
+costs on a real file: an 8-byte header, a body and a pad byte, plus a
+position query, were three to four system calls per packet. Both
+sides now go through a position-tracking block buffer (`bufio.rs`):
+position queries are free, seeks are deferred, small records move in
+blocks of up to 64 KiB, and a transfer of 8 KiB or more goes straight
+to / from the caller's memory (a large frame is not copied twice; the
+muxer sends its header and body in one gathered write). The reader's
+block starts at 4 KiB after a jump, so the `ix##` scan at `open()`
+fetches a few kilobytes per chunk header, not a block.
+
+`next_packet`'s per-chunk keyframe lookup is a sorted offset table
+with a cursor instead of a hash map (a cursor step instead of a hash
+and a cache miss; 8 bytes per indexed chunk; nothing for a crafted
+index to degrade).
+
+Means of two interleaved before / after runs (Apple Silicon, a
+machine shared with other builds — read the ratios, not the digits):
+
+| bench (400 000 chunks) | before | after | |
+|---|---|---|---|
+| `file_io/mux_avi10` | 1.47 s (0.27 M pkt/s) | 17.7 ms (22.6 M pkt/s) | 83× |
+| `file_io/mux_opendml` | 1.96 s | 16.2 ms | 121× |
+| `file_io/walk_avi10` | 571 ms (0.70 M pkt/s) | 13.8 ms (29 M pkt/s) | 41× |
+| `file_io/walk_opendml` | 710 ms | 14.8 ms | 48× |
+| `file_io/open_opendml` | 288 ms | 9.2 ms | 31× |
+| `file_io/open_avi10` | 8.2 ms | 5.5 ms | 1.5× |
+| `large_index/walk_avi10` (memory) | 52.4 ms (7.6 M pkt/s) | 14.3 ms (28 M pkt/s) | 3.7× |
+| `large_index/walk_opendml` (memory) | 58.4 ms | 15.6 ms | 3.7× |
+| `large_index/open_avi10` (memory) | 7.3 ms | 4.7 ms | 1.6× |
+| `large_index/open_opendml` (memory) | 7.9 ms | 9.1 ms | 0.87× |
+| `large_index/mux_avi10` (memory) | 8.4 ms | 10.2 ms | 0.82× |
+
+The trade-off: what passes through a block is copied once more. For
+a source or sink that is already memory, with packets between a few
+hundred bytes and 8 KiB, that extra pass is the whole cost — the
+round-415 fixture (2 KiB packets, 5.7 MiB) went from 0.20 ms to
+0.33 ms for a mux and from 0.25 ms to 0.48 ms for a walk (22 → 12
+GiB/s), and its OpenDML `open()` from 0.13 ms to 0.21 ms. The same
+fixture through a file drops from thousands of system calls to about
+ninety block transfers. Files are what an AVI usually is, so the
+block path is the only path; a caller that needs bytes on the device
+mid-stream calls `AviMuxer::flush()`.
+
 ## Fuzzing
 
 Round-442 depth round: cargo-fuzz harness (`fuzz/`) with three
@@ -420,9 +471,12 @@ check; the coverage-guided targets extend it:
   side-band records) and asserts the strict round-trip contract:
   every write succeeds, the output passes `open_avi_strict`'s
   idx1 ↔ `ix##` cross-validation, per-stream payload bytes are
-  byte-identical in order, video keyframe flags survive (idx1
-  `AVIIF_KEYFRAME` + `ix##` delta bit), and `seek_to(0, 0)` lands
-  when stream 0 opens on a keyframe.
+  byte-identical in order (zero-length packets are frame-time
+  slots: not returned, but every returned video packet carries the
+  slot it was written at as `pts`), video keyframe flags survive
+  (idx1 `AVIIF_KEYFRAME` + `ix##` delta bit) and agree with
+  `packet_is_keyframe`, and `seek_to(0, 0)` lands when stream 0
+  opens on a non-empty keyframe.
 - `structured_mutate` — builds a writer-shaped fixture from the
   recipe, then applies fuzz-directed byte flips, truncations, and
   targeted overwrites right after each `idx1` / `indx` / `ix##`
@@ -442,6 +496,24 @@ chunk-nesting rule), and the `avih`-derived
 pinned as `regression_*` corpus seeds. The `mux_roundtrip` identity
 contract held across the entire recipe space — no mux/demux
 asymmetry surfaced.
+
+Round 489: the scheduled run had been red since the zero-length
+chunk rule landed — the `mux_roundtrip` oracle still expected empty
+packets back. With the oracle following the rule (and checking
+timestamps and the keyframe accessor as well) the target found that
+side-band `##pc` / `##tx` chunks were counted as frames by every
+index walk (drifting keyframe table, seeks landing on palette
+chunks, timestamps ahead after a seek). An audit by reading then
+found what 4 KiB fuzz inputs cannot show: a hash-collision
+quadratic `open()` (154 s on a crafted 2 MiB file), a 3 000× memory
+amplification through overlapping side-band index entries, two
+table-scan-per-item validators, side-band counts that doubled on
+every read, and an unchecked width × height product in the raw-DIB
+row unpacker. All are fixed and pinned in
+`tests/fuzz_regressions.rs`; the corpus gained seeds with H.264 /
+H.265 / VP9 / AV1 / MPEG-4 / MJPEG / raw-DIB video streams (it had
+none whose first frame the layout readers would parse). ~8 M
+executions across the three targets after the fixes, clean.
 
 Run locally with `cargo fuzz run <target> -- -max_total_time=600`
 (nightly toolchain).

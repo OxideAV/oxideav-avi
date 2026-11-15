@@ -68,76 +68,133 @@ use crate::stream_format::{
     parse_waveformatex, parse_waveformatextensible, subformat_codec_hint,
 };
 
-/// Cheap hasher for `u64` file-offset map keys (round-415 perf). The
-/// keyframe map is built once per `open()` with one insert per indexed
-/// packet chunk and probed once per `next_packet`; the default hasher
-/// dominated the build cost in profiles.
+/// Per-chunk keyframe flags keyed by the file offset of the chunk
+/// header, for `next_packet`.
 ///
-/// The keys are chunk offsets taken from the file's indexes (`idx1`
-/// `dwChunkOffset`, `ix##` `qwBaseOffset + dwOffset`), so a crafted
-/// index chooses them. A bare multiplicative hash leaves the low bits
-/// of the product — the ones the table buckets on — a function of the
-/// key's low bits alone, and a file whose index offsets all agree in
-/// those bits would chain every insert into one probe sequence
-/// (quadratic `open()`). So the key is first whitened with a per-map
-/// random seed and the product's high half is folded down before a
-/// second multiply: every output bit depends on every key bit and on
-/// the seed. Two multiplies and two shifts per key.
-#[derive(Clone, Copy)]
-struct OffsetHasher {
-    seed: u64,
-    state: u64,
+/// A sorted table of `offset << 1 | keyframe` words, not a hash map:
+/// the walk asks for chunks in file order, which is the order the
+/// indexes list them in, so the answer is almost always the entry after
+/// the previous one (a cursor step, no hashing, no cache miss on a
+/// table of hundreds of thousands of entries); a seek re-synchronises
+/// by binary search. Eight bytes per indexed chunk. The offsets are the
+/// file's own claims — a sorted table has no bucket structure for a
+/// crafted index to degrade.
+#[derive(Default)]
+struct KeyframeTable {
+    /// Strictly increasing in `offset`.
+    words: Vec<u64>,
+    /// Where the next lookup is expected to hit.
+    cursor: usize,
 }
 
-impl std::hash::Hasher for OffsetHasher {
-    fn finish(&self) -> u64 {
-        self.state
+impl KeyframeTable {
+    /// Offsets at or past 2^63 cannot be chunk positions and are left out.
+    fn word(offset: u64, keyframe: bool) -> Option<u64> {
+        (offset < 1 << 63).then_some(offset << 1 | u64::from(keyframe))
     }
-    fn write(&mut self, bytes: &[u8]) {
-        // Generic byte path — required by the trait, not used for the
-        // `u64` keys this hasher is scoped to.
-        for &b in bytes {
-            self.write_u64(self.state ^ b as u64);
+
+    /// `idx1` entries (`AVIIF_KEYFRAME`) win over `ix##` entries (the
+    /// `dwSize` high bit) for the same chunk; among several `idx1`
+    /// entries naming one offset the last counts, among several `ix##`
+    /// entries the first.
+    fn build(idx_table: &[IdxEntry], std_indexes: &[StdIndex]) -> Self {
+        let mut from_idx1: Vec<u64> = idx_table
+            .iter()
+            .filter_map(|e| Self::word(e.offset, (e.flags & AVIIF_KEYFRAME) != 0))
+            .collect();
+        Self::sort_unique(&mut from_idx1, /* keep_last */ true);
+        let mut from_ix: Vec<u64> =
+            Vec::with_capacity(std_indexes.iter().map(|ix| ix.entries.len()).sum());
+        for ix in std_indexes {
+            for e in &ix.entries {
+                // dwOffset points at chunk DATA; back off 8 to the
+                // header. A degenerate offset inside the first 8 bytes
+                // of the file names no chunk.
+                let data_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
+                if data_off < 8 {
+                    continue;
+                }
+                from_ix.extend(Self::word(data_off - 8, e.is_keyframe));
+            }
         }
+        Self::sort_unique(&mut from_ix, /* keep_last */ false);
+        let words = if from_ix.is_empty() {
+            from_idx1
+        } else if from_idx1.is_empty() {
+            from_ix
+        } else {
+            // Merge two sorted runs; `idx1` wins a shared offset.
+            let mut merged = Vec::with_capacity(from_idx1.len() + from_ix.len());
+            let (mut a, mut b) = (0, 0);
+            while a < from_idx1.len() && b < from_ix.len() {
+                let (x, y) = (from_idx1[a], from_ix[b]);
+                match (x >> 1).cmp(&(y >> 1)) {
+                    std::cmp::Ordering::Less => {
+                        merged.push(x);
+                        a += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        merged.push(y);
+                        b += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        merged.push(x);
+                        a += 1;
+                        b += 1;
+                    }
+                }
+            }
+            merged.extend_from_slice(&from_idx1[a..]);
+            merged.extend_from_slice(&from_ix[b..]);
+            merged
+        };
+        Self { words, cursor: 0 }
     }
-    fn write_u64(&mut self, i: u64) {
-        let mut x = (i ^ self.seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        x ^= x >> 32;
-        x = x.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        x ^= x >> 32;
-        self.state = x;
-    }
-}
 
-/// Builds [`OffsetHasher`]s sharing one random seed (drawn once per
-/// map from the standard library's per-process hash keys).
-#[derive(Clone, Copy)]
-struct OffsetHashBuilder {
-    seed: u64,
-}
-
-impl Default for OffsetHashBuilder {
-    fn default() -> Self {
-        use std::hash::BuildHasher;
-        let seed = std::collections::hash_map::RandomState::new().hash_one(0x4156_4958_u64);
-        OffsetHashBuilder { seed }
-    }
-}
-
-impl std::hash::BuildHasher for OffsetHashBuilder {
-    type Hasher = OffsetHasher;
-    fn build_hasher(&self) -> OffsetHasher {
-        OffsetHasher {
-            seed: self.seed,
-            state: 0,
+    /// Sort `words` by offset (a no-op pass for an index already in
+    /// file order) and keep one word per offset: the last or the first
+    /// of each run, in the original order.
+    fn sort_unique(words: &mut Vec<u64>, keep_last: bool) {
+        if words.windows(2).all(|w| w[0] >> 1 < w[1] >> 1) {
+            return;
         }
+        words.sort_by_key(|&w| w >> 1); // stable
+        let mut kept = 0;
+        for i in 0..words.len() {
+            if kept > 0 && words[kept - 1] >> 1 == words[i] >> 1 {
+                if keep_last {
+                    words[kept - 1] = words[i];
+                }
+            } else {
+                words[kept] = words[i];
+                kept += 1;
+            }
+        }
+        words.truncate(kept);
+    }
+
+    /// The flag recorded for the chunk whose header is at `offset`.
+    fn get(&mut self, offset: u64) -> Option<bool> {
+        let words = &self.words;
+        // The walk skips entries it does not ask about (side-band
+        // chunks, zero-length slots): step over a few before giving up
+        // on the cursor.
+        let mut i = self.cursor;
+        let reach = (i + 8).min(words.len());
+        while i < reach && words[i] >> 1 < offset {
+            i += 1;
+        }
+        if i >= words.len() || words[i] >> 1 != offset {
+            i = words.partition_point(|&w| w >> 1 < offset);
+        }
+        self.cursor = i;
+        let word = *words.get(i)?;
+        (word >> 1 == offset).then(|| {
+            self.cursor = i + 1;
+            word & 1 == 1
+        })
     }
 }
-
-/// `HashMap` keyed by `u64` file offsets via [`OffsetHasher`]. Only
-/// ever probed by key, never iterated, so the random seed cannot
-/// affect any output.
-type OffsetKeyMap<V> = std::collections::HashMap<u64, V, OffsetHashBuilder>;
 
 /// Index of the `movi` segment `[start, end)` holding file offset
 /// `off`. `segments` is in file order and disjoint (each `LIST movi`
@@ -249,11 +306,16 @@ pub fn open_avi_strict(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> 
 }
 
 fn open_avi_inner(
-    mut input: Box<dyn ReadSeek>,
+    input: Box<dyn ReadSeek>,
     codecs: &dyn CodecResolver,
     lenient: bool,
     strict_cross_validate: bool,
 ) -> Result<AviDemuxer> {
+    // Every read below goes through a position-tracking 64 KiB block
+    // buffer: the header walk, the `ix##` scan and `next_packet` deal in
+    // 8-byte headers and small bodies, which would otherwise be several
+    // system calls per chunk on a file-backed input.
+    let mut input = Box::new(crate::bufio::BufferedInput::new(input)?);
     // Probe the actual file length so we can clamp over-declared chunk sizes
     // against it. Truncated-head AVI files (capture-card crash dumps,
     // copy-aborted recordings) routinely declare RIFF / LIST sizes that
@@ -2391,38 +2453,7 @@ fn open_avi_inner(
     // `ix##` entries not already keyed (OpenDML continuation segments,
     // or idx1-less files). Offsets in both forms name the chunk's 8-byte
     // header — exactly where `next_packet` sits when reading a payload.
-    // Round-415 perf: the map is built once per `open()` from every
-    // index entry in the file (one insert per packet chunk) and probed
-    // once per `next_packet`, so it's pre-sized to the exact entry
-    // count (no rehash-and-move churn while inserting thousands of
-    // entries) and keyed through the cheap multiplicative
-    // [`OffsetHasher`] instead of the DoS-resistant default hasher —
-    // the keys are file offsets we computed ourselves, not
-    // attacker-chosen map keys, so hash-flood resistance buys nothing
-    // here.
-    let keyframe_map_capacity =
-        idx_table.len() + std_indexes.iter().map(|ix| ix.entries.len()).sum::<usize>();
-    let mut keyframe_by_offset: OffsetKeyMap<bool> =
-        OffsetKeyMap::with_capacity_and_hasher(keyframe_map_capacity, Default::default());
-    for e in &idx_table {
-        keyframe_by_offset.insert(e.offset, (e.flags & AVIIF_KEYFRAME) != 0);
-    }
-    for ix in &std_indexes {
-        for e in &ix.entries {
-            let data_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
-            // dwOffset points at chunk DATA; back off 8 to the header,
-            // matching `seek_via_std_indexes`'s resolution. A degenerate
-            // dwOffset < 8 (offset inside the qwBaseOffset header) is
-            // skipped rather than wrapping the subtraction.
-            if data_off < 8 {
-                continue;
-            }
-            let header_off = data_off - 8;
-            keyframe_by_offset
-                .entry(header_off)
-                .or_insert(e.is_keyframe);
-        }
-    }
+    let keyframe_by_offset = KeyframeTable::build(&idx_table, &std_indexes);
 
     // Per-stream, per-packet-ordinal keyframe vector for the public
     // `packet_is_keyframe` accessor. Unifies both index forms, picking
@@ -6068,7 +6099,7 @@ impl VideoStrfInfo {
 /// Implements [`oxideav_core::Demuxer`] for the usual streams /
 /// next_packet / seek_to / metadata / duration_micros entry points.
 pub struct AviDemuxer {
-    input: Box<dyn ReadSeek>,
+    input: Box<crate::bufio::BufferedInput>,
     streams: Vec<StreamInfo>,
     /// For each stream, the expected 2-byte chunk-name suffix in `movi`.
     packet_chunk_suffix: Vec<[u8; 2]>,
@@ -6746,15 +6777,15 @@ pub struct AviDemuxer {
     /// [`build_idx_table`]'s offset-base probe; ix## via
     /// `qw_base_offset + dwOffset - 8`), which is exactly the position
     /// `next_packet` is at when it reads each payload chunk. Keying on
-    /// that offset lets `next_packet` stamp the true keyframe flag in
-    /// O(1) without re-deriving per-stream packet ordinals.
+    /// that offset lets `next_packet` stamp the true keyframe flag
+    /// without re-deriving per-stream packet ordinals.
     ///
     /// Empty when the file carries neither an `idx1` nor any parseable
     /// `ix##` index; in that case `next_packet` falls back to flagging
     /// every payload chunk as a keyframe (the historical behaviour —
     /// correct for the all-intra / uncompressed streams that are the
     /// only ones a no-index AVI 1.0 file can describe randomly).
-    keyframe_by_offset: OffsetKeyMap<bool>,
+    keyframe_by_offset: KeyframeTable,
     /// Per-stream keyframe flags in packet order, unifying idx1 and
     /// `ix##`. Outer index is `stream_index`, inner index is the
     /// zero-based packet ordinal `next_packet` assigns. Backs the
@@ -8361,8 +8392,7 @@ impl Demuxer for AviDemuxer {
                         // entry left the flag clear.
                         pkt.flags.keyframe = self
                             .keyframe_by_offset
-                            .get(&chunk_header_off)
-                            .copied()
+                            .get(chunk_header_off)
                             .unwrap_or(true)
                             || is_all_key_stream(stream);
                         // Bump counter.

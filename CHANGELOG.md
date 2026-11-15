@@ -7,8 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Demuxer and muxer do their own block I/O: a position-tracking
+  64 KiB buffer sits between the chunk walk / chunk writer and the
+  caller's `ReadSeek` / `WriteSeek`. A chunk is an 8-byte header, a
+  body and a pad byte, and both sides ask for the stream position per
+  chunk — three to four system calls per packet on a plain
+  `std::fs::File`. Position queries are now free, seeks are deferred
+  until a transfer needs the device elsewhere, and bodies of 8 KiB or
+  more still go straight to / from the caller's memory (the muxer
+  sends header and body in one gathered write). On a 400 000 chunk
+  file through an unbuffered `File`: mux 1.47 s → 17.7 ms, packet walk
+  571 ms → 13.8 ms, OpenDML `open()` (which scans `movi` for `ix##`)
+  288 ms → 9.2 ms. The muxer flushes at the end of `write_header` and
+  `write_trailer` (and on drop); output bytes are unchanged. Cost: an
+  in-memory source / sink with 0.5–8 KiB packets pays one extra copy
+  (22 → 12 GiB/s on the 2 KiB-packet bench fixture).
+- The per-chunk keyframe lookup of `next_packet` is a sorted offset
+  table with a cursor instead of a hash map: the walk asks in index
+  order, so a lookup is a cursor step rather than a hash and a cache
+  miss. In memory, 400 000 small chunks: walk 52 ms → 14 ms
+  (7.6 M → 28 M packets/s), AVI 1.0 `open()` 7.3 ms → 4.7 ms; 8 bytes
+  of table per indexed chunk instead of a hash bucket.
+
 ### Added
 
+- `AviMuxer::flush()` — hand everything written so far to the output
+  (the muxer now holds up to one 64 KiB block of recent chunks between
+  `write_header` and `write_trailer`).
+- Bench groups `large_index/…` and `file_io/…` (400 000 small chunks,
+  in memory and through `std::fs::File`).
 - All-field `new(..)` constructors for the demuxer's validator and
   index records (`BlockAlignViolation`, `PaletteChangeFlagViolation`,
   `SuperIndexDurationViolation`, `StdIndexBaseOffsetViolation`,
@@ -51,8 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - the per-chunk keyframe map hashed file offsets with a bare
     multiply, whose bucket bits depend on the key's low bits only; an
     index whose offsets agree in those bits made `open()` quadratic
-    (154 s for a 2 MiB file, now 0.13 s). The hash mixes every key bit
-    with a per-map random seed;
+    (154 s for a 2 MiB file, now 0.13 s). The map is now a sorted
+    offset table, which has no bucket structure to degrade;
   - an `idx1` whose `##pc` / `##tx` entries all name one large region
     had it buffered once per entry (1 GiB from a 326 KiB file); the
     side-band bodies kept at `open()` are now capped at the file size;

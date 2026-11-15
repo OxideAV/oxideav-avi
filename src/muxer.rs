@@ -2938,7 +2938,11 @@ pub fn open_avi(
         && options.strl_std_index_capacity.is_some()
         && options.mid_movi_index_streams.is_empty();
     Ok(AviMuxer {
-        output,
+        // Position-tracking 64 KiB block buffer: a chunk is an 8-byte
+        // header, a body and a pad byte, and the packet path asks for
+        // the write position — several system calls per packet on a
+        // file-backed output otherwise.
+        output: Box::new(crate::bufio::BufferedOutput::new(output)?),
         tracks,
         kind,
         options,
@@ -3015,7 +3019,7 @@ struct SegmentRecord {
 /// [`oxideav_core::Muxer`] for the usual write-header /
 /// write-packet / write-trailer flow.
 pub struct AviMuxer {
-    output: Box<dyn WriteSeek>,
+    output: Box<crate::bufio::BufferedOutput>,
     tracks: Vec<TrackState>,
     kind: AviKind,
     options: AviMuxOptions,
@@ -3523,6 +3527,9 @@ impl Muxer for AviMuxer {
         self.current_segment_indexed_packets = 0;
         self.rec_open_size_off = None;
         self.rec_packets_in_cluster = 0;
+        // The header is on the device when this returns; packets after
+        // it are held in blocks until a block fills or the trailer.
+        self.output.flush()?;
         self.header_written = true;
         Ok(())
     }
@@ -4003,6 +4010,20 @@ impl Muxer for AviMuxer {
 }
 
 impl AviMuxer {
+    /// Hand everything written so far to the output and flush it.
+    ///
+    /// The muxer writes through a 64 KiB block buffer (chunk headers
+    /// and small bodies are gathered into block writes), so between
+    /// `write_header` and `write_trailer` up to one block of recent
+    /// chunks may not have reached the output yet. Call this where the
+    /// bytes must be there — before reading a growing file back, at a
+    /// capture checkpoint. `write_header`, `write_trailer` and dropping
+    /// the muxer flush by themselves.
+    pub fn flush(&mut self) -> Result<()> {
+        std::io::Write::flush(&mut *self.output)?;
+        Ok(())
+    }
+
     /// Frame slots between the video track's next chunk and the slot
     /// `packet.dts` names (in the `strh` `dwScale / dwRate` tick), i.e.
     /// how many zero-length chunks go before this packet. Zero for

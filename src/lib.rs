@@ -7,6 +7,7 @@
 //! `muxer::AviKind::OpenDml`); an AVI 1.0 (`AviKind::Avi10`) muxer refuses
 //! to grow past ~2 GiB.
 
+mod bufio;
 pub mod demuxer;
 pub mod muxer;
 pub(crate) mod packaging;
