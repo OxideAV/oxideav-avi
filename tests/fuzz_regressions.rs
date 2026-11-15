@@ -232,3 +232,232 @@ fn first_video_keyframe_after_skips_side_band_and_empty_slots() {
     // before it: the empty slot is not one of them.
     assert_eq!(dmx.palette_change_packet_positions(0), [1, 2, 2, 3, 4]);
 }
+
+// ───────────── hostile index shapes (audit findings) ─────────────
+
+fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + body.len() + 1);
+    v.extend_from_slice(id);
+    v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    v.extend_from_slice(body);
+    if body.len() % 2 == 1 {
+        v.push(0);
+    }
+    v
+}
+
+fn list(id: &[u8; 4], form: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(12 + body.len());
+    v.extend_from_slice(id);
+    v.extend_from_slice(&(4 + body.len() as u32).to_le_bytes());
+    v.extend_from_slice(form);
+    v.extend_from_slice(body);
+    v
+}
+
+fn dwords(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// An empty `ix00` standard index (AVISTDINDEX header, no entries)
+/// whose `qwBaseOffset` is `base`.
+fn empty_ix00(base: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&2u16.to_le_bytes()); // wLongsPerEntry
+    body.extend_from_slice(&[0, 1]); // bIndexSubType, AVI_INDEX_OF_CHUNKS
+    body.extend_from_slice(&0u32.to_le_bytes()); // nEntriesInUse
+    body.extend_from_slice(b"00dc");
+    body.extend_from_slice(&base.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    chunk(b"ix00", &body)
+}
+
+/// `hdrl` for one `M8RG` video stream whose `strl` carries a
+/// super-index with the given `qwOffset`s.
+fn hdrl_with_super_index(targets: &[u64]) -> Vec<u8> {
+    // AVIMAINHEADER: 25 fps, one stream, 32x16.
+    let avih = dwords(&[40_000, 0, 0, 0, 0, 0, 1, 0, 32, 16, 0, 0, 0, 0]);
+    // AVISTREAMHEADER: vids / M8RG, dwScale 1, dwRate 25.
+    let mut strh = Vec::new();
+    strh.extend_from_slice(b"vidsM8RG");
+    strh.extend_from_slice(&dwords(&[0, 0, 0, 1, 25, 0, 0, 0, 0, 0]));
+    strh.extend_from_slice(&[0; 8]); // rcFrame
+    // BITMAPINFOHEADER.
+    let mut strf = dwords(&[40, 32, 16]);
+    strf.extend_from_slice(&1u16.to_le_bytes());
+    strf.extend_from_slice(&24u16.to_le_bytes());
+    strf.extend_from_slice(b"M8RG");
+    strf.extend_from_slice(&dwords(&[0, 0, 0, 0, 0]));
+    // AVISUPERINDEX.
+    let mut indx = Vec::with_capacity(24 + 16 * targets.len());
+    indx.extend_from_slice(&4u16.to_le_bytes());
+    indx.extend_from_slice(&[0, 0]); // AVI_INDEX_OF_INDEXES
+    indx.extend_from_slice(&(targets.len() as u32).to_le_bytes());
+    indx.extend_from_slice(b"00dc");
+    indx.extend_from_slice(&[0; 12]);
+    for &t in targets {
+        indx.extend_from_slice(&t.to_le_bytes());
+        indx.extend_from_slice(&dwords(&[32, 0]));
+    }
+    let strl = [
+        chunk(b"strh", &strh),
+        chunk(b"strf", &strf),
+        chunk(b"indx", &indx),
+    ]
+    .concat();
+    list(
+        b"LIST",
+        b"hdrl",
+        &[chunk(b"avih", &avih), list(b"LIST", b"strl", &strl)].concat(),
+    )
+}
+
+/// A super-index of 40 000 entries against 20 000 `ix00` chunks, each
+/// in its own `RIFF AVIX` segment — a 2 MiB file. Every lookup the
+/// validators and the open-time metadata pass make (super-index target
+/// → `ix##` chunk, `qwBaseOffset` → `movi` segment) used to scan a
+/// whole table per item; they are hashed / binary-searched now, and
+/// must still report exactly the entries that are wrong.
+#[test]
+fn many_segments_and_a_long_super_index_validate_exactly() {
+    const SEGMENTS: usize = 20_000;
+    const ENTRIES: usize = 2 * SEGMENTS;
+    // Layout is fixed-size, so every offset is known up front.
+    let hdrl_len = hdrl_with_super_index(&vec![0; ENTRIES]).len() as u64;
+    let primary_len = 12 + hdrl_len + 12 + 8; // RIFF, hdrl, movi, one frame chunk
+    let segment_len = 12 + 12 + 32; // RIFF AVIX, LIST movi, ix00
+    let ix_offset = |k: usize| primary_len + (k * segment_len) as u64 + 24;
+    // Even entries point at the k-th ix00 chunk; odd ones 4 bytes off.
+    let targets: Vec<u64> = (0..ENTRIES)
+        .map(|e| ix_offset(e / 2) + if e % 2 == 0 { 0 } else { 4 })
+        .collect();
+    let hdrl = hdrl_with_super_index(&targets);
+    let movi = list(b"LIST", b"movi", &chunk(b"00dc", &[]));
+    let mut file = list(b"RIFF", b"AVI ", &[hdrl, movi].concat());
+    assert_eq!(file.len() as u64, primary_len);
+    for k in 0..SEGMENTS {
+        // Every third index anchors outside any movi list.
+        let base = if k % 3 == 0 { 4 } else { ix_offset(k) };
+        file.extend(list(
+            b"RIFF",
+            b"AVIX",
+            &list(b"LIST", b"movi", &empty_ix00(base)),
+        ));
+    }
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = open_avi(rs, &registry()).unwrap();
+    assert_eq!(dmx.movi_segment_count(), SEGMENTS + 1);
+
+    let stale = dmx.super_index_target_violations();
+    assert_eq!(stale.len(), SEGMENTS);
+    assert!(stale.iter().all(|v| v.entry_index % 2 == 1));
+
+    let outside = dmx.std_index_base_offset_violations();
+    assert_eq!(outside.len(), SEGMENTS.div_ceil(3));
+    assert!(outside.iter().all(|v| v.segment_index % 3 == 0));
+
+    // Nothing to read and nothing to land on, but both terminate.
+    assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+    assert!(dmx.seek_to(0, 0).is_err());
+}
+
+/// 262 144 standard-index entries whose chunk offsets all agree in
+/// their low 21 bits (`dwOffset` a multiple of 2^21, `qwBaseOffset` a
+/// multiple of 2^32) — a 2 MiB file. The per-chunk keyframe map is
+/// keyed by those offsets; with a hash whose bucket bits came from the
+/// key's low bits alone, every insert walked one ever-longer probe
+/// chain. The map's hash now mixes all key bits with a per-map seed.
+#[test]
+fn index_offsets_agreeing_in_their_low_bits_open_in_linear_time() {
+    const CHUNKS: usize = 128;
+    const ENTRIES: usize = 2048;
+    let mut movi = Vec::new();
+    for k in 0..CHUNKS {
+        let mut body = Vec::with_capacity(24 + 8 * ENTRIES);
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&[0, 1]);
+        body.extend_from_slice(&(ENTRIES as u32).to_le_bytes());
+        body.extend_from_slice(b"00dc");
+        body.extend_from_slice(&((k as u64 + 1) << 32).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        for j in 0..ENTRIES as u32 {
+            body.extend_from_slice(&dwords(&[j << 21, 1]));
+        }
+        movi.extend(chunk(b"ix00", &body));
+    }
+    let hdrl = hdrl_with_super_index(&[1]);
+    let file = list(
+        b"RIFF",
+        b"AVI ",
+        &[hdrl, list(b"LIST", b"movi", &movi)].concat(),
+    );
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = open_avi(rs, &registry()).unwrap();
+    assert_eq!(dmx.keyframe_indexed_packet_count(0), CHUNKS * ENTRIES);
+    // The entries point nowhere: a seek is refused, not followed.
+    assert!(dmx.seek_to(0, 1000).is_err());
+    assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+}
+
+/// Side-band chunks are counted and buffered once, whichever pass meets
+/// them: the `idx1` scan at `open()` (primary segment), or the `movi`
+/// walk (`RIFF AVIX` segments, which `idx1` cannot reach). The walk
+/// used to count the `idx1`-listed chunks a second time, and again on
+/// every re-read after a seek.
+#[test]
+fn side_band_chunks_are_recorded_once_however_often_they_are_read() {
+    let frames: Vec<(usize, bool)> = (0..40).map(|i| (300 + i, i % 8 == 0)).collect();
+    for kind in KINDS {
+        let bytes = mux(&frames, kind, Side::PaletteAndText);
+        let mut dmx = open(&bytes);
+        let multi_segment = dmx.movi_segment_count() > 1;
+        if !multi_segment {
+            // Everything is in idx1: known before the first packet.
+            assert_eq!(dmx.palette_change_count(0), 40);
+            assert_eq!(dmx.text_chunk_count(0), 40);
+        }
+        for round in 0..3 {
+            assert_eq!(drain(&mut dmx).len(), 40 - 8 * round.min(1) * 2);
+            assert_eq!(dmx.palette_change_count(0), 40, "round {round}");
+            assert_eq!(dmx.text_chunk_count(0), 40, "round {round}");
+            assert_eq!(dmx.palette_change_data(0).len(), 40);
+            assert_eq!(dmx.text_chunk_data(0).len(), 40);
+            assert!(dmx.text_chunk_data(0).iter().all(|t| t == b"overlay"));
+            assert_eq!(dmx.seek_to(0, 16).unwrap(), 16);
+        }
+    }
+}
+
+/// An `idx1` of 4 000 `00pc` entries that all name the same 256 KiB
+/// region: the eager side-band load must not buffer it 4 000 times
+/// (1 GiB from a 330 KiB file). Genuine side-band chunks are disjoint,
+/// so the bodies kept can never add up to more than the file.
+#[test]
+fn overlapping_side_band_index_entries_do_not_multiply_memory() {
+    const BODY: usize = 256 * 1024;
+    const ENTRIES: usize = 4000;
+    let hdrl = hdrl_with_super_index(&[]);
+    let movi = list(b"LIST", b"movi", &chunk(b"00pc", &vec![7u8; BODY]));
+    let mut idx1 = Vec::with_capacity(16 * ENTRIES);
+    for _ in 0..ENTRIES {
+        idx1.extend_from_slice(b"00pc");
+        idx1.extend_from_slice(&dwords(&[0x100, 4, BODY as u32]));
+    }
+    let file = list(
+        b"RIFF",
+        b"AVI ",
+        &[hdrl, movi, chunk(b"idx1", &idx1)].concat(),
+    );
+    let file_len = file.len();
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = open_avi(rs, &registry()).unwrap();
+    let held: usize = dmx.palette_change_data(0).iter().map(Vec::len).sum();
+    assert!(
+        held <= file_len,
+        "{held} bytes buffered from a {file_len}-byte file"
+    );
+    assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+    let held: usize = dmx.palette_change_data(0).iter().map(Vec::len).sum();
+    assert!(held <= file_len);
+}

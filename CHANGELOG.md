@@ -46,6 +46,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AVIIF_NO_TIME` ("should be set for palette changes", AVI 1.0
   §AVIOLDINDEX). The demuxer still reads files written the old way
   correctly where `idx1` identifies the side-band chunks.
+- Hostile-index hardening (audit; each with a regression test in
+  `tests/fuzz_regressions.rs`):
+  - the per-chunk keyframe map hashed file offsets with a bare
+    multiply, whose bucket bits depend on the key's low bits only; an
+    index whose offsets agree in those bits made `open()` quadratic
+    (154 s for a 2 MiB file, now 0.13 s). The hash mixes every key bit
+    with a per-map random seed;
+  - an `idx1` whose `##pc` / `##tx` entries all name one large region
+    had it buffered once per entry (1 GiB from a 326 KiB file); the
+    side-band bodies kept at `open()` are now capped at the file size;
+  - super-index target validation and the `qwBaseOffset`-in-`movi`
+    checks scanned a whole table per item (5.6 s for a 2 MiB file with
+    20 000 `RIFF AVIX` segments, now 0.09 s): hashed / binary-searched;
+    per-stream index walks stop at the 256 streams a chunk id can name;
+  - `rawvideo` row unpacking multiplied the header's width × height
+    unchecked; a product past the address space now leaves the frame
+    as read instead of wrapping.
+- `palette_change_count` / `text_chunk_count` and the buffered bodies
+  no longer double when the packets are read (the `movi` walk re-counted
+  what the `idx1` scan had already recorded) nor grow on every re-read
+  after a seek. Each side-band chunk is recorded once; chunks `idx1`
+  does not list (`RIFF AVIX` segments) are still picked up by the walk,
+  bodies included.
 - Fuzz: the `mux_roundtrip` oracle expected zero-length video packets
   back; since 0.0.11 they are frame-time slots, not packets, which is
   what turned the scheduled run red. The oracle now checks that every

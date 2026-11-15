@@ -142,10 +142,17 @@ impl RawLayout {
         if self.is_identity() || self.rows == 0 {
             return wire;
         }
-        let need = self.stride * (self.rows - 1) + self.row_bytes;
-        if wire.len() < need {
+        // The dimensions are the file's claim: a width × height product
+        // past the address space cannot be a frame that was read, and
+        // must not wrap into a small `need`.
+        let need = self
+            .stride
+            .checked_mul(self.rows - 1)
+            .and_then(|n| n.checked_add(self.row_bytes));
+        if need.is_none_or(|n| wire.len() < n) {
             return wire;
         }
+        // `row_bytes * rows <= need + stride`, bounded by the bytes held.
         let mut out = Vec::with_capacity(self.row_bytes * self.rows);
         for r in 0..self.rows {
             let src = if self.bottom_up { self.rows - 1 - r } else { r };
@@ -158,10 +165,11 @@ impl RawLayout {
     /// `rawvideo` packet → on-wire frame (inverse of [`Self::unpack`]),
     /// padding each row to the stride with zero bytes.
     pub(crate) fn pack(&self, packet: &[u8]) -> Option<Vec<u8>> {
-        if self.is_identity() || packet.len() != self.row_bytes * self.rows {
+        if self.is_identity() || Some(packet.len()) != self.row_bytes.checked_mul(self.rows) {
             return None;
         }
-        let mut out = vec![0u8; self.stride * self.rows];
+        // `stride <= row_bytes + 3` and the packet holds `rows` rows.
+        let mut out = vec![0u8; self.stride.checked_mul(self.rows)?];
         for r in 0..self.rows {
             let dst = if self.bottom_up { self.rows - 1 - r } else { r };
             out[dst * self.stride..dst * self.stride + self.row_bytes]
@@ -316,6 +324,33 @@ mod tests {
         let wire: Vec<u8> = (0..24).collect();
         assert_eq!(l.unpack(wire.clone()), wire);
         assert_eq!(l.pack(&wire), None);
+    }
+
+    #[test]
+    fn dimensions_past_the_address_space_pass_through() {
+        // 32-bit rows of 2^32 - 1 pixels, 2^32 - 1 of them, bottom-up:
+        // stride × rows wraps a 64-bit usize. The frame cannot be that
+        // large, so it is handed on untouched (and nothing panics).
+        let l = RawLayout::new(PixelFormat::Bgrx, RowRule::Dib, u32::MAX, u32::MAX, false);
+        if let Some(l) = l {
+            let wire = vec![5u8; 64];
+            assert_eq!(l.unpack(wire.clone()), wire);
+            assert_eq!(l.pack(&wire), None);
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn wrapped_row_products_are_not_matches() {
+        // stride × rows = 2^64 + 2^33 wraps to 2^33.
+        let l = RawLayout {
+            row_bytes: 1 << 33,
+            stride: 1 << 33,
+            rows: (1 << 31) + 1,
+            bottom_up: true,
+        };
+        assert_eq!(l.pack(&vec![0u8; 1 << 12]), None);
+        assert_eq!(l.unpack(vec![1u8; 1 << 12]), vec![1u8; 1 << 12]);
     }
 
     #[test]

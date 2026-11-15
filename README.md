@@ -373,8 +373,9 @@ output-identical on the demuxer side, gated by the full round-trip
 suite):
 
 - `open()`: the per-chunk keyframe map is pre-sized and keyed through
-  a cheap multiplicative `u64` hasher (offsets are self-computed, not
-  attacker-chosen); the idx1 `pc`/`tx` side-band counts collect in
+  a cheap seeded multiply-fold `u64` hasher (the keys are index
+  offsets, which a crafted file chooses, so every key bit and a
+  per-map seed feed the bucket bits); the idx1 `pc`/`tx` side-band counts collect in
   one pass instead of two, and the eager side-band body walks +
   palette-position pass are skipped when the counts prove them empty;
   the pts-assignment pass hoists the per-stream block-align divisor.

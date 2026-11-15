@@ -68,38 +68,89 @@ use crate::stream_format::{
     parse_waveformatex, parse_waveformatextensible, subformat_codec_hint,
 };
 
-/// Cheap deterministic hasher for `u64` file-offset map keys
-/// (round-415 perf). The keyframe map is built once per `open()` with
-/// one insert per indexed packet chunk and probed once per
-/// `next_packet`; the default DoS-resistant hasher dominated the
-/// build cost in profiles. The keys are chunk offsets the demuxer
-/// computed itself — not attacker-chosen map keys — so hash-flood
-/// resistance buys nothing here. Multiplying by the 64-bit golden
-/// ratio (Fibonacci multiplicative hashing) spreads the regular
-/// stride of consecutive chunk offsets across the table's high bits.
-#[derive(Clone, Copy, Default)]
-struct OffsetHasher(u64);
+/// Cheap hasher for `u64` file-offset map keys (round-415 perf). The
+/// keyframe map is built once per `open()` with one insert per indexed
+/// packet chunk and probed once per `next_packet`; the default hasher
+/// dominated the build cost in profiles.
+///
+/// The keys are chunk offsets taken from the file's indexes (`idx1`
+/// `dwChunkOffset`, `ix##` `qwBaseOffset + dwOffset`), so a crafted
+/// index chooses them. A bare multiplicative hash leaves the low bits
+/// of the product — the ones the table buckets on — a function of the
+/// key's low bits alone, and a file whose index offsets all agree in
+/// those bits would chain every insert into one probe sequence
+/// (quadratic `open()`). So the key is first whitened with a per-map
+/// random seed and the product's high half is folded down before a
+/// second multiply: every output bit depends on every key bit and on
+/// the seed. Two multiplies and two shifts per key.
+#[derive(Clone, Copy)]
+struct OffsetHasher {
+    seed: u64,
+    state: u64,
+}
 
 impl std::hash::Hasher for OffsetHasher {
     fn finish(&self) -> u64 {
-        self.0
+        self.state
     }
     fn write(&mut self, bytes: &[u8]) {
         // Generic byte path — required by the trait, not used for the
         // `u64` keys this hasher is scoped to.
         for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.write_u64(self.state ^ b as u64);
         }
     }
     fn write_u64(&mut self, i: u64) {
-        self.0 = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut x = (i ^ self.seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 32;
+        x = x.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        x ^= x >> 32;
+        self.state = x;
     }
 }
 
-/// `HashMap` keyed by self-computed `u64` file offsets via
-/// [`OffsetHasher`].
-type OffsetKeyMap<V> =
-    std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<OffsetHasher>>;
+/// Builds [`OffsetHasher`]s sharing one random seed (drawn once per
+/// map from the standard library's per-process hash keys).
+#[derive(Clone, Copy)]
+struct OffsetHashBuilder {
+    seed: u64,
+}
+
+impl Default for OffsetHashBuilder {
+    fn default() -> Self {
+        use std::hash::BuildHasher;
+        let seed = std::collections::hash_map::RandomState::new().hash_one(0x4156_4958_u64);
+        OffsetHashBuilder { seed }
+    }
+}
+
+impl std::hash::BuildHasher for OffsetHashBuilder {
+    type Hasher = OffsetHasher;
+    fn build_hasher(&self) -> OffsetHasher {
+        OffsetHasher {
+            seed: self.seed,
+            state: 0,
+        }
+    }
+}
+
+/// `HashMap` keyed by `u64` file offsets via [`OffsetHasher`]. Only
+/// ever probed by key, never iterated, so the random seed cannot
+/// affect any output.
+type OffsetKeyMap<V> = std::collections::HashMap<u64, V, OffsetHashBuilder>;
+
+/// Index of the `movi` segment `[start, end)` holding file offset
+/// `off`. `segments` is in file order and disjoint (each `LIST movi`
+/// is appended as the top-level walk meets it, and the walk resumes at
+/// the segment's end), so this is a binary search — a file may carry
+/// tens of thousands of tiny segments, and both the index validators
+/// and every seek ask this once per index chunk / landing point.
+fn movi_segment_containing(segments: &[(u64, u64)], off: u64) -> Option<usize> {
+    let i = segments
+        .partition_point(|&(start, _)| start <= off)
+        .checked_sub(1)?;
+    (off < segments[i].1).then_some(i)
+}
 
 /// `bIndexType` of an `AVIMETAINDEX` super-index (`indx` of indexes).
 const AVI_INDEX_OF_INDEXES: u8 = 0x00;
@@ -1567,7 +1618,6 @@ fn open_avi_inner(
     // (index-aligned with `palette_change_data`); only computable from
     // the static idx1 listing, so populated alongside the eager walk.
     let mut palette_change_positions: Vec<Vec<u64>> = vec![Vec::new(); streams.len()];
-    let mut sideband_data_loaded = false;
     // Round-285: `rec ` LIST entries recorded in idx1 (AVI 1.0 §"AVI
     // Index Entries": idx1 carries "entries for each data chunk,
     // including 'rec ' chunks"). Collected by `build_idx_table` while
@@ -1596,6 +1646,11 @@ fn open_avi_inner(
         // nothing and the position table stays all-empty.
         let any_pc = palette_change_counts.iter().any(|&c| c != 0);
         let any_tx = text_chunk_counts.iter().any(|&c| c != 0);
+        // An index entry is 16 bytes and names any (offset, size) it
+        // likes; thousands of entries naming one large region would
+        // buffer it thousands of times. Genuine side-band chunks are
+        // disjoint, so together they cannot exceed the file.
+        let mut sideband_budget = file_len;
         if any_pc {
             read_sideband_data_from_idx1(
                 &mut *input,
@@ -1604,6 +1659,7 @@ fn open_avi_inner(
                 &streams,
                 *b"pc",
                 &mut palette_change_data,
+                &mut sideband_budget,
             );
             palette_change_positions =
                 compute_palette_change_positions(&raw, &streams, &packet_chunk_suffix);
@@ -1616,9 +1672,9 @@ fn open_avi_inner(
                 &streams,
                 *b"tx",
                 &mut text_chunk_data,
+                &mut sideband_budget,
             );
         }
-        sideband_data_loaded = true;
         // Round-394: streams DECLARED `txts` deliver their `##tx`
         // chunks as packets through `next_packet` — for those slots
         // the tx chunks are the stream's data, not side-band, so the
@@ -1774,9 +1830,7 @@ fn open_avi_inner(
             let seg = seg_per_stream.entry(stream).or_default();
             let segment_index = *seg;
             *seg += 1;
-            let inside_movi = movi_segments
-                .iter()
-                .any(|&(start, end)| ix.qw_base_offset >= start && ix.qw_base_offset < end);
+            let inside_movi = movi_segment_containing(&movi_segments, ix.qw_base_offset).is_some();
             if !inside_movi {
                 metadata.push((
                     format!("avi:ix.{stream}.{segment_index}.base_outside_movi"),
@@ -2094,7 +2148,11 @@ fn open_avi_inner(
     // 2-field interlace.
     if !idx_table.is_empty() {
         const PART_BOTH: u32 = 0x0020 | 0x0040; // AVIIF_FIRSTPART | AVIIF_LASTPART
-        for s in 0..(streams.len() as u32) {
+        // A chunk id names its stream in two hex digits, so no index
+        // entry can belong to a stream past `ADDRESSABLE_STREAMS`:
+        // bounding the per-stream walks there keeps a hostile header
+        // with thousands of `strl` lists from turning them quadratic.
+        for s in 0..(streams.len().min(ADDRESSABLE_STREAMS) as u32) {
             // Skip streams that already produced an `avi:idx1.<n>.is_2field`
             // hint via the ix##-driven path above.
             if field2_streams_seen.contains(&s) {
@@ -2170,7 +2228,8 @@ fn open_avi_inner(
     // matches `IdxEntry::offset`.
     if !idx_table.is_empty() && !std_indexes.is_empty() {
         let primary_range = movi_segments.first().copied();
-        for (s_idx, _) in streams.iter().enumerate() {
+        let sideband_offsets = idx1_sideband_offsets(&idx_table);
+        for (s_idx, _) in streams.iter().enumerate().take(ADDRESSABLE_STREAMS) {
             let stream_id = s_idx as u32;
             let idx1_for_stream: Vec<(u64, u32)> = idx_table
                 .iter()
@@ -2199,10 +2258,10 @@ fn open_avi_inner(
                     continue;
                 }
                 for entry in &ix.entries {
-                    let header_off = ix
-                        .qw_base_offset
-                        .saturating_add(entry.dw_offset as u64)
-                        .saturating_sub(8);
+                    let header_off = ix.entry_header_offset(entry);
+                    if !sideband_offsets.is_empty() && sideband_offsets.contains(&header_off) {
+                        continue;
+                    }
                     ix_for_stream.push((header_off, entry.dw_size));
                 }
             }
@@ -2455,6 +2514,14 @@ fn open_avi_inner(
         })
         .collect();
 
+    // Everything `idx1` lists is accounted for (see
+    // `sideband_recorded_end`); the walk records what lies past it.
+    let sideband_recorded_end = idx_table
+        .iter()
+        .map(|e| e.offset.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
@@ -2498,7 +2565,7 @@ fn open_avi_inner(
         palette_change_data,
         palette_change_positions,
         text_chunk_data,
-        sideband_data_loaded,
+        sideband_recorded_end,
         video_strf: video_strfs,
         audio_strf: audio_strfs,
         stream_names,
@@ -4464,15 +4531,29 @@ fn super_index_stale_targets(
     stream_index: u32,
 ) -> Vec<(usize, u64)> {
     let mut out = Vec::new();
+    if sx.entries.is_empty() {
+        return out;
+    }
+    // Header offsets of this stream's `ix##` chunks, hashed once: a
+    // hostile file can pair a long super-index with thousands of tiny
+    // `ix##` chunks, and a scan per entry would be quadratic.
+    // (No chunk id can name a stream past `ADDRESSABLE_STREAMS`, so
+    // such a stream has no `ix##` to look through.)
+    let found: std::collections::HashSet<u64> = std_indexes
+        .iter()
+        .take(if (stream_index as usize) < ADDRESSABLE_STREAMS {
+            usize::MAX
+        } else {
+            0
+        })
+        .filter(|ix| ix.chunk_offset != 0 && parse_stream_index(&ix.chunk_id) == Some(stream_index))
+        .map(|ix| ix.chunk_offset)
+        .collect();
     for (k, e) in sx.entries.iter().enumerate() {
         if e.qw_offset == 0 {
             continue;
         }
-        let hit = std_indexes.iter().any(|ix| {
-            ix.chunk_offset != 0
-                && ix.chunk_offset == e.qw_offset
-                && parse_stream_index(&ix.chunk_id) == Some(stream_index)
-        });
+        let hit = found.contains(&e.qw_offset);
         if !hit {
             out.push((k, e.qw_offset));
         }
@@ -5528,6 +5609,7 @@ fn read_sideband_data_from_idx1<R: ReadSeek + ?Sized>(
     streams: &[StreamInfo],
     suffix: [u8; 2],
     out: &mut [Vec<Vec<u8>>],
+    budget: &mut u64,
 ) {
     if raw.len() < 16 || out.len() < streams.len() {
         return;
@@ -5599,8 +5681,16 @@ fn read_sideband_data_from_idx1<R: ReadSeek + ?Sized>(
         if r.seek(SeekFrom::Start(chunk_off + 8)).is_err() {
             continue;
         }
+        if u64::from(size) > *budget {
+            // More side-band bytes claimed than the file holds: the
+            // entries overlap. Keep what was read; stop buffering.
+            break;
+        }
         match read_body_bounded(r, size) {
-            Ok(body) => out[s].push(body),
+            Ok(body) => {
+                *budget -= body.len() as u64;
+                out[s].push(body);
+            }
             Err(_) => continue,
         }
     }
@@ -6277,7 +6367,7 @@ pub struct AviDemuxer {
     /// the packet-sequence-based [`AviDemuxer::effective_palette_at`]:
     /// a delta with preceding-count `p` is in effect for every data
     /// packet of sequence `>= p`. Populated only when the eager `idx1`
-    /// walk supplied the data (`sideband_data_loaded == true`); empty
+    /// walk supplied the data; empty
     /// for `idx1`-less files, where the packet-sequence accessor can't
     /// place the deltas and returns `None`.
     palette_change_positions: Vec<Vec<u64>>,
@@ -6288,12 +6378,13 @@ pub struct AviDemuxer {
     /// caption / subtitle / cuepoint string written by
     /// [`crate::muxer::AviMuxer::write_text_chunk`].
     text_chunk_data: Vec<Vec<Vec<u8>>>,
-    /// `true` once the side-band data buffers have been populated from
-    /// `idx1` at `open()` time. The lazy `next_packet` skip-and-buffer
-    /// path checks this flag to avoid double-appending the same chunks
-    /// once the eager path already cached them. `false` for `idx1`-less
-    /// (OpenDML-only) files where `next_packet` is the only producer.
-    sideband_data_loaded: bool,
+    /// File offset below which every side-band chunk has been counted
+    /// and buffered: just past the last chunk `idx1` lists after
+    /// `open()`, then advanced by the `movi` walk (which records the
+    /// side-band chunks `idx1` does not reach — `RIFF AVIX` segments,
+    /// the tail of a file whose index was cut short — exactly once,
+    /// however often a seek makes the walk pass them again).
+    sideband_recorded_end: u64,
     /// Per-video-stream BMIH-derived side-info (top-down orientation,
     /// `BI_BITFIELDS` color masks) — round-19 candidates 1+2 per VfW
     /// `wingdi.h` §"biHeight sign rules" and §"BI_BITFIELDS". Indexed
@@ -8192,79 +8283,17 @@ impl Demuxer for AviDemuxer {
                 if (idx as usize) < self.streams.len() {
                     let expected = self.packet_chunk_suffix[idx as usize];
                     let suffix = [hdr.id[2], hdr.id[3]];
-                    // Round-8 candidate 3: explicitly recognise `xxpc`
-                    // VfW palette-change chunks. They're not regular
-                    // video data so we still skip them from the packet
-                    // stream, but we bump the per-stream counter
-                    // (lazily — the static idx1 scan in `open()`
-                    // already covers files with idx1; this catches
-                    // idx1-less files where the runtime walk is the
-                    // only path that sees these chunks). The cap
-                    // doubles as a guard against malformed files
-                    // declaring billions of palette changes.
-                    if suffix == *b"pc" {
-                        let s = idx as usize;
-                        if self.palette_change_counts.len() <= s {
-                            self.palette_change_counts.resize(s + 1, 0);
-                        }
-                        self.palette_change_counts[s] =
-                            self.palette_change_counts[s].saturating_add(1);
-                        // Round-12 C1: also buffer the body so
-                        // `palette_change_data(stream)` can return it.
-                        // Skip when the eager `idx1` walk in `open()`
-                        // already populated the buffer (avoids double-
-                        // append on idx1-bearing files where
-                        // `next_packet` re-walks the same chunks).
-                        if self.sideband_data_loaded {
-                            skip_chunk(&mut *self.input, &hdr)?;
-                        } else {
-                            if self.palette_change_data.len() <= s {
-                                self.palette_change_data.resize(s + 1, Vec::new());
-                            }
-                            match read_body_bounded(&mut *self.input, hdr.size) {
-                                Ok(body) => {
-                                    skip_pad(&mut *self.input, hdr.size)?;
-                                    self.palette_change_data[s].push(body);
-                                }
-                                Err(_) => {
-                                    skip_chunk(&mut *self.input, &hdr)?;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    // Round-10 C1: explicitly recognise `xxtx`
-                    // text/subtitle chunks per `mmsystem.h`'s
-                    // text-stream FourCC family. Same handling shape
-                    // as `xxpc` — skip from the packet stream, bump
-                    // the per-stream counter so the metadata key
-                    // `avi:text_chunk.<stream>` and the typed
-                    // [`AviDemuxer::text_chunk_count`] accessor stay
-                    // in sync with what the static idx1 scan
-                    // produced for files that have an idx1.
-                    if suffix == *b"tx" && expected != *b"tx" {
-                        let s = idx as usize;
-                        if self.text_chunk_counts.len() <= s {
-                            self.text_chunk_counts.resize(s + 1, 0);
-                        }
-                        self.text_chunk_counts[s] = self.text_chunk_counts[s].saturating_add(1);
-                        // Round-12 C1: same body-buffer hookup as `xxpc`.
-                        if self.sideband_data_loaded {
-                            skip_chunk(&mut *self.input, &hdr)?;
-                        } else {
-                            if self.text_chunk_data.len() <= s {
-                                self.text_chunk_data.resize(s + 1, Vec::new());
-                            }
-                            match read_body_bounded(&mut *self.input, hdr.size) {
-                                Ok(body) => {
-                                    skip_pad(&mut *self.input, hdr.size)?;
-                                    self.text_chunk_data[s].push(body);
-                                }
-                                Err(_) => {
-                                    skip_chunk(&mut *self.input, &hdr)?;
-                                }
-                            }
-                        }
+                    // Side-band chunks — `##pc` palette changes, and
+                    // `##tx` text riding on a non-text stream — are not
+                    // packets: they are counted and their bodies kept
+                    // for the typed accessors (once per chunk).
+                    if suffix == *b"pc" || (suffix == *b"tx" && expected != *b"tx") {
+                        self.note_sideband_chunk(
+                            idx as usize,
+                            suffix == *b"tx",
+                            &hdr,
+                            chunk_header_off,
+                        )?;
                         continue;
                     }
                     let accept = suffix == expected
@@ -8411,10 +8440,7 @@ impl Demuxer for AviDemuxer {
         if target_off < self.movi_start {
             target_off = self.movi_start;
         }
-        let seg = self
-            .movi_segments
-            .iter()
-            .position(|&(s, e)| target_off >= s && target_off < e)
+        let seg = movi_segment_containing(&self.movi_segments, target_off)
             .ok_or_else(|| Error::invalid("AVI: idx1 entry points past end of movi segments"))?;
         self.current_segment = seg;
         self.input.seek(SeekFrom::Start(target_off))?;
@@ -8784,7 +8810,7 @@ impl AviDemuxer {
     /// effect for every data packet of sequence `>= p`.
     ///
     /// Computed from the static `idx1` listing, so it's available only
-    /// for files that carry an `idx1` (`sideband_data_loaded`). Returns
+    /// for files that carry an `idx1`. Returns
     /// an empty slice for `idx1`-less (OpenDML-only) files — where the
     /// packet-sequence accessor [`Self::effective_palette_at`] can't
     /// place the deltas — and for unknown `stream_index`.
@@ -9587,10 +9613,8 @@ impl AviDemuxer {
             let seg = seg_per_stream.entry(stream).or_default();
             let segment_index = *seg;
             *seg += 1;
-            let inside_movi = self
-                .movi_segments
-                .iter()
-                .any(|&(start, end)| ix.qw_base_offset >= start && ix.qw_base_offset < end);
+            let inside_movi =
+                movi_segment_containing(&self.movi_segments, ix.qw_base_offset).is_some();
             if !inside_movi {
                 out.push(StdIndexBaseOffsetViolation {
                     stream_index: stream,
@@ -11880,10 +11904,7 @@ impl AviDemuxer {
         if target_off < self.movi_start {
             target_off = self.movi_start;
         }
-        let seg = self
-            .movi_segments
-            .iter()
-            .position(|&(s, e)| target_off >= s && target_off < e)
+        let seg = movi_segment_containing(&self.movi_segments, target_off)
             .ok_or_else(|| Error::invalid("AVI: idx1 entry points past end of movi segments"))?;
         self.current_segment = seg;
         self.input.seek(SeekFrom::Start(target_off))?;
@@ -12002,10 +12023,7 @@ impl AviDemuxer {
             ))
         })?;
         // Find which segment hosts this offset.
-        let seg = self
-            .movi_segments
-            .iter()
-            .position(|&(s, e)| target_off >= s && target_off < e)
+        let seg = movi_segment_containing(&self.movi_segments, target_off)
             .ok_or_else(|| Error::invalid("AVI: ix## entry points outside of any movi segment"))?;
         self.current_segment = seg;
         self.input.seek(SeekFrom::Start(target_off))?;
@@ -12049,6 +12067,56 @@ impl AviDemuxer {
             }
         }
         Ok(landed_pts)
+    }
+
+    /// A side-band chunk (`##pc`, or `##tx` on a non-text stream) met
+    /// by the `movi` walk at `header_off`, positioned just past its
+    /// header: count it and keep its body — once. Chunks below
+    /// `sideband_recorded_end` were recorded already, by the `idx1`
+    /// pass at `open()` or by an earlier walk (a seek back re-reads
+    /// them), and are only skipped. The recorded chunks are disjoint
+    /// byte ranges of the file, so the buffers can never hold more
+    /// than the file does.
+    fn note_sideband_chunk(
+        &mut self,
+        s: usize,
+        text: bool,
+        hdr: &crate::riff::ChunkHeader,
+        header_off: u64,
+    ) -> Result<()> {
+        if header_off < self.sideband_recorded_end {
+            return skip_chunk(&mut *self.input, hdr);
+        }
+        self.sideband_recorded_end = header_off
+            .saturating_add(8)
+            .saturating_add(hdr.padded_size());
+        let (counts, data) = if text {
+            (&mut self.text_chunk_counts, &mut self.text_chunk_data)
+        } else {
+            (
+                &mut self.palette_change_counts,
+                &mut self.palette_change_data,
+            )
+        };
+        if counts.len() <= s {
+            counts.resize(s + 1, 0);
+        }
+        counts[s] = counts[s].saturating_add(1);
+        if data.len() <= s {
+            data.resize(s + 1, Vec::new());
+        }
+        match read_body_bounded(&mut *self.input, hdr.size) {
+            Ok(body) => {
+                skip_pad(&mut *self.input, hdr.size)?;
+                data[s].push(body);
+            }
+            Err(_) => {
+                // Truncated body: the walk ends at the next read.
+                self.input
+                    .seek(SeekFrom::Start(self.sideband_recorded_end))?;
+            }
+        }
+        Ok(())
     }
 
     /// Build [`SeekCache`] on first use (round-415 perf). The source
@@ -12203,6 +12271,9 @@ fn seek_cache_select_keyframe(
     }
     best.or_else(|| keyframes.first().copied())
 }
+
+/// Number of streams a `##xx` chunk id can name (two hex digits).
+const ADDRESSABLE_STREAMS: usize = 256;
 
 /// Parse "NNsf" where NN is two ASCII digits into the stream index.
 fn parse_stream_index(name: &[u8; 4]) -> Option<u32> {

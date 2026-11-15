@@ -77,6 +77,19 @@ pub fn registry() -> CodecRegistry {
     let mut reg = CodecRegistry::new();
     reg.register(CodecInfo::new(CodecId::new("magicyuv")).tag(CodecTag::fourcc(b"M8RG")));
     reg.register(CodecInfo::new(CodecId::new("mjpeg")).tag(CodecTag::fourcc(b"MJPG")));
+    // Families whose first frame / configuration record the demuxer
+    // reads for the decoded layout: registered so the resolved-id
+    // route is exercised as well as the bare-FourCC one (the corpus
+    // seeds `seed_video_*.avi` carry these FourCCs).
+    for (id, tag) in [
+        ("h264", b"H264"),
+        ("hevc", b"HEVC"),
+        ("vp9", b"VP90"),
+        ("av1", b"AV01"),
+        ("mpeg4video", b"XVID"),
+    ] {
+        reg.register(CodecInfo::new(CodecId::new(id)).tag(CodecTag::fourcc(tag)));
+    }
     reg
 }
 
