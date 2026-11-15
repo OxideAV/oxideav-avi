@@ -16,6 +16,14 @@
 //!   * `seek/…`  — keyframe seek: the `idx1`-backed `seek_to` path and
 //!     the OpenDML `ix##` std-index path (`idx1` FourCC blanked so the
 //!     demuxer must use the std-index tables).
+//!   * `large_index/…` — the same four paths on a file whose cost is
+//!     the index, not the payload: 400 000 chunks of 16–48 bytes
+//!     (~27 MiB of chunk headers + two index entries per chunk). Open
+//!     time with a large index, packets/s for the walk and the mux.
+//!   * `file_io/…` — that same fixture through `std::fs::File` in the
+//!     system temp directory (no caller-side buffering): what the
+//!     container costs in system calls, which an in-memory `Cursor`
+//!     cannot show.
 
 use std::hint::black_box;
 use std::io::{Cursor, Seek, SeekFrom, Write};
@@ -39,8 +47,6 @@ const FRAMES: usize = 1500;
 const VIDEO_PAYLOAD: usize = 2048;
 /// Synthetic audio payload bytes per packet: 480 stereo S16 samples.
 const AUDIO_PAYLOAD: usize = 1920;
-/// Audio samples per packet (payload / block_align = 1920 / 4).
-const AUDIO_SAMPLES_PER_PKT: i64 = 480;
 /// Video keyframe cadence: every 8th frame is flagged as a keyframe.
 const KEYFRAME_EVERY: usize = 8;
 
@@ -133,9 +139,20 @@ fn payload(seed: u32, len: usize) -> Vec<u8> {
 /// Pre-built packet load shared by every mux iteration: interleaved
 /// video/audio, video keyframe every [`KEYFRAME_EVERY`] frames.
 fn build_packets(streams: &[StreamInfo; 2]) -> Vec<Packet> {
-    let mut pkts = Vec::with_capacity(FRAMES * 2);
-    for i in 0..FRAMES {
-        let mut v = Packet::new(0, streams[0].time_base, payload(i as u32, VIDEO_PAYLOAD));
+    build_packets_sized(streams, FRAMES, VIDEO_PAYLOAD, AUDIO_PAYLOAD)
+}
+
+/// `frames` video packets of `video_len` bytes interleaved with as
+/// many audio packets of `audio_len` bytes (a multiple of 4).
+fn build_packets_sized(
+    streams: &[StreamInfo; 2],
+    frames: usize,
+    video_len: usize,
+    audio_len: usize,
+) -> Vec<Packet> {
+    let mut pkts = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        let mut v = Packet::new(0, streams[0].time_base, payload(i as u32, video_len));
         v.pts = Some(i as i64);
         v.flags.keyframe = i % KEYFRAME_EVERY == 0;
         pkts.push(v);
@@ -143,9 +160,9 @@ fn build_packets(streams: &[StreamInfo; 2]) -> Vec<Packet> {
         let mut a = Packet::new(
             1,
             streams[1].time_base,
-            payload(0x8000_0000 | i as u32, AUDIO_PAYLOAD),
+            payload(0x8000_0000 | i as u32, audio_len),
         );
-        a.pts = Some(i as i64 * AUDIO_SAMPLES_PER_PKT);
+        a.pts = Some(i as i64 * (audio_len / 4) as i64);
         a.flags.keyframe = true;
         pkts.push(a);
     }
@@ -326,5 +343,111 @@ fn bench_seek(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_mux, bench_open, bench_walk, bench_seek);
+/// Frames of the index-bound fixture (two chunks per frame).
+const BIG_FRAMES: usize = 200_000;
+/// Its payload sizes: small enough that chunk headers and index
+/// entries, not payload bytes, are what the file is made of.
+const BIG_VIDEO_PAYLOAD: usize = 48;
+const BIG_AUDIO_PAYLOAD: usize = 16;
+
+fn bench_large_index(c: &mut Criterion) {
+    let streams = fixture_streams();
+    let packets = build_packets_sized(&streams, BIG_FRAMES, BIG_VIDEO_PAYLOAD, BIG_AUDIO_PAYLOAD);
+    let reg = fixture_registry();
+    let avi10 = mux_fixture_bytes(AviKind::Avi10, &streams, &packets);
+    let opendml = mux_fixture_bytes(OPENDML_1MIB, &streams, &packets);
+    let capacity = avi10.len().max(opendml.len()) + 65536;
+
+    let mut g = c.benchmark_group("large_index");
+    g.sample_size(10);
+    g.throughput(Throughput::Elements(packets.len() as u64));
+    for (name, kind) in [("avi10", AviKind::Avi10), ("opendml", OPENDML_1MIB)] {
+        g.bench_function(format!("mux_{name}_400k_chunks"), |b| {
+            b.iter(|| {
+                let ws: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::with_capacity(capacity)));
+                mux_into(ws, kind, &streams, &packets);
+            });
+        });
+    }
+    for (name, bytes) in [("avi10", &avi10), ("opendml", &opendml)] {
+        g.bench_function(format!("open_{name}_400k_chunks"), |b| {
+            b.iter_batched(
+                || bytes.clone(),
+                |bytes| black_box(open_demuxer(bytes, &reg)),
+                BatchSize::LargeInput,
+            );
+        });
+        g.bench_function(format!("walk_{name}_400k_chunks"), |b| {
+            b.iter_batched(
+                || open_demuxer(bytes.clone(), &reg),
+                |mut dmx| {
+                    let mut n = 0usize;
+                    while let Ok(p) = dmx.next_packet() {
+                        n += p.data.len();
+                    }
+                    black_box(n)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    g.finish();
+}
+
+/// The index-bound fixture again, through unbuffered `std::fs::File`s.
+fn bench_file_io(c: &mut Criterion) {
+    let streams = fixture_streams();
+    let packets = build_packets_sized(&streams, BIG_FRAMES, BIG_VIDEO_PAYLOAD, BIG_AUDIO_PAYLOAD);
+    let reg = fixture_registry();
+    let dir = std::env::temp_dir().join(format!("oxideav-avi-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("bench temp dir");
+
+    let mut g = c.benchmark_group("file_io");
+    g.sample_size(10);
+    g.throughput(Throughput::Elements(packets.len() as u64));
+    for (name, kind) in [("avi10", AviKind::Avi10), ("opendml", OPENDML_1MIB)] {
+        let path = dir.join(format!("{name}.avi"));
+        g.bench_function(format!("mux_{name}_400k_chunks"), |b| {
+            b.iter(|| {
+                let f = std::fs::File::create(&path).expect("create");
+                mux_into(Box::new(f), kind, &streams, &packets);
+            });
+        });
+        // The last mux iteration left the finished file behind.
+        g.bench_function(format!("open_{name}_400k_chunks"), |b| {
+            b.iter(|| {
+                let f = std::fs::File::open(&path).expect("open");
+                black_box(oxideav_avi::demuxer::open_avi(Box::new(f), &reg).expect("demux open"))
+            });
+        });
+        g.bench_function(format!("walk_{name}_400k_chunks"), |b| {
+            b.iter_batched(
+                || {
+                    let f = std::fs::File::open(&path).expect("open");
+                    oxideav_avi::demuxer::open_avi(Box::new(f), &reg).expect("demux open")
+                },
+                |mut dmx| {
+                    let mut n = 0usize;
+                    while let Ok(p) = dmx.next_packet() {
+                        n += p.data.len();
+                    }
+                    black_box(n)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    g.finish();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+criterion_group!(
+    benches,
+    bench_mux,
+    bench_open,
+    bench_walk,
+    bench_seek,
+    bench_large_index,
+    bench_file_io
+);
 criterion_main!(benches);
