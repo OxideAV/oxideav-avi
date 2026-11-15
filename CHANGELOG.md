@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-avi/compare/v0.0.11...v0.0.12) - 2026-11-15
+
+### Other
+
+- a raw DIB with no columns or rows has no row layout (15 s per packet on a 431-byte file)
+- block I/O on both sides, sorted keyframe table — file mux 83x, file walk 41x, OpenDML open 31x
+- large_index and file_io groups — 400 000 small chunks, in memory and through std::fs::File
+- bound hostile-index cost — seeded offset hash, side-band budget, hashed/binary-searched validators; side-band chunks recorded once
+- side-band chunks are not frames in any index; fuzz oracle follows zero-length slots
+- API hygiene: #[non_exhaustive] growable types, #[doc(hidden)] internals
+
 ### Performance
 
 - Demuxer and muxer do their own block I/O: a position-tracking
