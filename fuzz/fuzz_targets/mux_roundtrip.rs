@@ -19,13 +19,22 @@
 //!     in-`strl` compact index the recipe picked;
 //!   * the demuxer must report the same stream count and, per
 //!     stream, the same packet count and byte-identical payloads in
-//!     order;
+//!     order — where "packet" follows the container's own rule: a
+//!     zero-length data chunk is a frame-time slot with no frame
+//!     (`dwSampleSize` 0: one chunk per frame-time; only an
+//!     `AVIIF_NO_TIME` chunk does not affect timing — AVI 1.0
+//!     §AVISTREAMHEADER / §AVIOLDINDEX), so an empty video packet
+//!     handed to the muxer is NOT returned by the demuxer, but the
+//!     stream clock counts it: every returned video packet must carry
+//!     the frame-slot number it was written at as its `pts`;
 //!   * every video packet's demuxed `flags.keyframe` must equal the
 //!     flag the muxer was handed (AVI 1.0 Appendix C
 //!     `AVIIF_KEYFRAME` on the idx1 side, the OpenDML `ix##`
 //!     `dwSize` delta high bit on the AVIX side);
-//!   * when stream 0 is video, non-empty, and starts on a keyframe,
-//!     `seek_to(0, 0)` must land.
+//!   * when stream 0 is video and its first packet is a non-empty
+//!     keyframe, `seek_to(0, 0)` must land and the next packet read
+//!     must exist; on every other plan the seek may refuse but must
+//!     not panic.
 //!
 //! The arithmetic under fire: the RIFF AVIX segment-roll projection
 //! (tiny `RiffSegmentLimit::Bytes` ceilings force a roll every few
@@ -65,14 +74,28 @@ fuzz_target!(|data: &[u8]| {
     );
 
     let n = plan.streams.len();
-    let mut got: Vec<Vec<(Vec<u8>, bool)>> = vec![Vec::new(); n];
+    // What the demuxer owes us back: every non-empty packet, with the
+    // frame-slot number it was written at (video) — a zero-length
+    // chunk takes its slot on the stream clock but is not a packet.
+    let want: Vec<Vec<(&[u8], bool, i64)>> = plan
+        .sent
+        .iter()
+        .map(|list| {
+            list.iter()
+                .enumerate()
+                .filter(|(_, (d, _))| !d.is_empty())
+                .map(|(slot, (d, k))| (d.as_slice(), *k, slot as i64))
+                .collect()
+        })
+        .collect();
+    let mut got: Vec<Vec<(Vec<u8>, bool, Option<i64>)>> = vec![Vec::new(); n];
     let cap = plan.total_packets() + 64;
     for _ in 0..cap {
         match dmx.next_packet() {
             Ok(p) => {
                 let s = p.stream_index as usize;
                 assert!(s < n, "demuxed packet stream index in range");
-                got[s].push((p.data, p.flags.keyframe));
+                got[s].push((p.data, p.flags.keyframe, p.pts));
             }
             Err(Error::Eof) => break,
             Err(e) => panic!("demux error on muxer output: {e}"),
@@ -82,27 +105,43 @@ fuzz_target!(|data: &[u8]| {
     for (s, got_s) in got.iter().enumerate() {
         assert_eq!(
             got_s.len(),
-            plan.sent[s].len(),
-            "stream {s}: packet count must survive the round trip"
+            want[s].len(),
+            "stream {s}: non-empty packet count must survive the round trip"
         );
-        for (i, ((gd, gk), (sd, sk))) in got_s.iter().zip(plan.sent[s].iter()).enumerate() {
+        for (i, ((gd, gk, gpts), (sd, sk, slot))) in got_s.iter().zip(want[s].iter()).enumerate() {
             assert_eq!(gd, sd, "stream {s} packet {i}: payload bytes must match");
             if plan.is_video[s] {
                 assert_eq!(
                     gk, sk,
                     "stream {s} packet {i}: video keyframe flag must survive"
                 );
+                assert_eq!(
+                    *gpts,
+                    Some(*slot),
+                    "stream {s} packet {i}: pts must be the frame slot it was written at"
+                );
+                assert_eq!(
+                    dmx.packet_is_keyframe(s as u32, i),
+                    Some(*sk),
+                    "stream {s} packet {i}: index keyframe view must follow returned packets"
+                );
             }
         }
     }
 
     // -- Seek contract on the leading video stream. -------------------
-    if plan.is_video[0] && !plan.sent[0].is_empty() && plan.sent[0][0].1 {
+    let lead = plan.is_video[0].then(|| plan.sent[0].first()).flatten();
+    if lead.is_some_and(|(d, kf)| !d.is_empty() && *kf) {
         dmx.seek_to(0, 0)
             .expect("seek to pts 0 must land on a file whose first video packet is a keyframe");
         let p = dmx
             .next_packet()
             .expect("a packet must follow a landed seek");
         let _ = p;
+    } else {
+        // Empty lead slot / no video: landing is the file's business,
+        // not panicking is ours.
+        let _ = dmx.seek_to(0, 0);
+        let _ = dmx.next_packet();
     }
 });

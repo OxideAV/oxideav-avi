@@ -27,6 +27,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entries, `VIDEO_FIELD_DESC`) and `AviKind` (the two envelope forms)
   stay exhaustive.
 
+### Fixed
+
+- Side-band chunks (`##pc` palette changes, `##tx` text on a non-text
+  stream) no longer count as frames in any index walk. Their `idx1`
+  entries used to advance the per-stream clock and occupy a slot in the
+  keyframe table, so `packet_is_keyframe` /
+  `keyframe_indexed_packet_count` drifted from the packets `next_packet`
+  returns, a seek could land on a side-band chunk, and packets read
+  after a seek carried timestamps advanced by one tick per side-band
+  chunk passed. `palette_change_packet_positions` likewise counts only
+  returned packets (zero-length frame slots and side-band text are not
+  packets). Found by the `mux_roundtrip` fuzz target.
+- The muxer no longer enters side-band chunks in the stream's `ix##`
+  standard index, which lists frames only ("Palette changes should not
+  appear in the same Index List as ##dc chunks", OpenDML "Index
+  Locations in RIFF File"), and flags their `idx1` entries
+  `AVIIF_NO_TIME` ("should be set for palette changes", AVI 1.0
+  §AVIOLDINDEX). The demuxer still reads files written the old way
+  correctly where `idx1` identifies the side-band chunks.
+- Fuzz: the `mux_roundtrip` oracle expected zero-length video packets
+  back; since 0.0.11 they are frame-time slots, not packets, which is
+  what turned the scheduled run red. The oracle now checks that every
+  returned video packet carries the frame slot it was written at and
+  that `packet_is_keyframe` follows the returned packets.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-avi/compare/v0.0.10...v0.0.11) - 2026-11-07
 
 ### Other

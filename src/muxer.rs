@@ -4667,10 +4667,10 @@ impl AviMuxer {
     /// after [`oxideav_core::Muxer::write_header`] and before
     /// [`oxideav_core::Muxer::write_trailer`]. Honours the active
     /// `LIST rec ` clustering and OpenDML segment-rolling, and
-    /// records both an `idx1` entry (with no `AVIIF_KEYFRAME` bit so
-    /// the demuxer's `scan_idx1_for_suffix` picks it up under
-    /// `text_chunk_count`) and an `ix##` standard-index entry when
-    /// in `AviKind::OpenDml` mode.
+    /// records an `idx1` entry flagged `AVIIF_NO_TIME` (primary
+    /// segment; the demuxer counts it under `text_chunk_count`). The
+    /// stream's `ix##` standard index lists frames only and does not
+    /// carry it.
     ///
     /// Does NOT bump `strh.dwLength` for the parent stream — the
     /// chunk lives alongside the stream's regular packets without
@@ -4739,10 +4739,9 @@ impl AviMuxer {
     /// change). Lays out the chunk into the current `movi` LIST,
     /// honours `LIST rec ` clustering, rolls a fresh OpenDML segment
     /// when the projected size would push past the configured
-    /// byte limit, records an `idx1` entry (no `AVIIF_KEYFRAME` so
-    /// the demuxer's suffix scanner attributes the chunk to the
-    /// per-stream side-band counter), and stamps an `ix##`
-    /// standard-index entry when in OpenDML mode.
+    /// byte limit, and records an `idx1` entry flagged `AVIIF_NO_TIME`
+    /// (primary segment). The stream's `ix##` standard index lists
+    /// frames only, so the chunk is not entered there.
     fn write_sideband_chunk(
         &mut self,
         stream_index: u32,
@@ -4822,38 +4821,35 @@ impl AviMuxer {
         let rel_off_opt = chunk_off.checked_sub(self.movi_start_off);
         let size = data.len() as u32;
 
-        // OpenDML std-index: record the side-band chunk so the
-        // segment-tail `ix##` flush includes it, mirroring how
-        // regular packets land. The chunk is never a keyframe, so
-        // the high `dwSize` bit is set to flag a delta-frame entry.
-        if matches!(self.kind, AviKind::OpenDml(_)) {
+        // A side-band chunk never enters the stream's `ix##` standard
+        // index: that index lists the `##dc` / `##db` / `##wb` chunks
+        // its `dwChunkId` names, one entry per frame, and "Palette
+        // changes should not appear in the same Index List as ##dc
+        // chunks, since they eliminate the ability to access an element
+        // (frame) directly without having to scan the list" (OpenDML
+        // AVI File Format Extensions, "Index Locations in RIFF File").
+        // The chunk stays reachable through `idx1` (primary segment)
+        // and the `movi` walk.
+        //
+        // idx1 flags: `AVIIF_NO_TIME` — "The chunk does not affect
+        // timing. For example, this flag should be set for palette
+        // changes" (AVI 1.0 §AVIOLDINDEX); no `AVIIF_KEYFRAME`.
+        if matches!(self.kind, AviKind::OpenDml(_))
+            && self.options.synthesise_idx1_from_ix
+            && self.segments.is_empty()
+        {
             let qw_base = self.movi_start_off + 4;
             let data_off = chunk_off + 8;
             if let Some(d) = data_off.checked_sub(qw_base)
                 && d <= u32::MAX as u64
             {
-                let dw_size_with_flag = size | 0x8000_0000;
-                let ix_entry = IxStdEntry {
-                    dw_offset: d as u32,
-                    dw_size_with_flag,
-                    dw_offset_field2: 0,
-                };
-                self.tracks[idx].ix_entries.push(ix_entry);
-                self.check_strl_std_overflow(idx);
-                if self.options.synthesise_idx1_from_ix && self.segments.is_empty() {
-                    // Side-band chunks (xxtx / xxpc) carry no
-                    // AVIIF_KEYFRAME bit so the demuxer's
-                    // suffix-scanner attributes them to the
-                    // per-stream side-band counter (mirror of the
-                    // `flags = 0` rule below).
-                    let idx1_offset = (d as u32).saturating_sub(4);
-                    self.primary_ix_snapshot.push(PrimaryIxSnapshot {
-                        ckid: fourcc,
-                        flags: 0,
-                        offset: idx1_offset,
-                        size,
-                    });
-                }
+                let idx1_offset = (d as u32).saturating_sub(4);
+                self.primary_ix_snapshot.push(PrimaryIxSnapshot {
+                    ckid: fourcc,
+                    flags: crate::demuxer::AVIIF_NO_TIME,
+                    offset: idx1_offset,
+                    size,
+                });
             }
         }
 
@@ -4864,11 +4860,7 @@ impl AviMuxer {
             self.rec_bytes_in_cluster += 8u64 + data.len() as u64 + (data.len() & 1) as u64;
         }
 
-        // idx1 entry — flags = 0 so the demuxer's
-        // `scan_idx1_for_suffix(*b"tx", ...)` /
-        // `scan_idx1_for_suffix(*b"pc", ...)` picks up the chunk
-        // under the per-stream side-band counter (the scanner only
-        // matches on the chunk-id suffix; flags don't gate it).
+        // idx1 entry (`AVIIF_NO_TIME`, see above).
         let in_primary_segment = self.segments.is_empty();
         if in_primary_segment
             && let Some(rel_off) = rel_off_opt
@@ -4876,7 +4868,7 @@ impl AviMuxer {
         {
             self.index.push(IndexEntry {
                 ckid: fourcc,
-                flags: 0,
+                flags: crate::demuxer::AVIIF_NO_TIME,
                 offset: rel_off as u32,
                 size,
             });

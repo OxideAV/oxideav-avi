@@ -1605,7 +1605,8 @@ fn open_avi_inner(
                 *b"pc",
                 &mut palette_change_data,
             );
-            palette_change_positions = compute_palette_change_positions(&raw, &streams);
+            palette_change_positions =
+                compute_palette_change_positions(&raw, &streams, &packet_chunk_suffix);
         }
         if any_tx {
             read_sideband_data_from_idx1(
@@ -1633,7 +1634,13 @@ fn open_avi_inner(
                 }
             }
         }
-        let (table, recs) = build_idx_table(&mut *input, &raw, movi_start, &chunk_divisors)?;
+        let (table, recs) = build_idx_table(
+            &mut *input,
+            &raw,
+            movi_start,
+            &chunk_divisors,
+            &packet_chunk_suffix,
+        )?;
         idx1_rec_entries = recs;
         table
     } else {
@@ -2167,7 +2174,7 @@ fn open_avi_inner(
             let stream_id = s_idx as u32;
             let idx1_for_stream: Vec<(u64, u32)> = idx_table
                 .iter()
-                .filter(|e| e.stream == stream_id)
+                .filter(|e| e.stream == stream_id && e.data)
                 .map(|e| (e.offset, e.size))
                 .collect();
             if idx1_for_stream.is_empty() {
@@ -2378,20 +2385,31 @@ fn open_avi_inner(
     //
     // Zero-length chunks are left out (they never become packets, see
     // `next_packet`), and an all-key stream (`MJPG`) reads key throughout.
+    //
+    // A standard index lists frames only (OpenDML "Index Locations in
+    // RIFF File": palette changes "should not appear in the same Index
+    // List as ##dc chunks"); an entry that nevertheless names a chunk
+    // `idx1` identifies as side-band is left out as well.
     let all_key: Vec<bool> = streams.iter().map(is_all_key_stream).collect();
+    let sideband_offsets = idx1_sideband_offsets(&idx_table);
     let mut ix_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
     for ix in &std_indexes {
         if let Some(s) = parse_stream_index(&ix.chunk_id) {
             let s = s as usize;
             if s < ix_per_stream.len() {
                 for e in ix.entries.iter().filter(|e| e.dw_size != 0) {
+                    if !sideband_offsets.is_empty()
+                        && sideband_offsets.contains(&ix.entry_header_offset(e))
+                    {
+                        continue;
+                    }
                     ix_per_stream[s].push(e.is_keyframe || all_key[s]);
                 }
             }
         }
     }
     let mut idx1_kf_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
-    for e in idx_table.iter().filter(|e| e.size != 0) {
+    for e in idx_table.iter().filter(|e| e.data && e.size != 0) {
         let s = e.stream as usize;
         if s < idx1_kf_per_stream.len() {
             idx1_kf_per_stream[s].push((e.flags & AVIIF_KEYFRAME) != 0 || all_key[s]);
@@ -5605,7 +5623,11 @@ fn read_sideband_data_from_idx1<R: ReadSeek + ?Sized>(
 /// idx1 entries are the canonical static list of every chunk in `movi`,
 /// in file order, so a single linear pass over the raw entries is
 /// enough — no seeking, no body reads.
-fn compute_palette_change_positions(raw: &[u8], streams: &[StreamInfo]) -> Vec<Vec<u64>> {
+fn compute_palette_change_positions(
+    raw: &[u8],
+    streams: &[StreamInfo],
+    packet_suffixes: &[[u8; 2]],
+) -> Vec<Vec<u64>> {
     let mut out: Vec<Vec<u64>> = vec![Vec::new(); streams.len()];
     if raw.len() < 16 {
         return out;
@@ -5623,14 +5645,21 @@ fn compute_palette_change_positions(raw: &[u8], streams: &[StreamInfo]) -> Vec<V
             continue;
         }
         let suffix = [ckid[2], ckid[3]];
+        let size = u32::from_le_bytes([
+            raw[base + 12],
+            raw[base + 13],
+            raw[base + 14],
+            raw[base + 15],
+        ]);
         if suffix == *b"pc" {
             // Record the running data-packet count for this stream as
             // this delta's position, then leave the count unchanged —
             // a palette change is side-band, not a data packet.
             out[stream].push(data_counts[stream]);
-        } else if suffix == *b"tx" {
-            // Text/subtitle is also side-band: not a data packet.
-        } else {
+        } else if is_packet_chunk_suffix(suffix, packet_suffixes.get(stream).copied()) && size != 0
+        {
+            // Exactly the chunks `next_packet` returns: side-band text
+            // and zero-length frame slots are not packets.
             data_counts[stream] = data_counts[stream].saturating_add(1);
         }
     }
@@ -5642,6 +5671,7 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
     raw: &[u8],
     movi_start: u64,
     divisors: &[Option<usize>],
+    packet_suffixes: &[[u8; 2]],
 ) -> Result<(Vec<IdxEntry>, Vec<Idx1RecEntry>)> {
     if raw.len() < 16 {
         return Ok((Vec::new(), Vec::new()));
@@ -5748,6 +5778,10 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
             offset: abs,
             size,
             pts: 0,
+            data: is_packet_chunk_suffix(
+                [ckid[2], ckid[3]],
+                packet_suffixes.get(stream as usize).copied(),
+            ),
         });
     }
 
@@ -5759,6 +5793,12 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
     for e in entries.iter_mut() {
         let s = e.stream as usize;
         e.pts = per_stream_pts[s];
+        if !e.data {
+            // Side-band (`##pc` palette change, `##tx` text on a
+            // non-text stream): `next_packet` does not advance the
+            // stream clock over it, so neither does the index walk.
+            continue;
+        }
         let bump = time_delta_with_divisor(divisors[s], e.size as usize) as i64;
         per_stream_pts[s] = per_stream_pts[s].saturating_add(bump);
     }
@@ -7959,6 +7999,26 @@ struct StdIndexEntry {
     dw_offset_field2: u32,
 }
 
+/// File offsets of the chunk headers `idx1` identifies as side-band
+/// (`##pc`, `##tx` on a non-text stream). Empty for the usual file.
+fn idx1_sideband_offsets(idx_table: &[IdxEntry]) -> std::collections::HashSet<u64> {
+    idx_table
+        .iter()
+        .filter(|e| !e.data)
+        .map(|e| e.offset)
+        .collect()
+}
+
+impl StdIndex {
+    /// File offset of the 8-byte chunk header entry `e` points at
+    /// (`qwBaseOffset + dwOffset` names the chunk data).
+    fn entry_header_offset(&self, e: &StdIndexEntry) -> u64 {
+        self.qw_base_offset
+            .saturating_add(e.dw_offset as u64)
+            .saturating_sub(8)
+    }
+}
+
 /// One `ix##` AVISTDINDEX chunk parsed out of a `movi` LIST.
 #[derive(Clone, Debug)]
 struct StdIndex {
@@ -8020,8 +8080,13 @@ struct IdxEntry {
     /// File-absolute offset of the chunk header (8-byte `ckid` + size).
     offset: u64,
     /// Payload size as recorded in idx1.
-    #[allow(dead_code)]
     size: u32,
+    /// Whether the entry names a data chunk of its stream — one
+    /// `next_packet` returns (or, when zero-length, counts as a frame
+    /// slot). False for side-band chunks: `##pc` palette changes and
+    /// `##tx` text riding on a non-text stream, which take no time slot
+    /// and are never packets or seek landing points.
+    data: bool,
     /// Synthesised PTS at this entry (in the stream's time base). Matches
     /// `per_stream_counter[stream]` right after `next_packet` finishes
     /// returning the packet pointed to by this entry.
@@ -11767,7 +11832,7 @@ impl AviDemuxer {
         // First non-NO_TIME keyframe with pts >= target.
         let mut best: Option<&IdxEntry> = None;
         for e in &self.idx_table {
-            if e.stream != stream_index {
+            if e.stream != stream_index || !e.data || e.size == 0 {
                 continue;
             }
             if (e.flags & AVIIF_KEYFRAME) == 0 {
@@ -11791,6 +11856,8 @@ impl AviDemuxer {
         if best.is_none() {
             for e in &self.idx_table {
                 if e.stream != stream_index
+                    || !e.data
+                    || e.size == 0
                     || (e.flags & AVIIF_KEYFRAME) == 0
                     || (e.flags & AVIIF_NO_TIME) != 0
                 {
@@ -12016,6 +12083,7 @@ fn build_seek_cache(
     let mut idx1_entries: Vec<Vec<(u64, i64)>> = vec![Vec::new(); n];
     let mut idx1_off_globally_monotonic = true;
     let mut prev_global_off = 0u64;
+    let sideband_offsets = idx1_sideband_offsets(idx_table);
     for e in idx_table {
         if e.offset < prev_global_off {
             idx1_off_globally_monotonic = false;
@@ -12026,8 +12094,9 @@ fn build_seek_cache(
             continue;
         }
         idx1_entries[s].push((e.offset, e.pts));
-        // A zero-length chunk is never a packet, so never a landing point.
-        if e.size == 0 || ((e.flags & AVIIF_KEYFRAME) == 0 && !all_key[s]) {
+        // A side-band chunk or a zero-length chunk is never a packet,
+        // so never a landing point.
+        if !e.data || e.size == 0 || ((e.flags & AVIIF_KEYFRAME) == 0 && !all_key[s]) {
             continue;
         }
         if let Some(&(prev_pts, _)) = idx1_keyframes[s].last()
@@ -12058,11 +12127,14 @@ fn build_seek_cache(
             continue;
         }
         for e in &ix.entries {
-            let abs_off = ix.qw_base_offset.saturating_add(e.dw_offset as u64);
             // The std-index dwOffset points at the chunk *data*
             // (just past the 8-byte header). Our `next_packet`
             // expects to land on the chunk header, so back off 8.
-            let header_off = abs_off.saturating_sub(8);
+            let header_off = ix.entry_header_offset(e);
+            if !sideband_offsets.is_empty() && sideband_offsets.contains(&header_off) {
+                // Not a frame: takes no time slot, never a landing point.
+                continue;
+            }
             if let Some(&(prev_off, _)) = std_entries[s].last()
                 && header_off < prev_off
             {
@@ -12147,6 +12219,16 @@ fn ascii_hex(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Whether a `##xx` chunk with two-character type `suffix` is a data
+/// chunk of a stream whose declared data suffix is `expected` — the
+/// rule `next_packet` applies: `##pc` palette changes are always
+/// side-band, `##tx` is data only on a text stream, and `dc` / `db` /
+/// `wb` are accepted on any stream.
+fn is_packet_chunk_suffix(suffix: [u8; 2], expected: Option<[u8; 2]>) -> bool {
+    suffix != *b"pc"
+        && (Some(suffix) == expected || suffix == *b"dc" || suffix == *b"db" || suffix == *b"wb")
 }
 
 /// Whether every frame of the stream is a key frame whatever its index

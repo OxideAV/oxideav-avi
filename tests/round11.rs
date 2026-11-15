@@ -691,13 +691,15 @@ fn write_sideband_chunk_errors_before_header_or_after_trailer() {
 }
 
 #[test]
-fn write_text_chunk_in_opendml_mode_lands_in_ix_index() {
-    // Round-11 C3: in OpenDML mode the std-index for the parent
-    // stream must include the text-chunk entries (as delta-flagged
-    // entries — high `dwSize` bit set). The demuxer's
-    // `text_chunk_count` covers idx1; this test asserts the ix##
-    // path keeps parity by counting both regular packets and text
-    // chunks in nEntriesInUse.
+fn write_text_chunk_in_opendml_mode_stays_out_of_ix_index() {
+    // The stream's `ix##` standard index lists the chunks its
+    // `dwChunkId` names — one entry per frame. OpenDML AVI File Format
+    // Extensions, "Index Locations in RIFF File": side-band chunks
+    // "must be indexed by their own Index List" and "should not appear
+    // in the same Index List as ##dc chunks, since they eliminate the
+    // ability to access an element (frame) directly without having to
+    // scan the list". So `nEntriesInUse` counts the three frames only;
+    // the text chunks stay reachable through idx1 and the movi walk.
     let stream = magicyuv_stream(64, 64);
     let payload = synth_payload(42, 256);
 
@@ -738,11 +740,7 @@ fn write_text_chunk_in_opendml_mode_lands_in_ix_index() {
         bytes[ix00 + 14],
         bytes[ix00 + 15],
     ]);
-    // 3 packets + 3 text chunks = 6 entries.
-    assert_eq!(
-        n_entries, 6,
-        "ix00 must carry both regular and side-band entries"
-    );
+    assert_eq!(n_entries, 3, "ix00 lists the three frames only");
 }
 
 // Silence unused_imports warnings for items dragged along for the
