@@ -559,6 +559,38 @@ ninety block transfers. Files are what an AVI usually is, so the
 block path is the only path; a caller that needs bytes on the device
 mid-stream calls `AviMuxer::flush()`.
 
+### Round 494: large frames, measured on real files
+
+Timed with `cargo run --release --example avi_tool -- time <file>`
+(open, full packet walk, 1000 scattered `seek_to` + one packet read) on
+files written by the outside muxer, read from the page cache through
+`std::fs::File`; medians of five runs on a machine shared with other
+builds.
+
+| file | | before | after |
+|---|---|---|---|
+| 1.33 GiB, 2 RIFF, 225 raw frames of 6.2 MB | walk | 254 ms (5.2 GiB/s) | 54.6 ms (24.4 GiB/s) |
+| | 1000 seeks + read | 1059 ms | 248 ms |
+| | peak RSS | 416 MB | 8.6 MB |
+| 2.23 GiB, 3 RIFF, 3.1 MB frames + PCM | walk | 233 ms (9.6 GiB/s) | 94 ms (23.7 GiB/s) |
+| | 1000 seeks + read | 380 ms | 128 ms |
+| | peak RSS | 9.2 MB | 5.9 MB |
+| 246 MiB, 3600 MJPEG frames + MP3 | walk | 55.9 ms (4.4 GiB/s) | 23.2 ms (10.6 GiB/s) |
+| | 1000 seeks + read | 15.4 ms | 7.4 ms |
+
+`open()` is 0.2 – 1.5 ms on all three (index parse; OpenDML files
+scan `movi` for `ix##`). One change: `next_packet` allocates a chunk
+body at its size in one step. The body is known to end inside its
+`movi` segment, and segments are clamped to the file, so the size is
+bounded by the file's whatever the header claims; before, every body
+grew from 64 KiB by doubling — a 6 MB frame was moved seven times, and
+the allocator kept the abandoned steps resident. Header chunks keep the
+grow-as-read path (their size is not yet known to be real). Output
+unchanged.
+
+Remux (demux + mux to a file, `avi_tool remux … opendml`): 2.18 GiB
+in 0.51 s, 246 MiB in 0.08 s, peak RSS under 6 MB.
+
 ## Fuzzing
 
 Round-442 depth round: cargo-fuzz harness (`fuzz/`) with three

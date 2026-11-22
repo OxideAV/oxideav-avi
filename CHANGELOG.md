@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- `next_packet` allocates a chunk body at its size in one step (the
+  body is known to end inside the file) instead of growing from
+  64 KiB by doubling. On a 1.33 GiB file of 6.2 MB raw frames: full
+  walk 254 ms → 54.6 ms (5.2 → 24.4 GiB/s), 1000 seeks + read 1059 →
+  248 ms, peak RSS 416 MB → 8.6 MB; 246 MiB of 30 kB MJPEG frames:
+  55.9 → 23.2 ms. Output unchanged.
 - Demuxer and muxer do their own block I/O: a position-tracking
   64 KiB buffer sits between the chunk walk / chunk writer and the
   caller's `ReadSeek` / `WriteSeek`. A chunk is an 8-byte header, a

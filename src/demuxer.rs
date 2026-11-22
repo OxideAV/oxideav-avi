@@ -5548,6 +5548,26 @@ fn sample_format_for(codec: &str, bits: u16) -> Option<SampleFormat> {
     }
 }
 
+/// Read a chunk body already known to end inside the file (so its
+/// size is bounded by the file's, whatever the header claims): one
+/// allocation of exactly the body, no growth steps. A multi-megabyte
+/// frame read through [`read_body_bounded`] is moved seven times on
+/// its way from 64 KiB to its final size.
+fn read_body_within_file<R: std::io::Read + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
+    let total = size as usize;
+    let mut buf: Vec<u8> = Vec::with_capacity(total);
+    let mut bounded = <&mut R as std::io::Read>::take(&mut *r, size as u64);
+    let got = std::io::Read::read_to_end(&mut bounded, &mut buf)?;
+    if got < total {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "AVI: truncated chunk body",
+        )
+        .into());
+    }
+    Ok(buf)
+}
+
 fn read_body_bounded<R: std::io::Read + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
     // Never trust the declared chunk size for the up-front allocation:
     // a corrupt / hostile `cb` near `0xFFFFFFFF` would otherwise commit
@@ -8399,10 +8419,13 @@ impl Demuxer for AviDemuxer {
                         continue;
                     }
                     if accept {
-                        let data = match read_body_bounded(&mut *self.input, hdr.size) {
+                        // The body lies inside its `movi` segment, and
+                        // segments are clamped to the file: allocate it
+                        // at its size in one step.
+                        let data = match read_body_within_file(&mut *self.input, hdr.size) {
                             Ok(d) => d,
                             Err(e) if is_unexpected_eof(&e) => {
-                                // Truncated tail: drop the partial frame.
+                                // The source ended early after all.
                                 return Err(Error::Eof);
                             }
                             Err(e) => return Err(e),

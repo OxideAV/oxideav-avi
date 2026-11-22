@@ -30,7 +30,10 @@
 //!   * every video packet's demuxed `flags.keyframe` must equal the
 //!     flag the muxer was handed (AVI 1.0 Appendix C
 //!     `AVIIF_KEYFRAME` on the idx1 side, the OpenDML `ix##`
-//!     `dwSize` delta high bit on the AVIX side);
+//!     `dwSize` delta high bit on the AVIX side) — except on a stream
+//!     none of whose non-empty packets was written key: an index that
+//!     flags no frame of a stream key reads all-key (no frame of such
+//!     a stream could ever be decoded otherwise);
 //!   * when stream 0 is video and its first packet is a non-empty
 //!     keyframe, `seek_to(0, 0)` must land and the next packet read
 //!     must exist; on every other plan the seek may refuse but must
@@ -108,8 +111,11 @@ fuzz_target!(|data: &[u8]| {
             want[s].len(),
             "stream {s}: non-empty packet count must survive the round trip"
         );
+        // A stream written without a single key frame reads all-key.
+        let keyless = !want[s].iter().any(|(_, k, _)| *k);
         for (i, ((gd, gk, gpts), (sd, sk, slot))) in got_s.iter().zip(want[s].iter()).enumerate() {
             assert_eq!(gd, sd, "stream {s} packet {i}: payload bytes must match");
+            let sk = &(*sk || keyless);
             if plan.is_video[s] {
                 assert_eq!(
                     gk, sk,
