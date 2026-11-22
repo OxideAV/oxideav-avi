@@ -507,7 +507,7 @@ fn round16_c4_vbr_codecs_require_zero_sample_size() {
         let bytes = build_minimal_avi_audio(tag, 4);
         let cur = std::io::Cursor::new(bytes);
         let rs: Box<dyn ReadSeek> = Box::new(cur);
-        let res = demuxer_open_avi(rs, &reg);
+        let res = oxideav_avi::demuxer::open_avi_strict(rs, &reg);
         match res {
             Err(Error::InvalidData(msg)) => {
                 assert!(

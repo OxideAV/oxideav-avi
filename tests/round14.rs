@@ -337,7 +337,7 @@ fn vbr_audio_with_nonzero_sample_size_fails_validator() {
     let reg = registry_with_magicyuv_and_pcm();
     let cur = std::io::Cursor::new(bytes);
     let rs: Box<dyn ReadSeek> = Box::new(cur);
-    match demuxer_open_avi(rs, &reg) {
+    match oxideav_avi::demuxer::open_avi_strict(rs, &reg) {
         Err(Error::InvalidData(msg)) => {
             assert!(
                 msg.contains("VBR") && msg.contains("0x0055"),
@@ -358,7 +358,7 @@ fn cbr_audio_with_zero_sample_size_fails_validator() {
     let reg = registry_with_magicyuv_and_pcm();
     let cur = std::io::Cursor::new(bytes);
     let rs: Box<dyn ReadSeek> = Box::new(cur);
-    match demuxer_open_avi(rs, &reg) {
+    match oxideav_avi::demuxer::open_avi_strict(rs, &reg) {
         Err(Error::InvalidData(msg)) => {
             assert!(
                 msg.contains("CBR") && msg.contains("0x0001"),

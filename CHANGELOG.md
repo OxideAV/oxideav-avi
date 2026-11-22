@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/avi_tool.rs`: `dump` (streams, metadata, one line per
+  packet with its CRC-32 — the listing a black-box prober prints),
+  `remux` (AVI 1.0 / OpenDML / compact index), `seek`, `raw`.
+
 - `AviMuxer::flush()` — hand everything written so far to the output
   (the muxer now holds up to one 64 KiB block of recent chunks between
   `write_header` and `write_trailer`).
@@ -47,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `open` / `open_avi` no longer refuse a file over the audio
+  `(wFormatTag, dwSampleSize)` pairing; `open_avi_strict` does, and
+  `AviDemuxer::audio_sample_size_mismatches` reports it. `open_avi_lenient`
+  is now the same as `open_avi`.
+- Demuxed packets carry `duration`: the `dwScale / dwRate` ticks their
+  chunk spans (one for a frame-per-chunk stream, `size / dwSampleSize`
+  otherwise).
+
 - API hygiene: `#[non_exhaustive]` on the `muxer::RiffSegmentLimit` enum
   and on the records `muxer::AviMuxOptions`, `muxer::VprpConfig` (build
   them with `Default` + their `with_*` builders), `demuxer::AudioStrfInfo`,
@@ -57,6 +69,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stay exhaustive.
 
 ### Fixed
+
+- A file that marks none of a stream's frames key in its index no
+  longer reads as a stream with no entry point: an index like that
+  (seen on intra-only codecs and on audio) states that its writer did
+  not maintain `AVIIF_KEYFRAME`, so every frame of that stream is a key
+  frame — packets, `packet_is_keyframe` and seeks. Before, a player
+  waited for a key frame that never came. One flagged frame is enough
+  for the index to be taken at its word.
+- Block-framed compressed audio written with `dwSampleSize` =
+  `nBlockAlign` — what AVI 1.0 §AVISTREAMHEADER asks of audio streams,
+  and how WMA is written — failed `open()` with "VBR codec requires
+  strh.dwSampleSize == 0". Found by the black-box matrix.
 
 - Side-band chunks (`##pc` palette changes, `##tx` text on a non-text
   stream) no longer count as frames in any index walk. Their `idx1`

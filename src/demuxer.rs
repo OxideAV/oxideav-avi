@@ -257,23 +257,23 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<
 /// handle alongside the [`oxideav_core::Demuxer`] trait it
 /// implements.
 ///
-/// Round-14 candidate 2: also runs the per-audio-stream
-/// `(strh.dwSampleSize, wave_format.format_tag)` invariant check
-/// — VBR codecs (MP3 / AAC / MPEG) require `dwSampleSize == 0`,
-/// CBR codecs (PCM / G.711 / IMA-ADPCM) require `dwSampleSize > 0`.
-/// A mismatch surfaces as [`Error::Validation`]. Use [`open_avi_lenient`]
-/// to skip this check (e.g. when re-muxing a malformed legacy file).
+/// A stream whose `strh.dwSampleSize` is unusual for its `wFormatTag`
+/// (a compressed codec with a nonzero sample size, PCM with zero) still
+/// opens: AVI 1.0 §AVISTREAMHEADER says of audio that `dwSampleSize`
+/// "should be the same as the nBlockAlign member of the WAVEFORMATEX
+/// structure", and block-framed compressed streams are written exactly
+/// that way. [`open_avi_strict`] refuses such a file with
+/// [`Error::InvalidData`]; [`AviDemuxer::audio_sample_size_mismatches`]
+/// reports the same finding without refusing.
 pub fn open_avi(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<AviDemuxer> {
     open_avi_inner(
         input, codecs, /* lenient */ false, /* strict_cross_validate */ false,
     )
 }
 
-/// Open an AVI demuxer skipping the round-14 C2 audio sample-size
-/// VBR/CBR validator. Use this when the caller wants to re-mux or
-/// inspect a malformed legacy file whose `strh.dwSampleSize` doesn't
-/// match the spec for its `wFormatTag`. All other open-time checks
-/// still run — only the VBR/CBR invariant is bypassed.
+/// Same as [`open_avi`]: neither refuses a file over the audio
+/// `(wFormatTag, dwSampleSize)` pairing. Kept for callers written when
+/// [`open_avi`] did.
 pub fn open_avi_lenient(
     input: Box<dyn ReadSeek>,
     codecs: &dyn CodecResolver,
@@ -296,9 +296,11 @@ pub fn open_avi_lenient(
 /// "OpenDML ix## is more reliable than idx1" handoff to abort on a
 /// mismatch (e.g. validating a freshly muxed file before shipping
 /// it, or refusing to play a recovered capture whose stale idx1
-/// disagrees with reality). All other open-time checks still run —
-/// the round-14 C2 audio sample-size VBR/CBR validator stays armed
-/// and surfaces its own [`Error::Validation`] on violation.
+/// disagrees with reality). Strict mode also refuses an audio stream whose
+/// `strh.dwSampleSize` is unusual for its `wFormatTag` (a per-frame
+/// compressed codec with a nonzero sample size, PCM-family audio with
+/// zero) — the pairing [`AviDemuxer::audio_sample_size_mismatches`]
+/// reports on a normal open.
 pub fn open_avi_strict(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<AviDemuxer> {
     open_avi_inner(
         input, codecs, /* lenient */ false, /* strict_cross_validate */ true,
@@ -771,19 +773,15 @@ fn open_avi_inner(
         ));
     }
 
-    // Round-14 candidate 2: audio `(format_tag, sample_size)` invariant.
-    // Per AVI 1.0 / WAVEFORMATEX: VBR codecs (MPEG / MP3 / AAC) carry
-    // one packet per audio frame so `dwSampleSize` MUST be 0; CBR
-    // codecs (PCM / G.711 a-law / G.711 µ-law / IMA-ADPCM) carry a
-    // fixed bytes-per-sample so `dwSampleSize` MUST be > 0. A mismatch
-    // means the file lies about its own carriage and downstream
-    // `strh.dwLength` derivations (AviMuxer's audio sample-count walk)
-    // will be wrong. Skip when `lenient` (caller opted in via
-    // [`open_avi_lenient`]) so a malformed legacy file can still be
-    // re-muxed / inspected. Other format tags (codecs the spec doesn't
-    // pin one way or the other — e.g. WMA, AC-3, custom registrations)
-    // pass through with no constraint.
-    if !lenient {
+    // Strict mode: refuse an audio stream whose `dwSampleSize` is
+    // unusual for its `wFormatTag` (see `audio_strh_violation`). A
+    // normal open accepts it — "for audio streams, this number should
+    // be the same as the nBlockAlign member" (AVI 1.0 §AVISTREAMHEADER)
+    // describes exactly the block-framed compressed streams the check
+    // objects to — and reports it through
+    // `AviDemuxer::audio_sample_size_mismatches`.
+    let _ = lenient;
+    if strict_cross_validate {
         for (i, ai) in audio_infos.iter().enumerate() {
             let info = match ai {
                 Some(v) => v,
@@ -2480,7 +2478,7 @@ fn open_avi_inner(
     // RIFF File": palette changes "should not appear in the same Index
     // List as ##dc chunks"); an entry that nevertheless names a chunk
     // `idx1` identifies as side-band is left out as well.
-    let all_key: Vec<bool> = streams.iter().map(is_all_key_stream).collect();
+    let all_key = all_key_streams(&streams, &idx_table, &std_indexes);
     let sideband_offsets = idx1_sideband_offsets(&idx_table);
     let mut ix_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
     for ix in &std_indexes {
@@ -2621,6 +2619,7 @@ fn open_avi_inner(
         top_level_disp,
         top_level_cset,
         keyframe_by_offset,
+        all_key,
         keyframe_per_stream,
         seek_cache: None,
     })
@@ -6786,6 +6785,9 @@ pub struct AviDemuxer {
     /// correct for the all-intra / uncompressed streams that are the
     /// only ones a no-index AVI 1.0 file can describe randomly).
     keyframe_by_offset: KeyframeTable,
+    /// Per stream: every data chunk is a key frame whatever its index
+    /// entry says (see [`all_key_streams`]).
+    all_key: Vec<bool>,
     /// Per-stream keyframe flags in packet order, unifying idx1 and
     /// `ix##`. Outer index is `stream_index`, inner index is the
     /// zero-based packet ordinal `next_packet` assigns. Backs the
@@ -8394,12 +8396,19 @@ impl Demuxer for AviDemuxer {
                             .keyframe_by_offset
                             .get(chunk_header_off)
                             .unwrap_or(true)
-                            || is_all_key_stream(stream);
-                        // Bump counter.
+                            || self.all_key[idx as usize];
+                        // Bump counter. The chunk spans `bump` ticks of
+                        // `dwScale / dwRate`: one for a frame-per-chunk
+                        // stream, the whole sample blocks it holds
+                        // otherwise (AVI 1.0 §AVISTREAMHEADER
+                        // `dwSampleSize`).
                         let bump = time_delta_with_divisor(
                             self.chunk_divisors[idx as usize],
                             pkt.data.len(),
                         );
+                        if bump > 0 {
+                            pkt.duration = Some(bump.min(i64::MAX as u64) as i64);
+                        }
                         self.per_stream_counter[idx as usize] = counter + bump;
                         return Ok(pkt);
                     } else {
@@ -9904,6 +9913,23 @@ impl AviDemuxer {
             .get(stream_index as usize)
             .copied()
             .flatten()
+    }
+
+    /// Audio streams whose `strh.dwSampleSize` is unusual for their
+    /// `wFormatTag`, as `(stream index, dwSampleSize)`: a per-frame
+    /// compressed codec ([`Self::audio_is_vbr`] `Some(true)`) with a
+    /// nonzero sample size, or PCM-family audio (`Some(false)`) with
+    /// zero. Informational — such a file opens and demuxes (a nonzero
+    /// `dwSampleSize` divides each chunk into that many-byte ticks, AVI
+    /// 1.0 §AVISTREAMHEADER); [`open_avi_strict`] refuses it instead.
+    pub fn audio_sample_size_mismatches(&self) -> Vec<(u32, u32)> {
+        (0..self.streams.len() as u32)
+            .filter_map(|i| {
+                let vbr = self.audio_is_vbr(i)?;
+                let size = self.stream_sample_size(i).unwrap_or(0);
+                (vbr != (size == 0)).then_some((i, size))
+            })
+            .collect()
     }
 
     /// Cross-check of each video stream's `AVISF_VIDEO_PALCHANGES` strh
@@ -12175,7 +12201,7 @@ fn build_seek_cache(
     divisors: &[Option<usize>],
 ) -> SeekCache {
     let n = streams.len();
-    let all_key: Vec<bool> = streams.iter().map(is_all_key_stream).collect();
+    let all_key = all_key_streams(streams, idx_table, std_indexes);
     let mut idx1_keyframes: Vec<Vec<(i64, u64)>> = vec![Vec::new(); n];
     let mut idx1_kf_monotonic = vec![true; n];
     let mut idx1_entries: Vec<Vec<(u64, i64)>> = vec![Vec::new(); n];
@@ -12337,6 +12363,52 @@ fn is_packet_chunk_suffix(suffix: [u8; 2], expected: Option<[u8; 2]>) -> bool {
 /// sequence all JPEG frames will be key frames".
 fn is_all_key_stream(stream: &StreamInfo) -> bool {
     stream.params.tag == Some(CodecTag::Fourcc(*b"MJPG"))
+}
+
+/// Per stream: every data chunk reads as a key frame.
+///
+/// Besides the `MJPG` rule ([`is_all_key_stream`]) this covers a stream
+/// whose index names frames but flags NONE of them key. `AVIIF_KEYFRAME`
+/// marks the frames that "do not need previous video information to be
+/// decompressed" (AVI 1.0 §"AVI Index Entries"); a stream with no such
+/// frame at all could never be decoded, so an index like that states
+/// that its writer did not maintain the bit (seen on intra-only codecs
+/// and on audio), not that the stream has no entry point. Reading it
+/// literally leaves a player waiting for a key frame that never comes.
+fn all_key_streams(
+    streams: &[StreamInfo],
+    idx_table: &[IdxEntry],
+    std_indexes: &[StdIndex],
+) -> Vec<bool> {
+    let n = streams.len();
+    // (has a non-empty frame entry, has a key entry)
+    let mut seen = vec![(false, false); n];
+    for e in idx_table {
+        let s = e.stream as usize;
+        if s < n && e.data && e.size != 0 {
+            seen[s].0 = true;
+            seen[s].1 |= (e.flags & AVIIF_KEYFRAME) != 0;
+        }
+    }
+    for ix in std_indexes {
+        let Some(s) = parse_stream_index(&ix.chunk_id).map(|s| s as usize) else {
+            continue;
+        };
+        if s >= n {
+            continue;
+        }
+        for e in &ix.entries {
+            if e.dw_size != 0 {
+                seen[s].0 = true;
+                seen[s].1 |= e.is_keyframe;
+            }
+        }
+    }
+    streams
+        .iter()
+        .zip(seen)
+        .map(|(st, (any, key))| is_all_key_stream(st) || (any && !key))
+        .collect()
 }
 
 /// How many stream ticks one data chunk spans, as a byte divisor:

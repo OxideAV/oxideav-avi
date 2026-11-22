@@ -244,7 +244,7 @@ fn strh_sample_size_audio_explicit_zero_rejected_strict_lenient_none() {
     // Strict open: round-14 C2 sample-size invariant fires. PCM
     // (wFormatTag=1) is CBR and requires sample_size > 0.
     let rs_strict: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let err = match demuxer_open_avi(rs_strict, &reg) {
+    let err = match oxideav_avi::demuxer::open_avi_strict(rs_strict, &reg) {
         Ok(_) => panic!(
             "PCM stream with dwSampleSize=0 must fail the round-14 C2 invariant under strict open",
         ),
