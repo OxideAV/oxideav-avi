@@ -128,17 +128,11 @@ fn block_align_and_vbr_classification_per_stream() {
     assert_eq!(dem.stream_block_align(1), Some(4));
     assert_eq!(dem.audio_is_vbr(1), Some(false));
 
-    // MP3 stream 2: VBR. nBlockAlign for VBR is advisory (typically 1);
-    // whatever the muxer stamped, the VBR classification is the key
-    // signal and `nBlockAlign == 1` maps through the accessor verbatim.
+    // MP3 stream 2: VBR, one frame per chunk. The muxer stamps
+    // nBlockAlign = the largest chunk (here every frame is 417 bytes):
+    // the stream tick is "the time needed to play nBlockAlign bytes".
     assert_eq!(dem.audio_is_vbr(2), Some(true));
-    // The accessor returns the raw value (or None for a 0 stamp); for a
-    // VBR stream the muxer stamps nBlockAlign = 1.
-    let mp3_ba = dem.stream_block_align(2);
-    assert!(
-        mp3_ba == Some(1) || mp3_ba.is_none(),
-        "VBR nBlockAlign should be 1 or unspecified, got {mp3_ba:?}"
-    );
+    assert_eq!(dem.stream_block_align(2), Some(417));
 
     // Out-of-range stream index: None, never panics.
     assert_eq!(dem.stream_block_align(99), None);

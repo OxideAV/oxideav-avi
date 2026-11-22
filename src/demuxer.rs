@@ -5513,6 +5513,7 @@ fn audio_codec_id_fallback(format_tag: u16, bits: u16) -> CodecId {
             8 => "pcm_u8",
             24 => "pcm_s24le",
             32 => "pcm_s32le",
+            64 => "pcm_s64le",
             _ => "pcm_s16le",
         },
         0x0003 => match bits {

@@ -36,8 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Muxer::set_metadata` / `carries_metadata_key`: the keys the
   demuxer's `metadata()` reports for `LIST INFO`, `IDIT` and `ISMP`
   are written, so text metadata survives a remux through the trait.
-- `tests/blackbox_matrix.rs`: 297 files from an outside muxer read
-  against a from-the-spec model and an outside reader, 1100 remuxes
+- `tests/blackbox_matrix.rs`: 298 files from an outside muxer read
+  against a from-the-spec model and an outside reader, 1104 remuxes
   compared by the outside reader (skips without the tools).
 - A frame-per-chunk audio stream read from a file gets its gaps (empty
   `##wb` chunks) written back, like dropped video frames.
@@ -78,6 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Headers built from stream parameters: a compressed audio stream
+  whose parameters named a sample format (AAC, FLAC, AC-3, WMA, even
+  A-law with a 16-bit output format) was written with a PCM header;
+  frame-per-chunk audio was stamped `nBlockAlign` 1, which readers
+  that count a chunk as `size / nBlockAlign` ticks play one tick per
+  byte — it is now the largest chunk. 64-bit integer PCM read as
+  `pcm_s16le`; it is `pcm_s64le`.
 - Remuxing a file this crate did not write lost most of its stream
   headers: 51 of 322 outside files survived a demux → mux round trip
   as the outside reader saw them. `WAVE_FORMAT_EXTENSIBLE` streams

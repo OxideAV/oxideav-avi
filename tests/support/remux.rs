@@ -16,8 +16,36 @@ pub fn remux(
     kind: AviKind,
     options: AviMuxOptions,
 ) -> Result<()> {
+    remux_with(input, output, kind, options, true)
+}
+
+/// [`remux`], optionally without the demuxer's track records
+/// (`avi.*` options): the muxer then builds every stream header from
+/// the parameters alone, as it does for a stream an encoder describes.
+pub fn remux_with(
+    input: Box<dyn ReadSeek>,
+    output: Box<dyn WriteSeek>,
+    kind: AviKind,
+    options: AviMuxOptions,
+    keep_records: bool,
+) -> Result<()> {
     let mut dmx = oxideav_avi::demuxer::open_avi(input, &super::claims::registry())?;
-    let streams = dmx.streams().to_vec();
+    let mut streams = dmx.streams().to_vec();
+    if !keep_records {
+        for s in &mut streams {
+            let kept: Vec<(String, String)> = s
+                .params
+                .options
+                .iter()
+                .filter(|(k, _)| !k.starts_with("avi."))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            s.params.options = oxideav_core::CodecOptions::new();
+            for (k, v) in kept {
+                s.params.options.insert(k, v);
+            }
+        }
+    }
     let mut mux = oxideav_avi::muxer::open_avi(output, &streams, kind, options)?;
     mux.set_metadata(dmx.metadata())?;
     mux.write_header()?;

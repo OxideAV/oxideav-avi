@@ -526,7 +526,7 @@ fn audio_format_tag(params: &CodecParameters) -> Result<u16> {
 /// the order of PCM registrations.
 fn pcm_synth_format_tag(codec_id: &CodecId) -> Option<u16> {
     match codec_id.as_str() {
-        "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" => Some(0x0001),
+        "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_s64le" => Some(0x0001),
         "pcm_f32le" | "pcm_f64le" => Some(0x0003),
         _ => None,
     }
@@ -818,8 +818,14 @@ fn pcm_bits_per_sample(codec_id: &str, sample_format: Option<SampleFormat>) -> O
         "pcm_s24le" => Some(24),
         "pcm_s32le" => Some(32),
         "pcm_f32le" => Some(32),
-        "pcm_f64le" => Some(64),
-        _ => sample_format.map(|f| (f.bytes_per_sample() as u16) * 8),
+        "pcm_f64le" | "pcm_s64le" => Some(64),
+        // A sample format says how a decoder's output is laid out, not
+        // that the stream is PCM: only a linear `pcm_*` id takes its
+        // depth from it. (An AAC or FLAC stream whose parameters named
+        // a 16-bit format was being written with a PCM header.)
+        "pcm_alaw" | "pcm_mulaw" => None,
+        id if id.starts_with("pcm_") => sample_format.map(|f| (f.bytes_per_sample() as u16) * 8),
+        _ => None,
     }
 }
 

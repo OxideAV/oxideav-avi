@@ -4407,6 +4407,29 @@ impl AviMuxer {
                 self.output.write_all(&block16.to_le_bytes())?;
             }
 
+            // Frame-per-chunk audio whose header was built from the
+            // stream parameters: `nBlockAlign` = the largest chunk. The
+            // stream rate "corresponds to the time needed to play
+            // nBlockAlign bytes of audio" (AVI 1.0 §AVISTREAMHEADER);
+            // with one codec frame per `dwScale / dwRate` tick that is
+            // a frame's worth of bytes. Readers that count a chunk as
+            // `size / nBlockAlign` ticks (rounded up) then count one
+            // tick per chunk — with the former 1 they counted one tick
+            // per byte.
+            if &t.entry.strh_type == b"auds"
+                && t.record.is_none()
+                && t.entry.sample_size == 0
+                && !sample_size_overridden
+                && t.entry.strf.len() >= 14
+                && t.entry.strf.get(0..2) != Some(&0x0011u16.to_le_bytes()[..])
+                && t.max_chunk_size > 0
+            {
+                let block = t.max_chunk_size.min(u32::from(u16::MAX)) as u16;
+                self.output
+                    .seek(SeekFrom::Start(strh_body_off + 56 + 8 + 12))?;
+                self.output.write_all(&block.to_le_bytes())?;
+            }
+
             // Also patch strh.dwSuggestedBufferSize at body offset 36.
             // Round-217: an `AviMuxOptions::with_stream_suggested_buffer_size`
             // override (when present) wins over the long-standing

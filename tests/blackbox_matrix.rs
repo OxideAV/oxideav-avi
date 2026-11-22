@@ -1365,6 +1365,7 @@ fn cases() -> Vec<Case> {
         ("flac", "-c:a flac -ac 2", 44_100),
         ("wmav1", "-c:a wmav1 -ac 2", 44_100),
         ("wmav2", "-c:a wmav2 -ac 2", 44_100),
+        ("vorbis", "-c:a vorbis -strict -2 -ac 2", 44_100),
     ] {
         add(format!("a-{name}"), a(enc, rate, "2"));
     }

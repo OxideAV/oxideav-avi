@@ -1089,6 +1089,7 @@ pub fn subformat_codec_hint(subformat: &Guid, bits_per_sample: u16) -> Option<&'
             8 => "pcm_u8",
             24 => "pcm_s24le",
             32 => "pcm_s32le",
+            64 => "pcm_s64le",
             _ => "pcm_s16le",
         });
     }

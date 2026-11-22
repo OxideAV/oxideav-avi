@@ -514,3 +514,71 @@ fn text_metadata_crosses_a_remux() {
     let out = remuxed(file, oxideav_avi::muxer::AviKind::Avi10);
     assert!(has(&open(out)));
 }
+
+// ───────── headers built from the parameters alone ─────────
+
+/// A compressed stream whose parameters name a sample format (a
+/// decoder's output layout) is not PCM: it keeps its tag and its
+/// configuration bytes, counts one tick per chunk, and states the
+/// largest chunk as `nBlockAlign`. 64-bit integer PCM is `pcm_s64le`.
+#[test]
+fn a_compressed_stream_with_a_sample_format_is_not_written_as_pcm() {
+    use oxideav_core::{CodecId, CodecParameters, CodecTag, SampleFormat, StreamInfo, TimeBase};
+    let mut params = CodecParameters::audio(CodecId::new("aac"));
+    params.tag = Some(CodecTag::wave_format(0x00FF));
+    params.channels = Some(2);
+    params.sample_rate = Some(44_100);
+    params.sample_format = Some(SampleFormat::S16);
+    params.extradata = vec![0x12, 0x10];
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 44_100),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+    let sink = Sink::default();
+    let ws: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+    let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).expect("mux opens");
+    mux.write_header().expect("header");
+    for (n, len) in [300usize, 412, 7].into_iter().enumerate() {
+        let mut p = Packet::new(0, stream.time_base, vec![0xD0; len]);
+        p.pts = Some(n as i64 * 1024);
+        p.duration = Some(1024);
+        p.flags.keyframe = true;
+        mux.write_packet(&p).expect("packet");
+    }
+    mux.write_trailer().expect("trailer");
+    let out = sink.0.lock().unwrap().get_ref().clone();
+
+    let strf = nth_chunk(&out, b"strf", 0);
+    assert_eq!(strf[0..2], 0x00FFu16.to_le_bytes(), "wFormatTag");
+    assert_eq!(
+        strf[12..14],
+        412u16.to_le_bytes(),
+        "nBlockAlign = largest chunk"
+    );
+    assert_eq!(strf[18..], [0x12, 0x10], "codec configuration");
+    let strh = nth_chunk(&out, b"strh", 0);
+    assert_eq!(strh[44..48], [0; 4], "dwSampleSize 0: one frame per chunk");
+    assert_eq!(strh[32..36], 3u32.to_le_bytes(), "dwLength counts frames");
+
+    let mut dmx = open(out);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+    let pts: Vec<_> = packets(&mut dmx).iter().map(|p| p.pts).collect();
+    assert_eq!(pts, [Some(0), Some(1), Some(2)]);
+
+    let wide = Track {
+        strh: Strh::audio(1, 8000, 2, 16).bytes(),
+        strf: wfx(1, 2, 8000, 128_000, 16, 64, &[]),
+        extra: Vec::new(),
+    };
+    let items = [Item {
+        stream: 0,
+        kind: b"wb",
+        data: &[0; 32],
+        flags: Some(KEY),
+    }];
+    let dmx = open(avi(&[wide], &items, true));
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_s64le");
+}

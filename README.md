@@ -126,13 +126,13 @@ defaults to) refuses to grow past ~2 GiB and returns
 modes and has the outside reader compare the result with the original.
 It skips when the tools are not on `PATH`; nothing is committed.
 
-Current size (one run, ffmpeg 9.0): **297 foreign files** read —
+Current size (one run, ffmpeg 9.0): **298 foreign files** read —
 video codecs × audio codecs × PCM depths / channel counts / rates,
 DIB depths and orientations, raw FourCCs, odd picture sizes, frame
 rates, dropped frames, palette changes, several audio / video tracks,
 index reserved in the header, files written through a pipe (no index,
 no sizes), files cut short, index removed / disguised / file-absolute —
-and **1100 remuxes** compared (AVI 1.0, OpenDML, OpenDML rolled into
+and **1104 remuxes** compared (AVI 1.0, OpenDML, OpenDML rolled into
 20 kB `RIFF AVIX` segments, OpenDML with the compact in-`strl` index),
 a third of them also decoded by the outside decoder and compared frame
 for frame. **0 mismatches.** Three multi-RIFF files of 0.26 – 2.3 GiB
@@ -155,6 +155,10 @@ the tables:
   each chunk is one `dwScale / dwRate` tick. The outside reader divides
   the chunk by `nBlockAlign` instead when that is not 1 (its own DTS and
   E-AC-3 files then play 100× too slow in a second player).
+- **Vorbis** is written by the outside muxer as one packet followed
+  by empty chunks filling its duration; the rule above gives every
+  packet its place on the clock (the outside reader's own timestamps
+  for these files are off by the same division).
 - **Stream length.** `StreamInfo::duration` is `dwLength`. The outside
   reader reports its own estimate for sample-sized audio.
 - **Key frames.** The index is taken at its word (`AVIIF_KEYFRAME`,
@@ -167,9 +171,6 @@ What the matrix does **not** establish:
 
 - Codec ids for tags no codec crate claims come out as `avi:<FOURCC>` /
   `avi:tag_xxxx` / `avi:guid_…`; the streams still remux exactly.
-- Vorbis in AVI: packets and headers pass, timestamps do not — the
-  stream's `dwLength` counts something other than chunks and the
-  documents here do not say what.
 - Raw YUV FourCCs (`I420`, `YUY2`, `UYVY`, `NV12`, …) and DIB depths
   other than 16 / 24 / 32 pass through as tagged streams; this crate
   does not turn them into `rawvideo` + a pixel format (no FourCC
@@ -182,6 +183,14 @@ What the matrix does **not** establish:
 - Non-zero `dwStart`: the outside muxer never writes one. Checked on
   hand-patched files only (the outside reader offsets timestamps the
   same way).
+- Headers built from stream parameters alone (an encoder's output,
+  or a remux with the track records removed) carry less than a recorded
+  header: run over the same 322 files that way, 288 decode to the same
+  frames in the outside decoder. The rest need a field
+  `CodecParameters` has no place for — bits per coded sample (IMA
+  ADPCM), a palette or an unusual DIB depth (`AviMuxOptions::
+  with_indexed_video` covers the first), a 32-bit `biBitCount`
+  (ProRes 4444).
 - Palette changes survive a remux only through `AviDemuxer`'s
   accessors + `AviMuxer::write_palette_change` (as `examples/avi_tool.rs`
   does); they are not packets.
