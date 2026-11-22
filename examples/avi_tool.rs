@@ -20,10 +20,12 @@
 
 #[path = "../tests/support/claims.rs"]
 mod claims;
+#[path = "../tests/support/remux.rs"]
+mod remux;
 
 use std::io::Write;
 
-use oxideav_core::{Demuxer, Error, Muxer, ReadSeek, WriteSeek};
+use oxideav_core::{Demuxer, Error, ReadSeek, WriteSeek};
 
 use oxideav_avi::muxer::{AviKind, AviMuxOptions, RiffSegmentLimit};
 
@@ -87,13 +89,6 @@ fn dump(path: &str) -> i32 {
 }
 
 fn remux(input: &str, output: &str, mode: Option<&String>) -> i32 {
-    let mut dmx = match open(input) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("open failed: {e}");
-            return 1;
-        }
-    };
     let mut opts = AviMuxOptions::default();
     let kind = match mode.map(String::as_str) {
         None | Some("avi10") => AviKind::Avi10,
@@ -110,48 +105,18 @@ fn remux(input: &str, output: &str, mode: Option<&String>) -> i32 {
             }
         },
     };
-    let streams = dmx.streams().to_vec();
-    let f = match std::fs::File::create(output) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("create failed: {e}");
-            return 1;
-        }
+    let run = || -> Result<(), Error> {
+        let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(input)?);
+        let ws: Box<dyn WriteSeek> = Box::new(std::fs::File::create(output)?);
+        remux::remux(rs, ws, kind, opts)
     };
-    let ws: Box<dyn WriteSeek> = Box::new(f);
-    let mut mux = match oxideav_avi::muxer::open_avi(ws, &streams, kind, opts) {
-        Ok(m) => m,
+    match run() {
+        Ok(()) => 0,
         Err(e) => {
-            eprintln!("mux open failed: {e}");
-            return 1;
-        }
-    };
-    let meta = dmx.metadata().to_vec();
-    let _ = mux.set_metadata(&meta);
-    if let Err(e) = mux.write_header() {
-        eprintln!("write_header failed: {e}");
-        return 1;
-    }
-    loop {
-        match dmx.next_packet() {
-            Ok(p) => {
-                if let Err(e) = mux.write_packet(&p) {
-                    eprintln!("write_packet failed: {e}");
-                    return 1;
-                }
-            }
-            Err(Error::Eof) => break,
-            Err(e) => {
-                eprintln!("demux error: {e}");
-                return 1;
-            }
+            eprintln!("remux failed: {e}");
+            1
         }
     }
-    if let Err(e) = mux.write_trailer() {
-        eprintln!("write_trailer failed: {e}");
-        return 1;
-    }
-    0
 }
 
 fn seek(path: &str, stream: &str, pts: &str) -> i32 {

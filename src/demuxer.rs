@@ -856,8 +856,35 @@ fn open_avi_inner(
     // fields, and a hostile `0xFFFFFFFF x 0xFFFFFFFF` pair overflows
     // i64 (round-442 fuzz finding) — a nonsense header saturates the
     // derived duration instead of aborting the open.
+    //
+    // A length the file has no room for is not a length: a writer that
+    // could not seek back (a pipe, a live capture) leaves a placeholder
+    // in `dwTotalFrames` / `dwLength`. Every tick of a frame-per-chunk
+    // stream costs at least a chunk header, every tick of a
+    // sample-sized audio stream `dwSampleSize` bytes; a count past what
+    // `movi` can hold is reported as unknown.
+    let movi_bytes: u64 = movi_segments
+        .iter()
+        .map(|&(start, end)| end.saturating_sub(start))
+        .sum();
+    for (i, st) in streams.iter_mut().enumerate() {
+        let per_tick = match stream_sample_sizes.get(i).copied().flatten() {
+            Some(n) if st.params.media_type == MediaType::Audio => u64::from(n),
+            _ => 8,
+        };
+        if st
+            .duration
+            .is_some_and(|len| (len as u64).saturating_mul(per_tick) > movi_bytes)
+        {
+            st.duration = None;
+        }
+    }
     let duration_micros: i64 = match avih {
-        Some(h) if h.micro_sec_per_frame > 0 && h.total_frames > 0 => {
+        Some(h)
+            if h.micro_sec_per_frame > 0
+                && h.total_frames > 0
+                && u64::from(h.total_frames).saturating_mul(8) <= movi_bytes =>
+        {
             (h.total_frames as i64).saturating_mul(h.micro_sec_per_frame as i64)
         }
         _ => 0,
@@ -3521,6 +3548,8 @@ fn parse_strl<R: ReadSeek + ?Sized>(
     let mut super_index = SuperIndex::default();
     let mut vprp = VprpHeader::default();
     let mut strn_name: Option<String> = None;
+    let mut strn_raw: Option<Vec<u8>> = None;
+    let mut vprp_raw: Option<Vec<u8>> = None;
     let mut strd_bytes: Option<Vec<u8>> = None;
     while r.stream_position()? < end_pos {
         let hdr = match read_chunk_header(r)? {
@@ -3548,6 +3577,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 let body = read_body_bounded(r, hdr.size)?;
                 skip_pad(r, hdr.size)?;
                 strn_name = parse_strn_body(&body);
+                strn_raw = Some(body);
             }
             b"strd" => {
                 // AVI 1.0 §"AVI Stream Headers" (round-89): optional
@@ -3621,6 +3651,7 @@ fn parse_strl<R: ReadSeek + ?Sized>(
                 if let Some(parsed) = parse_vprp(&body) {
                     vprp = parsed;
                 }
+                vprp_raw = Some(body);
             }
             _ => {
                 skip_chunk(r, &hdr)?;
@@ -3661,7 +3692,22 @@ fn parse_strl<R: ReadSeek + ?Sized>(
         }
     };
     let strf = strf_buf.unwrap_or_default();
-    let parsed = build_stream(index, &strh, &strf, codecs)?;
+    let mut parsed = build_stream(index, &strh, &strf, codecs)?;
+    // The stream's header chunks, verbatim, as container track records:
+    // the muxer writes them back when they still describe the stream,
+    // so a remux keeps every field this crate has no model for.
+    let records = &mut parsed.0.params.options;
+    records.insert(crate::packaging::REC_STRH, crate::packaging::hex(&strh));
+    records.insert(crate::packaging::REC_STRF, crate::packaging::hex(&strf));
+    if let Some(b) = &strd_bytes {
+        records.insert(crate::packaging::REC_STRD, crate::packaging::hex(b));
+    }
+    if let Some(b) = &strn_raw {
+        records.insert(crate::packaging::REC_STRN, crate::packaging::hex(b));
+    }
+    if let Some(b) = &vprp_raw {
+        records.insert(crate::packaging::REC_VPRP, crate::packaging::hex(b));
+    }
     Ok((
         Some(parsed.0),
         Some(parsed.1),
@@ -5108,13 +5154,26 @@ fn build_stream(
             // when the legacy `wFormatTag` is the EXTENSIBLE escape
             // hatch per docs/container/riff/waveformatextensible/
             // README §"What's covered".
-            let wfex = if format_tag == WAVE_FORMAT_EXTENSIBLE && !strf.is_empty() {
-                Some(parse_waveformatextensible(strf)?)
+            // An extensible tag over a header too short for the 22-byte
+            // extension reads as a plain (unrecognised) tag.
+            let wfex = if format_tag == WAVE_FORMAT_EXTENSIBLE {
+                parse_waveformatextensible(strf).ok()
             } else {
                 None
             };
 
-            let tag = CodecTag::wave_format(format_tag);
+            // `WAVE_FORMAT_EXTENSIBLE` names the codec by SubFormat
+            // GUID. A GUID of the `xxxxxxxx-0000-0010-8000-00aa00389b71`
+            // family wraps a `wFormatTag` in its first DWORD
+            // (docs/container/riff/waveformatextensible/): the stream
+            // is that codec, resolved — and reported in `params.tag` —
+            // exactly as if the tag stood in a plain `WAVEFORMATEX`.
+            let inner_tag = wfex
+                .as_ref()
+                .and_then(|wfe| wfe.subformat.ksdataformat_tag())
+                .filter(|&t| t != WAVE_FORMAT_EXTENSIBLE);
+            let codec_tag = inner_tag.unwrap_or(format_tag);
+            let tag = CodecTag::wave_format(codec_tag);
             let mut ctx = ProbeContext::new(&tag).header(strf);
             if let Some(w) = &wfx {
                 ctx = ctx
@@ -5122,69 +5181,39 @@ fn build_stream(
                     .channels(w.channels)
                     .sample_rate(w.samples_per_sec);
             }
-            // Codec id resolution path:
-            // 1. Try the codec registry against `CodecTag::wave_format(format_tag)`
-            //    (legacy path). Registered codecs for `0xFFFE` could
-            //    re-dispatch via `ctx.header` — we keep that surface
-            //    so a future codec crate can claim the EXTENSIBLE tag.
-            // 2. For extensible streams, prefer the SubFormat GUID's
-            //    well-known mapping (PCM / IEEE_FLOAT / ALAW / MULAW
-            //    / ADPCM / MPEG / DRM) over the synthetic
-            //    `avi:tag_fffe` placeholder the legacy fallback would
-            //    produce — the GUID is the actual codec id.
-            // 3. Fall back to the legacy depth-aware
-            //    `audio_codec_id_fallback`.
+            // Codec id: the registry's claim on the tag; failing that
+            // the well-known SubFormat GUIDs and the PCM depths; failing
+            // that a placeholder naming the GUID or the tag.
+            //
+            // The wire sample is `wBitsPerSample` wide — "the container
+            // size" — whatever `wValidBitsPerSample` says of the
+            // precision inside it (a 24-bit signal "can use a 32-bit
+            // container size"), so the container size picks the PCM
+            // flavour.
             let codec_id = codecs.resolve_tag(&ctx).unwrap_or_else(|| {
                 if let Some(wfe) = &wfex {
-                    // For depth-aware PCM/IEEE_FLOAT resolution, the
-                    // SubFormat's `wValidBitsPerSample` is the actual
-                    // codec precision (e.g. 24 for 24-in-32 PCM); fall
-                    // back to the WAVEFORMATEX `wBitsPerSample`
-                    // container size only when the union member is
-                    // zero (writers in the wild sometimes leave it
-                    // unset, in which case the container size is the
-                    // best available proxy).
-                    let depth = if wfe.valid_bits_per_sample > 0 {
-                        wfe.valid_bits_per_sample
-                    } else {
-                        bits
-                    };
-                    if let Some(hint) = subformat_codec_hint(&wfe.subformat, depth) {
+                    if let Some(hint) = subformat_codec_hint(&wfe.subformat, bits) {
                         return CodecId::new(hint);
                     }
-                    // Unknown SubFormat — synthesise an `avi:guid_<...>`
-                    // id so downstream `make_decoder` lookup fails
-                    // cleanly with a CodecNotFound naming the actual
-                    // GUID rather than the opaque `0xFFFE` tag.
-                    return CodecId::new(format!("avi:guid_{}", wfe.subformat.display()));
+                    if inner_tag.is_none() {
+                        return CodecId::new(format!("avi:guid_{}", wfe.subformat.display()));
+                    }
                 }
-                audio_codec_id_fallback(format_tag, bits)
+                audio_codec_id_fallback(codec_tag, bits)
             });
             let mut p = CodecParameters::audio(codec_id.clone());
-            // Stamp the on-wire wFormatTag onto the params for
-            // round-trip preservation.
-            p.tag = Some(CodecTag::wave_format(format_tag));
+            p.tag = Some(CodecTag::wave_format(codec_tag));
             if let Some(w) = &wfx {
                 p.channels = Some(w.channels);
                 p.sample_rate = Some(w.samples_per_sec);
-                p.extradata = w.extradata.clone();
-                // For extensible streams, prefer the SubFormat's
-                // wValidBitsPerSample for the sample-format hint —
-                // matches what the underlying codec actually decodes
-                // (24-in-32 PCM uses S24, not S32, even when the
-                // container is 32 bits). Fall back to the container
-                // size when the extension union is zero.
-                let depth_for_format = wfex
-                    .as_ref()
-                    .map(|wfe| {
-                        if wfe.valid_bits_per_sample > 0 {
-                            wfe.valid_bits_per_sample
-                        } else {
-                            w.bits_per_sample
-                        }
-                    })
-                    .unwrap_or(w.bits_per_sample);
-                p.sample_format = sample_format_for(codec_id.as_str(), depth_for_format);
+                // Codec configuration: the `cbSize` bytes, less the
+                // 22-byte extension (valid bits, channel mask,
+                // SubFormat) of an extensible header.
+                p.extradata = match &wfex {
+                    Some(_) => w.extradata.get(22..).unwrap_or_default().to_vec(),
+                    None => w.extradata.clone(),
+                };
+                p.sample_format = sample_format_for(codec_id.as_str(), w.bits_per_sample);
                 p.bit_rate = if w.avg_bytes_per_sec > 0 {
                     Some(w.avg_bytes_per_sec as u64 * 8)
                 } else {
@@ -5198,7 +5227,7 @@ fn build_stream(
             // validator runs in `open_avi` (or is skipped by
             // `open_avi_lenient`).
             audio_info = Some(AudioStrhInfo {
-                format_tag,
+                format_tag: codec_tag,
                 sample_size,
                 // nBlockAlign from the parsed WAVEFORMATEX (0 when the
                 // strf had no parsable WAVEFORMATEX — e.g. a 0-byte
@@ -5278,7 +5307,10 @@ fn build_stream(
         index,
         time_base,
         duration,
-        start_time: Some(0),
+        // "Starting time for this stream … it can specify a delay time
+        // for a stream that does not start concurrently with the file"
+        // (AVI 1.0 §AVISTREAMHEADER `dwStart`), in stream ticks.
+        start_time: Some(i64::from(start_raw)),
         params,
     };
     Ok((
@@ -8301,10 +8333,22 @@ impl Demuxer for AviDemuxer {
                 continue;
             }
             // End of movi guard in case sizes disagree.
-            let body_end = self.input.stream_position()? + hdr.size as u64;
+            let body_start = self.input.stream_position()?;
+            let body_end = body_start + hdr.size as u64;
+            // A chunk running past the end of the last `movi`: the file
+            // was cut short. What is there of a stream's final chunk is
+            // still handed out, flagged corrupt — the head of a frame
+            // can be worth decoding, and the caller is told.
+            let mut hdr = hdr;
+            let mut cut_short = false;
             if body_end > current_end {
-                // Truncated or bad size — stop.
-                return Err(Error::Eof);
+                let left = current_end.saturating_sub(body_start);
+                let last = self.current_segment + 1 == self.movi_segments.len();
+                if !last || left == 0 {
+                    return Err(Error::Eof);
+                }
+                hdr.size = left as u32; // `left < hdr.size`
+                cut_short = true;
             }
             if hdr.id == *b"JUNK" || hdr.id == *b"junk" {
                 skip_chunk(&mut *self.input, &hdr)?;
@@ -8374,7 +8418,7 @@ impl Demuxer for AviDemuxer {
                         // number of samples in this packet (PCM: block_align
                         // derived from bps*channels; other codecs we just use
                         // the packet counter in units of rate/scale).
-                        let pts = counter as i64;
+                        let pts = (counter as i64).saturating_add(self.start_ticks(idx));
                         let mut pkt = Packet::new(idx, stream.time_base, data);
                         pkt.pts = Some(pts);
                         pkt.dts = Some(pts);
@@ -8397,6 +8441,7 @@ impl Demuxer for AviDemuxer {
                             .get(chunk_header_off)
                             .unwrap_or(true)
                             || self.all_key[idx as usize];
+                        pkt.flags.corrupt = cut_short;
                         // Bump counter. The chunk spans `bump` ticks of
                         // `dwScale / dwRate`: one for a frame-per-chunk
                         // stream, the whole sample blocks it holds
@@ -8425,6 +8470,42 @@ impl Demuxer for AviDemuxer {
     }
 
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        // Timestamps handed out are offset by the stream's `dwStart`;
+        // the index tables count from the stream's first sample.
+        let start = self.start_ticks(stream_index);
+        let landed = self.seek_to_ticks(stream_index, pts.saturating_sub(start))?;
+        Ok(landed.saturating_add(start))
+    }
+
+    fn metadata(&self) -> &[(String, String)] {
+        &self.metadata
+    }
+
+    fn duration_micros(&self) -> Option<i64> {
+        if self.duration_micros > 0 {
+            Some(self.duration_micros)
+        } else {
+            None
+        }
+    }
+}
+
+impl AviDemuxer {
+    /// The stream's `strh.dwStart` — "starting time for this stream …
+    /// it can specify a delay time for a stream that does not start
+    /// concurrently with the file" (AVI 1.0 §AVISTREAMHEADER) — in
+    /// stream ticks. Packet timestamps are offset by it.
+    fn start_ticks(&self, stream_index: u32) -> i64 {
+        self.stream_starts
+            .get(stream_index as usize)
+            .copied()
+            .flatten()
+            .map_or(0, i64::from)
+    }
+
+    /// [`Demuxer::seek_to`] in ticks counted from the stream's first
+    /// sample (no `dwStart` offset).
+    fn seek_to_ticks(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         if (stream_index as usize) >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "AVI: stream index {stream_index} out of range"
@@ -8528,18 +8609,6 @@ impl Demuxer for AviDemuxer {
         }
 
         Ok(landed_pts)
-    }
-
-    fn metadata(&self) -> &[(String, String)] {
-        &self.metadata
-    }
-
-    fn duration_micros(&self) -> Option<i64> {
-        if self.duration_micros > 0 {
-            Some(self.duration_micros)
-        } else {
-            None
-        }
     }
 }
 
@@ -11903,6 +11972,8 @@ impl AviDemuxer {
                 "AVI: stream index {stream_index} out of range"
             )));
         }
+        let start = self.start_ticks(stream_index);
+        let target_pts = target_pts.saturating_sub(start);
         if self.idx_table.is_empty() {
             return Err(Error::unsupported(
                 "AVI: seek_to_first_video_keyframe_after requires idx1 \
@@ -11989,8 +12060,8 @@ impl AviDemuxer {
         // don't get a negative distance.
         let gop_distance = landed_pts.saturating_sub(target_pts).max(0);
         Ok(KeyframeSeekResult {
-            target_pts,
-            landed_pts,
+            target_pts: target_pts.saturating_add(start),
+            landed_pts: landed_pts.saturating_add(start),
             gop_distance,
         })
     }
@@ -12030,7 +12101,10 @@ impl AviDemuxer {
                 "AVI: seek_to_keyframe_strict_via_std_index requires OpenDML ix## standard indexes",
             ));
         }
-        let landed_pts = self.seek_via_std_indexes(stream_index, target_pts)?;
+        let start = self.start_ticks(stream_index);
+        let landed_pts = self
+            .seek_via_std_indexes(stream_index, target_pts.saturating_sub(start))?
+            .saturating_add(start);
         let gop_distance = target_pts.saturating_sub(landed_pts).max(0);
         Ok(KeyframeSeekResult {
             target_pts,

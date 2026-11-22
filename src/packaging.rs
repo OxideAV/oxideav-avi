@@ -25,6 +25,220 @@ use crate::stream_format::{
     write_waveformatextensible,
 };
 
+/// `CodecParameters::options` keys under which the demuxer records a
+/// stream's header chunks (lower-case hex of the chunk body) and the
+/// muxer looks for them. Documented in the README, "Container track
+/// records".
+pub(crate) const REC_STRH: &str = "avi.strh";
+pub(crate) const REC_STRF: &str = "avi.strf";
+pub(crate) const REC_STRD: &str = "avi.strd";
+pub(crate) const REC_STRN: &str = "avi.strn";
+pub(crate) const REC_VPRP: &str = "avi.vprp";
+
+/// Lower-case hex of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[usize::from(b >> 4)] as char);
+        out.push(DIGITS[usize::from(b & 15)] as char);
+    }
+    out
+}
+
+/// Inverse of [`hex`]; `None` for an odd length or a non-hex digit.
+pub(crate) fn unhex(text: &str) -> Option<Vec<u8>> {
+    let (pairs, odd) = text.as_bytes().as_chunks::<2>();
+    if !odd.is_empty() {
+        return None;
+    }
+    let nibble = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    pairs
+        .iter()
+        .map(|&[hi, lo]| Some(nibble(hi)? << 4 | nibble(lo)?))
+        .collect()
+}
+
+/// The header chunks a demuxer recorded for a stream, accepted only
+/// while they still describe the stream being written.
+#[derive(Debug, Clone)]
+pub(crate) struct TrackRecord {
+    /// `strh` body (at least 48 bytes).
+    pub strh: Vec<u8>,
+    /// `strf` body.
+    pub strf: Vec<u8>,
+    pub strd: Option<Vec<u8>>,
+    pub strn: Option<Vec<u8>>,
+    pub vprp: Option<Vec<u8>>,
+}
+
+impl TrackRecord {
+    /// The records in `params.options`, when present and consistent
+    /// with the parameters: same stream type, same tag, same picture
+    /// size / channel count / sample rate, same codec configuration. A
+    /// caller that re-encoded the stream and changed any of those gets
+    /// headers built from the parameters instead.
+    pub(crate) fn from_params(params: &CodecParameters) -> Option<Self> {
+        let get = |key: &str| params.options.get(key).and_then(unhex);
+        let rec = Self {
+            strh: get(REC_STRH)?,
+            strf: get(REC_STRF)?,
+            strd: get(REC_STRD),
+            strn: get(REC_STRN),
+            vprp: get(REC_VPRP),
+        };
+        if rec.strh.len() < 48 {
+            return None;
+        }
+        let consistent = match (params.media_type, &rec.strh[0..4]) {
+            (MediaType::Video, b"vids") => rec.video_matches(params),
+            (MediaType::Audio, b"auds") => rec.audio_matches(params),
+            (MediaType::Subtitle, b"txts") => rec.strf == params.extradata,
+            _ => false,
+        };
+        consistent.then_some(rec)
+    }
+
+    fn video_matches(&self, params: &CodecParameters) -> bool {
+        let Ok(b) = crate::stream_format::parse_bitmap_info_header(&self.strf) else {
+            return false;
+        };
+        let raw = crate::raw_dib::pixel_format_for(
+            b.compression,
+            b.bit_count,
+            crate::stream_format::parse_bitfields_masks(&b.extradata)
+                .filter(|_| b.compression == crate::stream_format::BI_BITFIELDS),
+        );
+        let is_raw = params.codec_id.as_str() == "rawvideo";
+        params.tag == Some(CodecTag::fourcc(&b.compression))
+            && params.width == Some(b.width)
+            && params.height == Some(b.height)
+            && params.extradata == b.extradata
+            && is_raw == raw.is_some()
+            && (!is_raw || params.pixel_format == raw.map(|(fmt, _)| fmt))
+    }
+
+    fn audio_matches(&self, params: &CodecParameters) -> bool {
+        let Ok(w) = crate::stream_format::parse_waveformatex(&self.strf) else {
+            return false;
+        };
+        let (tag, config) = if w.format_tag == WAVE_FORMAT_EXTENSIBLE {
+            let Some(guid) = w.extradata.get(6..22).and_then(Guid::from_bytes) else {
+                return false;
+            };
+            (
+                guid.ksdataformat_tag().unwrap_or(WAVE_FORMAT_EXTENSIBLE),
+                &w.extradata[22..],
+            )
+        } else {
+            (w.format_tag, &w.extradata[..])
+        };
+        params.tag == Some(CodecTag::wave_format(tag))
+            && params.channels == Some(w.channels)
+            && params.sample_rate == Some(w.samples_per_sec)
+            && params.extradata == config
+    }
+
+    fn u32_at(&self, at: usize) -> u32 {
+        u32::from_le_bytes([
+            self.strh[at],
+            self.strh[at + 1],
+            self.strh[at + 2],
+            self.strh[at + 3],
+        ])
+    }
+
+    fn u16_at(&self, at: usize) -> u16 {
+        u16::from_le_bytes([self.strh[at], self.strh[at + 1]])
+    }
+
+    pub(crate) fn flags(&self) -> u32 {
+        self.u32_at(8)
+    }
+
+    pub(crate) fn priority(&self) -> u16 {
+        self.u16_at(12)
+    }
+
+    pub(crate) fn language(&self) -> u16 {
+        self.u16_at(14)
+    }
+
+    pub(crate) fn initial_frames(&self) -> u32 {
+        self.u32_at(16)
+    }
+
+    pub(crate) fn start(&self) -> u32 {
+        self.u32_at(28)
+    }
+
+    pub(crate) fn quality(&self) -> u32 {
+        self.u32_at(40)
+    }
+
+    /// `rcFrame`, when the recorded header is long enough to hold it.
+    pub(crate) fn frame_rect(&self) -> Option<[i16; 4]> {
+        let r = self.strh.get(48..56)?;
+        Some([
+            i16::from_le_bytes([r[0], r[1]]),
+            i16::from_le_bytes([r[2], r[3]]),
+            i16::from_le_bytes([r[4], r[5]]),
+            i16::from_le_bytes([r[6], r[7]]),
+        ])
+    }
+
+    /// The muxer's stream entry for the recorded headers: `strf`
+    /// verbatim, and the `strh` type, handler, `dwScale / dwRate` and
+    /// `dwSampleSize` as recorded.
+    pub(crate) fn entry(&self, params: &CodecParameters) -> StrfEntry {
+        let four = |at: usize| {
+            [
+                self.strh[at],
+                self.strh[at + 1],
+                self.strh[at + 2],
+                self.strh[at + 3],
+            ]
+        };
+        let strh_type = four(0);
+        let mut chunk_suffix = match &strh_type {
+            b"auds" => *b"wb",
+            b"txts" => *b"tx",
+            _ => *b"dc",
+        };
+        let mut raw_layout = None;
+        if &strh_type == b"vids"
+            && let Ok(b) = crate::stream_format::parse_bitmap_info_header(&self.strf)
+        {
+            // "db: uncompressed video frame" (AVI 1.0 §"Stream Data").
+            let uncompressed =
+                b.compression == [0; 4] || b.compression == crate::stream_format::BI_BITFIELDS;
+            if uncompressed {
+                chunk_suffix = *b"db";
+            }
+            let masks = crate::stream_format::parse_bitfields_masks(&b.extradata)
+                .filter(|_| b.compression == crate::stream_format::BI_BITFIELDS);
+            if params.codec_id.as_str() == "rawvideo"
+                && let Some((fmt, rule)) =
+                    crate::raw_dib::pixel_format_for(b.compression, b.bit_count, masks)
+            {
+                raw_layout =
+                    crate::raw_dib::RawLayout::new(fmt, rule, b.width, b.height, b.top_down)
+                        .filter(|l| !l.is_identity());
+            }
+        }
+        StrfEntry {
+            chunk_suffix,
+            handler_fourcc: four(4),
+            strf: self.strf.clone(),
+            strh_type,
+            sample_size: self.u32_at(44),
+            scale: self.u32_at(20),
+            rate: self.u32_at(24),
+            raw_layout,
+        }
+    }
+}
+
 /// Result of building a stream-format chunk for the muxer.
 #[derive(Debug)]
 pub(crate) struct StrfEntry {
@@ -155,7 +369,7 @@ pub struct BmihOverrides {
 }
 
 impl BmihOverrides {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.size_image.is_none()
             && self.pels_per_meter.is_none()
             && self.clr_important.is_none()

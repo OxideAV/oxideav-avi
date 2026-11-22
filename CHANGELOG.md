@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Muxer::set_metadata` / `carries_metadata_key`: the keys the
+  demuxer's `metadata()` reports for `LIST INFO`, `IDIT` and `ISMP`
+  are written, so text metadata survives a remux through the trait.
+- `tests/blackbox_matrix.rs`: 297 files from an outside muxer read
+  against a from-the-spec model and an outside reader, 1100 remuxes
+  compared by the outside reader (skips without the tools).
+- A frame-per-chunk audio stream read from a file gets its gaps (empty
+  `##wb` chunks) written back, like dropped video frames.
 - `examples/avi_tool.rs`: `dump` (streams, metadata, one line per
   packet with its CRC-32 — the listing a black-box prober prints),
   `remux` (AVI 1.0 / OpenDML / compact index), `seek`, `raw`.
@@ -70,6 +78,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remuxing a file this crate did not write lost most of its stream
+  headers: 51 of 322 outside files survived a demux → mux round trip
+  as the outside reader saw them. `WAVE_FORMAT_EXTENSIBLE` streams
+  were refused by the muxer; compressed audio came out with
+  `nBlockAlign` 1, `wBitsPerSample` 0 and a `dwScale / dwRate` guessed
+  from the first packets (MS-ADPCM undecodable, MP3 / AC-3 / DTS on
+  the wrong clock); any non-PCM stream whose header stated a sample
+  depth was rewritten as PCM; FourCCs were upper-cased; `vprp`
+  (aspect ratio), `strn`, palettes of indexed DIBs, bottom-up row
+  order and the `LIST INFO` text were dropped. The demuxer now records
+  each stream's header chunks (`avi.strh` / `avi.strf` / `avi.strd` /
+  `avi.strn` / `avi.vprp` in `CodecParameters::options`) and the muxer
+  writes them back while they still describe the stream; 1100 of 1100
+  remuxes (four writer modes) now match.
+- `WAVE_FORMAT_EXTENSIBLE` audio: the codec is the format tag the
+  SubFormat GUID wraps, resolved through the registry like a plain
+  tag (extensible AAC was `avi:guid_…`); `extradata` is the codec
+  configuration after the 22-byte extension, not the extension; PCM is
+  framed by its container size (24 valid bits in a 32-bit container
+  was labelled `pcm_s24le` over 4-byte samples); a header too short
+  for the extension no longer fails `open()`.
+- `strh.dwStart` was read but ignored: `StreamInfo::start_time` is now
+  the stream's start and its packet timestamps (and seeks) are offset
+  by it.
+- A `dwLength` / `dwTotalFrames` placeholder left by a writer that
+  could not seek back (0x40000000 frames in a piped file) was reported
+  as the stream length; a count the file has no room for is now
+  unknown.
+- The last chunk of a file cut short was dropped; what is there of it
+  is now returned with `flags.corrupt` set.
 - A file that marks none of a stream's frames key in its index no
   longer reads as a stream with no entry point: an index like that
   (seen on intra-only codecs and on audio) states that its writer did

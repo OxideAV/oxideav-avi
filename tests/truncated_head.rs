@@ -168,7 +168,7 @@ fn riff_oversize_declared_walks_clean() {
 /// region, so the demuxer falls back to linear movi walking. The last
 /// packet's body straddles the truncation boundary.
 #[test]
-fn physical_truncation_drops_partial_tail_packet() {
+fn physical_truncation_keeps_what_is_left_of_the_tail_packet() {
     let mut buf = build_pcm_avi("phys-trunc-tail", 4, 256);
     let original_len = buf.len();
     // Truncate the last 200 bytes so we lose at least the idx1 chunk and
@@ -183,18 +183,22 @@ fn physical_truncation_drops_partial_tail_packet() {
         "expected 3-4 packets, got {}",
         got.len()
     );
-    for (i, p) in got.iter().enumerate() {
+    // Every packet but the one the cut landed in is a full block; that
+    // one comes out with what is left of it.
+    let (last, whole) = got.split_last().expect("at least three packets");
+    for (i, p) in whole.iter().enumerate() {
         assert_eq!(p.len(), 256 * 4, "packet {i} should be a full block");
     }
+    assert!(!last.is_empty() && last.len() <= 256 * 4);
 }
 
 /// Fixture (d): Truncate the file partway through the **last packet's
 /// body** specifically — the chunk header parses cleanly but the
 /// `read_exact` inside `next_packet` would otherwise hit
-/// UnexpectedEof. The demuxer should drop the partial frame and
-/// surface `Eof`.
+/// UnexpectedEof. The demuxer returns what is there of the frame
+/// (flagged corrupt), then `Eof`.
 #[test]
-fn physical_truncation_inside_packet_body_drops_partial() {
+fn physical_truncation_inside_packet_body_delivers_the_partial() {
     let buf = build_pcm_avi("phys-trunc-body", 4, 256);
     // Walk forward inside the movi LIST body chunk-by-chunk so we find
     // the **last actual packet header** (not an idx1 entry that
@@ -231,13 +235,9 @@ fn physical_truncation_inside_packet_body_drops_partial() {
 
     let got = drain_packets(truncated);
     // Headers + bodies of packets 0..2 are wholly inside the truncated
-    // buffer — packet 3's body is short. Demuxer should surface 3
-    // packets cleanly, then Eof on the 4th body's UnexpectedEof.
-    assert_eq!(
-        got.len(),
-        3,
-        "expected 3 full packets recovered (4th body truncated)"
-    );
+    // buffer — packet 3's body is short: its first half is delivered.
+    assert_eq!(got.len(), 4, "three whole packets and the cut one");
+    assert_eq!(got[3].len(), size / 2);
 }
 
 /// Fixture (e): **AVI 1.0 with no `idx1`** — degrade to linear walk.

@@ -397,18 +397,27 @@ fn strh_length_does_not_perturb_sibling_dwords() {
 #[test]
 fn strh_length_streaminfo_duration_agrees_with_raw_stamp() {
     let tmp = tmp_path("duration-agree");
-    let opts = AviMuxOptions::default().with_stream_length(0, 9_999);
+    let opts = AviMuxOptions::default().with_stream_length(0, 2);
     write_minimal(&tmp, opts, 64);
 
     let reg = CodecRegistry::new();
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
     let dmx = demuxer_open_avi(rs, &reg).unwrap();
 
-    assert_eq!(dmx.stream_length(0), Some(9_999));
+    assert_eq!(dmx.stream_length(0), Some(2));
     let streams = dmx.streams();
     let s0 = streams.iter().find(|s| s.index == 0).unwrap();
     // The framework `duration` is the same u32 widened to i64.
-    assert_eq!(s0.duration, Some(9_999_i64));
+    assert_eq!(s0.duration, Some(2_i64));
+
+    // A stamp the file has no room for (every frame costs at least a
+    // chunk header) stays readable raw, but is no stream length.
+    let opts = AviMuxOptions::default().with_stream_length(0, 9_999_999);
+    write_minimal(&tmp, opts, 64);
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
+    let dmx = demuxer_open_avi(rs, &reg).unwrap();
+    assert_eq!(dmx.stream_length(0), Some(9_999_999));
+    assert_eq!(dmx.streams()[0].duration, None);
 
     let _ = std::fs::remove_file(&tmp);
 }

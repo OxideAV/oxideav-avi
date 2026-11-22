@@ -115,13 +115,15 @@ fn wfex_pcm_5_1_24_in_32_roundtrip() {
     let recovered = dmx.stream_subformat(0).expect("SubFormat GUID present");
     assert_eq!(recovered, KSDATAFORMAT_SUBTYPE_PCM);
 
-    // params.tag stamps wFormatTag = 0xFFFE for round-trip fidelity.
+    // params.tag is the tag the SubFormat GUID wraps (PCM, 0x0001): the
+    // stream is that codec, however its header spells it.
     let p = &dmx.streams()[0].params;
-    assert_eq!(p.tag, Some(CodecTag::wave_format(WAVE_FORMAT_EXTENSIBLE)));
+    assert_eq!(p.tag, Some(CodecTag::wave_format(0x0001)));
+    assert!(p.extradata.is_empty(), "the extension is not codec config");
 
-    // PCM SubFormat + 24 valid bits ⇒ `pcm_s24le` resolution (depth-aware,
-    // matching the legacy `audio_codec_id_fallback`).
-    assert_eq!(p.codec_id.as_str(), "pcm_s24le");
+    // The wire sample is the 32-bit container (4 bytes, as written
+    // above); the 24 valid bits are a precision note, not a layout.
+    assert_eq!(p.codec_id.as_str(), "pcm_s32le");
     assert_eq!(p.channels, Some(channels));
     assert_eq!(p.sample_rate, Some(48_000));
 }

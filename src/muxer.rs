@@ -2645,6 +2645,11 @@ struct IndexEntry {
 
 struct TrackState {
     stream: StreamInfo,
+    /// Header chunks recorded by a demuxer and still valid for the
+    /// stream: `entry` was taken from them, and nothing derived from
+    /// the packets overwrites their `dwScale / dwRate`, `dwSampleSize`
+    /// or `nBlockAlign`.
+    record: Option<crate::packaging::TrackRecord>,
     entry: StrfEntry,
     /// 4-byte chunk FourCC used in movi for this stream (e.g. b"00dc").
     packet_fourcc: [u8; 4],
@@ -2901,18 +2906,36 @@ pub fn open_avi(
             s.time_base.num().clamp(0, u32::MAX as i64) as u32,
             s.time_base.den().clamp(0, u32::MAX as i64) as u32,
         );
-        let entry = build_strf(
-            &s.params,
-            top_down,
-            extensible,
-            indexed,
-            bmih_overrides,
-            avg_bytes_override,
-            tb,
-        )?;
+        // Header chunks a demuxer recorded for this stream are written
+        // back as they were, unless the caller asked for a different
+        // stream format through the options or the stream no longer
+        // matches them (`TrackRecord::from_params`).
+        let format_options_set = top_down
+            || extensible.is_some()
+            || indexed.is_some()
+            || !bmih_overrides.is_empty()
+            || avg_bytes_override.is_some();
+        let record = if format_options_set {
+            None
+        } else {
+            crate::packaging::TrackRecord::from_params(&s.params)
+        };
+        let entry = match &record {
+            Some(r) => r.entry(&s.params),
+            None => build_strf(
+                &s.params,
+                top_down,
+                extensible,
+                indexed,
+                bmih_overrides,
+                avg_bytes_override,
+                tb,
+            )?,
+        };
         let packet_fourcc = packet_fourcc_for(i as u32, entry.chunk_suffix);
         tracks.push(TrackState {
             stream: s.clone(),
+            record,
             entry,
             packet_fourcc,
             packet_count: 0,
@@ -2964,6 +2987,9 @@ pub fn open_avi(
         primary_ix_snapshot: Vec::new(),
         over_budget_streams: Vec::new(),
         header_written: false,
+        metadata_info: Vec::new(),
+        metadata_idit: None,
+        metadata_ismp: None,
         trailer_written: false,
     })
 }
@@ -3121,6 +3147,11 @@ pub struct AviMuxer {
     /// [`AviMuxer::over_budget_streams`].
     over_budget_streams: Vec<(u32, u64, u32)>,
     header_written: bool,
+    /// `LIST INFO` entries, `IDIT` and `ISMP` text handed over through
+    /// [`Muxer::set_metadata`].
+    metadata_info: Vec<([u8; 4], String)>,
+    metadata_idit: Option<String>,
+    metadata_ismp: Option<String>,
     trailer_written: bool,
 }
 
@@ -3142,9 +3173,71 @@ pub const OPENDML_SUPER_INDEX_DEFAULT_CAPACITY: usize = 256;
 /// reasonable lower bound for tiny OpenDML test fixtures.
 pub const OPENDML_SUPER_INDEX_MIN_CAPACITY: usize = 16;
 
+/// `LIST INFO` id a metadata key is written under: the names the
+/// demuxer reports for the ids it knows, and `avi:info.<fourcc>` for
+/// any other id.
+fn info_id_for_key(key: &str) -> Option<[u8; 4]> {
+    Some(*match key {
+        "title" => b"INAM",
+        "artist" => b"IART",
+        "album" => b"IPRD",
+        "comment" => b"ICMT",
+        "date" => b"ICRD",
+        "genre" => b"IGNR",
+        "copyright" => b"ICOP",
+        "engineer" => b"IENG",
+        "technician" => b"ITCH",
+        "encoder" => b"ISFT",
+        "subject" => b"ISBJ",
+        "track" => b"ITRK",
+        _ => {
+            let id = key.strip_prefix("avi:info.")?.as_bytes();
+            return (id.len() == 4 && id.iter().all(u8::is_ascii_graphic))
+                .then(|| [id[0], id[1], id[2], id[3]]);
+        }
+    })
+}
+
 impl Muxer for AviMuxer {
     fn format_name(&self) -> &str {
         "avi"
+    }
+
+    /// Text metadata for the file's `LIST INFO` (and the `IDIT` /
+    /// `ISMP` header chunks): `title`, `artist`, `album`, `comment`,
+    /// `date`, `genre`, `copyright`, `engineer`, `technician`,
+    /// `encoder`, `subject`, `track`, `avi:info.<fourcc>`, `avi:idit`,
+    /// `avi:ismp` — the keys the demuxer reports, so
+    /// `mux.set_metadata(demux.metadata())` carries a file's text
+    /// across. Other keys (the demuxer's `avi:*` header read-outs) are
+    /// dropped. Values set through [`AviMuxOptions`] win over a pair
+    /// for the same field.
+    fn set_metadata(&mut self, metadata: &[(String, String)]) -> Result<()> {
+        if self.header_written {
+            return Err(Error::invalid("avi muxer: set_metadata after write_header"));
+        }
+        self.metadata_info.clear();
+        self.metadata_idit = None;
+        self.metadata_ismp = None;
+        for (key, value) in metadata {
+            if value.is_empty() {
+                continue;
+            }
+            match key.as_str() {
+                "avi:idit" => self.metadata_idit = Some(value.clone()),
+                "avi:ismp" => self.metadata_ismp = Some(value.clone()),
+                _ => {
+                    if let Some(id) = info_id_for_key(key) {
+                        self.metadata_info.push((id, value.clone()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn carries_metadata_key(&self, key: &str) -> bool {
+        matches!(key, "avi:idit" | "avi:ismp") || info_id_for_key(key).is_some()
     }
 
     fn write_header(&mut self) -> Result<()> {
@@ -3434,9 +3527,17 @@ impl Muxer for AviMuxer {
         // payload is a NUL-terminated string per the AVI 1.0
         // `LIST INFO` registry — see `parse_info_list` in the
         // demuxer.
-        let want_info = !self.options.info_entries.is_empty();
+        // `set_metadata` pairs follow the `with_info` entries; an id the
+        // builder already set keeps the builder's value.
+        let mut info_entries = self.options.info_entries.clone();
+        for (id, value) in &self.metadata_info {
+            if !self.options.info_entries.iter().any(|(have, _)| have == id) {
+                info_entries.push((*id, value.clone()));
+            }
+        }
+        let want_info = !info_entries.is_empty();
         if want_info && !self.options.info_top_level {
-            write_info_list(self.output.as_mut(), &self.options.info_entries)?;
+            write_info_list(self.output.as_mut(), &info_entries)?;
         }
         // Round-107: emit the `IDIT` digitization-date chunk inside
         // `hdrl` (RIFF *Hdrl Tags* namespace, `DateTimeOriginal`, per
@@ -3446,7 +3547,12 @@ impl Muxer for AviMuxer {
         // caller's UTF-8 string + a NUL terminator (RIFF word-pad
         // applied by `write_chunk` for odd lengths). The demuxer
         // (`parse_hdrl`'s `b"IDIT"` arm) reads it back verbatim.
-        if let Some(ref date) = self.options.digitization_date {
+        if let Some(date) = self
+            .options
+            .digitization_date
+            .as_ref()
+            .or(self.metadata_idit.as_ref())
+        {
             let mut body = date.as_bytes().to_vec();
             body.push(0);
             write_chunk(self.output.as_mut(), b"IDIT", &body)?;
@@ -3459,7 +3565,12 @@ impl Muxer for AviMuxer {
         // Body is the caller's UTF-8 string + a NUL terminator (RIFF
         // word-pad applied by `write_chunk` for odd lengths). The
         // demuxer (`parse_hdrl`'s `b"ISMP"` arm) reads it back verbatim.
-        if let Some(ref timecode) = self.options.smpte_timecode {
+        if let Some(timecode) = self
+            .options
+            .smpte_timecode
+            .as_ref()
+            .or(self.metadata_ismp.as_ref())
+        {
             let mut body = timecode.as_bytes().to_vec();
             body.push(0);
             write_chunk(self.output.as_mut(), b"ISMP", &body)?;
@@ -3475,7 +3586,7 @@ impl Muxer for AviMuxer {
         // either placement so the metadata payload round-trips
         // byte-equally regardless of which the muxer chose.
         if want_info && self.options.info_top_level {
-            write_info_list(self.output.as_mut(), &self.options.info_entries)?;
+            write_info_list(self.output.as_mut(), &info_entries)?;
         }
 
         // Round-373: emit explicit top-level `JUNK` padding chunks as
@@ -4034,7 +4145,13 @@ impl AviMuxer {
     /// discontinuity rather than written out as empty chunks).
     fn skipped_frame_slots(&self, idx: usize, packet: &Packet) -> u64 {
         let t = &self.tracks[idx];
-        if t.entry.strh_type != *b"vids" || packet.flags.header {
+        // Video, and any other frame-per-chunk stream whose tick is
+        // already final because its header was recorded (compressed
+        // audio read from a file: an empty `##wb` chunk there is a gap
+        // of one frame time).
+        let frame_per_chunk =
+            t.entry.strh_type == *b"vids" || (t.record.is_some() && t.entry.sample_size == 0);
+        if !frame_per_chunk || packet.flags.header {
             return 0;
         }
         let Some(dts) = packet.dts else {
@@ -4053,7 +4170,16 @@ impl AviMuxer {
         let Some(slot) = packet.time_base.rescale_checked(dts, tick) else {
             return 0;
         };
-        let next = i64::from(t.packet_count);
+        // Slots count from the stream's own start (`dwStart`).
+        let start = self
+            .options
+            .stream_starts
+            .iter()
+            .find(|(i, _)| *i as usize == idx)
+            .map(|(_, s)| *s)
+            .or_else(|| t.record.as_ref().map(|r| r.start()))
+            .unwrap_or(0);
+        let next = i64::from(t.packet_count) + i64::from(start);
         match slot.checked_sub(next) {
             Some(gap) if gap > 0 && gap as u64 <= MAX_SKIPPED_FRAME_SLOTS => gap as u64,
             _ => 0,
@@ -4245,6 +4371,7 @@ impl AviMuxer {
                 .iter()
                 .any(|(idx, _, _)| *idx == i as u32);
             if let Some(spf) = t.vbr_chunk_samples
+                && t.record.is_none()
                 && !timebase_overridden
                 && let (Ok(spf), rate) = (u32::try_from(spf), t.entry.rate.max(1))
             {
@@ -4266,6 +4393,7 @@ impl AviMuxer {
                 .iter()
                 .any(|(idx, _)| *idx == i as u32);
             if &t.entry.strh_type == b"auds"
+                && t.record.is_none()
                 && t.entry.sample_size == 0
                 && !sample_size_overridden
                 && t.entry.strf.get(0..2) == Some(&0x0011u16.to_le_bytes()[..])
@@ -5324,6 +5452,17 @@ fn write_strl<W: Write + Seek + ?Sized>(
 ) -> Result<(u64, Option<u64>, Option<u64>, usize)> {
     let strl_off = begin_list(w, &LIST, b"strl")?;
 
+    // Recorded header fields stand in wherever the caller set no option.
+    let rec = t.record.as_ref();
+    let frame_rect_override = frame_rect_override.or_else(|| rec.and_then(|r| r.frame_rect()));
+    let language_override = language_override.or_else(|| rec.map(|r| r.language()));
+    let initial_frames_override =
+        initial_frames_override.or_else(|| rec.map(|r| r.initial_frames()));
+    let quality_override = quality_override.or_else(|| rec.map(|r| r.quality()));
+    let priority_override = priority_override.or_else(|| rec.map(|r| r.priority()));
+    let start_override = start_override.or_else(|| rec.map(|r| r.start()));
+    let flags_override = flags_override.or_else(|| rec.map(|r| r.flags()));
+
     // strh body (56 bytes).
     let mut strh = Vec::with_capacity(56);
     // fccType (round-253): an `AviMuxOptions::with_stream_fcc_type`
@@ -5594,9 +5733,15 @@ fn write_strl<W: Write + Seek + ?Sized>(
     // about the resolution. nbFieldPerFrame=1 (progressive) — the
     // muxer doesn't currently emit interlaced indexes, so single
     // field is correct.
-    if with_vprp {
-        let body = build_vprp_body(t, vprp_override);
-        write_chunk(w, b"vprp", &body)?;
+    // A recorded `vprp` goes back verbatim (in AVI 1.0 files too)
+    // unless the caller configured one.
+    match (rec.and_then(|r| r.vprp.as_deref()), &vprp_override) {
+        (Some(body), None) => write_chunk(w, b"vprp", body)?,
+        _ if with_vprp => {
+            let body = build_vprp_body(t, vprp_override);
+            write_chunk(w, b"vprp", &body)?;
+        }
+        _ => {}
     }
 
     // AVI 1.0 §"AVI Stream Headers" (round-89): optional `strd`
@@ -5609,7 +5754,7 @@ fn write_strl<W: Write + Seek + ?Sized>(
     // emit uses. The body is the caller-supplied bytes verbatim,
     // RIFF-word-padded by `write_chunk` so an odd-length blob gets
     // one trailing zero byte.
-    if let Some(bytes) = stream_header_data {
+    if let Some(bytes) = stream_header_data.or_else(|| rec.and_then(|r| r.strd.as_deref())) {
         write_chunk(w, b"strd", bytes)?;
     }
 
@@ -5624,6 +5769,8 @@ fn write_strl<W: Write + Seek + ?Sized>(
         body.extend_from_slice(name.as_bytes());
         body.push(0); // NUL terminator per spec.
         write_chunk(w, b"strn", &body)?;
+    } else if let Some(body) = rec.and_then(|r| r.strn.as_deref()) {
+        write_chunk(w, b"strn", body)?;
     }
 
     finish_chunk(w, strl_off)?;
