@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 8-bit indexed DIBs are `rawvideo` / `Pal8` (packed top-down index
+  rows, color table as `extradata`) in both directions; they were a
+  stream labelled `rgb24` holding padded bottom-up index rows.
 - `Muxer::set_metadata` / `carries_metadata_key`: the keys the
   demuxer's `metadata()` reports for `LIST INFO`, `IDIT` and `ISMP`
   are written, so text metadata survives a remux through the trait.

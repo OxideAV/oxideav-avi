@@ -172,7 +172,7 @@ What the matrix does **not** establish:
 - Codec ids for tags no codec crate claims come out as `avi:<FOURCC>` /
   `avi:tag_xxxx` / `avi:guid_…`; the streams still remux exactly.
 - Raw YUV FourCCs (`I420`, `YUY2`, `UYVY`, `NV12`, …) and DIB depths
-  other than 16 / 24 / 32 pass through as tagged streams; this crate
+  other than 8 / 16 / 24 / 32 pass through as tagged streams; this crate
   does not turn them into `rawvideo` + a pixel format (no FourCC
   registry among the documents).
 - Packed-B-frame MPEG-4 and DV type 1 (`iavs`) files: the outside
@@ -280,6 +280,7 @@ padding is dropped; already-packed top-down frames pass through as-is):
 
 | `biCompression` / `biBitCount` | pixel format |
 |--------------------------------|--------------|
+| `BI_RGB` 8 | `Pal8` (one index byte per pixel; the color table is `extradata`) |
 | `BI_RGB` 16 | `Rgb555Le` |
 | `BI_RGB` 24 | `Bgr24` |
 | `BI_RGB` 32 | `Bgrx` (high byte unused) |
@@ -289,8 +290,11 @@ padding is dropped; already-packed top-down frames pass through as-is):
 
 The muxer writes `rawvideo` streams of those pixel formats back as a
 top-down DIB (negative `biHeight`, rows padded to the DWORD stride) or
-the `RGBA` FourCC; other pixel formats are refused at `open`. Palettised
-(1/4/8 bpp) DIBs keep the legacy path.
+the `RGBA` FourCC; other pixel formats are refused at `open`. A `Pal8`
+stream is written as an 8-bit indexed DIB with the color table taken
+from `extradata` (four bytes per entry: blue, green, red, reserved).
+1- and 4-bit indexed DIBs keep the legacy path (`rgb24` codec id, wire
+bytes untouched, `stream_palette` for the table).
 
 ### Audio wFormatTag to codec id
 

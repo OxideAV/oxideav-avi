@@ -51,6 +51,11 @@ pub(crate) fn pixel_format_for(
     masks: Option<(u32, u32, u32)>,
 ) -> Option<(PixelFormat, RowRule)> {
     let fmt = match (compression, bit_count) {
+        // One index byte per pixel into the color table that follows
+        // the header ("BI_RGB and biBitCount ≤ 8 → an array of RGBQUAD
+        // palette entries follows", VfW §"Color tables"); the table
+        // travels as the stream's `extradata`.
+        (BI_RGB, 8) => PixelFormat::Pal8,
         (BI_RGB, 16) => PixelFormat::Rgb555Le,
         (BI_RGB, 24) => PixelFormat::Bgr24,
         (BI_RGB, 32) => PixelFormat::Bgrx,
@@ -79,6 +84,7 @@ pub(crate) fn pixel_format_for(
 /// Bytes per pixel of the packed single-plane formats mapped above.
 fn bytes_per_pixel(fmt: PixelFormat) -> Option<usize> {
     Some(match fmt {
+        PixelFormat::Pal8 => 1,
         PixelFormat::Rgb555Le
         | PixelFormat::Rgb565Le
         | PixelFormat::Bgr555Le
@@ -260,7 +266,14 @@ mod tests {
             pixel_format_for(BI_RGB, 16, None),
             Some((PixelFormat::Rgb555Le, RowRule::Dib))
         );
-        assert_eq!(pixel_format_for(BI_RGB, 8, None), None);
+        assert_eq!(
+            pixel_format_for(BI_RGB, 8, None),
+            Some((PixelFormat::Pal8, RowRule::Dib))
+        );
+        // 1- and 4-bit indexed rows pack several pixels to a byte; no
+        // `rawvideo` layout for those.
+        assert_eq!(pixel_format_for(BI_RGB, 4, None), None);
+        assert_eq!(pixel_format_for(BI_RGB, 1, None), None);
         assert_eq!(pixel_format_for(*b"MJPG", 24, None), None);
     }
 

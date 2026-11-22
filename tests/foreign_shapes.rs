@@ -582,3 +582,51 @@ fn a_compressed_stream_with_a_sample_format_is_not_written_as_pcm() {
     let dmx = open(avi(&[wide], &items, true));
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_s64le");
 }
+
+/// An 8-bit indexed DIB is `rawvideo` / `Pal8`: packed top-down index
+/// rows, with the color table as `extradata`. Written back from the
+/// parameters alone it is an indexed DIB again, table and all.
+#[test]
+fn an_eight_bit_indexed_dib_is_pal8_rawvideo() {
+    use oxideav_core::PixelFormat;
+    // 3 x 2, bottom-up, rows padded to 4 bytes; a 2-entry table.
+    let table = [10, 20, 30, 0, 40, 50, 60, 0];
+    let mut strf = bmih(3, 2, &[0; 4], 8, &table);
+    strf[32..36].copy_from_slice(&2u32.to_le_bytes()); // biClrUsed
+    let track = Track {
+        strh: Strh::video(&[0; 4], 1, 25, 1).bytes(),
+        strf,
+        extra: Vec::new(),
+    };
+    let wire = [1, 1, 0, 0xEE, /* top row last */ 0, 1, 0, 0xEE];
+    let items = [Item {
+        stream: 0,
+        kind: b"db",
+        data: &wire,
+        flags: Some(KEY),
+    }];
+    let mut dmx = open(avi(&[track], &items, true));
+    let mut stream = dmx.streams()[0].clone();
+    assert_eq!(stream.params.codec_id.as_str(), "rawvideo");
+    assert_eq!(stream.params.pixel_format, Some(PixelFormat::Pal8));
+    assert_eq!(stream.params.extradata, table);
+    let got = packets(&mut dmx);
+    assert_eq!(got[0].data, [0, 1, 0, 1, 1, 0]);
+
+    // Without the recorded headers: built from the parameters.
+    stream.params.options = oxideav_core::CodecOptions::new();
+    let sink = Sink::default();
+    let ws: Box<dyn oxideav_core::WriteSeek> = Box::new(sink.clone());
+    let mut mux = oxideav_avi::muxer::open(ws, &[stream]).expect("mux opens");
+    mux.write_header().expect("header");
+    mux.write_packet(&got[0]).expect("packet");
+    mux.write_trailer().expect("trailer");
+    let out = sink.0.lock().unwrap().get_ref().clone();
+    let mut again = open(out);
+    assert_eq!(
+        again.streams()[0].params.pixel_format,
+        Some(PixelFormat::Pal8)
+    );
+    assert_eq!(again.streams()[0].params.extradata, table);
+    assert_eq!(packets(&mut again)[0].data, got[0].data);
+}

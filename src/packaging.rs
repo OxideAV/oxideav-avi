@@ -571,6 +571,50 @@ fn build_video_strf(
         let fmt = params
             .pixel_format
             .ok_or_else(|| Error::invalid("avi muxer: rawvideo stream missing pixel_format"))?;
+        if fmt == oxideav_core::PixelFormat::Pal8 {
+            // An 8-bit indexed DIB: the color table is the stream's
+            // `extradata`, four bytes (blue, green, red, reserved) per
+            // entry, as the demuxer hands it over.
+            let (quads, rest) = params.extradata.as_chunks::<4>();
+            if quads.is_empty() || quads.len() > 256 || !rest.is_empty() {
+                return Err(Error::unsupported(
+                    "avi muxer: a Pal8 rawvideo stream needs its color table \
+                     (1..=256 RGBQUADs) as extradata",
+                ));
+            }
+            let palette: Vec<RgbQuad> = quads
+                .iter()
+                .map(|&[blue, green, red, reserved]| RgbQuad {
+                    blue,
+                    green,
+                    red,
+                    reserved,
+                })
+                .collect();
+            let strf = write_indexed_bitmap_info_header(width, height, 8, &palette);
+            let top_down = crate::stream_format::parse_bitmap_info_header(&strf)
+                .map(|b| b.top_down)
+                .unwrap_or(false);
+            let raw_layout = crate::raw_dib::RawLayout::new(
+                fmt,
+                crate::raw_dib::RowRule::Dib,
+                width,
+                height,
+                top_down,
+            )
+            .filter(|l| !l.is_identity());
+            let (scale, rate) = video_scale_rate(params);
+            return Ok(StrfEntry {
+                chunk_suffix: *b"db",
+                raw_layout,
+                handler_fourcc: [0; 4],
+                strf,
+                strh_type: *b"vids",
+                sample_size: 0,
+                scale,
+                rate,
+            });
+        }
         let (compression, bit_count, masks, rule) =
             crate::raw_dib::header_for(fmt).ok_or_else(|| {
                 Error::unsupported(format!(
